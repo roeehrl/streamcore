@@ -14,7 +14,7 @@ validates strictly, round-trips to the same JSON, carries `updatedAt`
 
 Spot checks against the official pages on 10–11 October 2026 (all matched the
 files): Rebelle 8 (tools E, I, W, O, Y, F, H, [ ], ⌘0 fit, ⌘⌥0 reset rotation,
-⇧F flip, ⌘⌥←/→ rotate, ⌘+ / ⌘− zoom, ⇧⌘Z redo), Krita navigation (⌘[ / ⌘] rotate,
+⇧F flip, ⌘⌥←/→ rotate, ⌘+ / ⌘− zoom (the preset sends ⌘= since 2 November 2026, below), ⇧⌘Z redo), Krita navigation (⌘[ / ⌘] rotate,
 5 reset rotation, M mirror; zoom and gestures checked again on 21 October 2026, below), Clip Studio Paint (⌘ keypad +/− zoom, − and ^ rotate in
 5° steps, ⇧⌘N, ⌘T/⇧⌘T, ⌘D, ⌘0, redo ⌘Y or ⇧⌘Z), Affinity Photo 2 (B, E, I, L, V,
 [ ], ⇧⌘N, ⌘0, ⌃⇧⌘R). The Goodnotes help page refused automated access (HTTP 403);
@@ -140,6 +140,11 @@ Windows key (noted below).
   `rotateStepDegrees` is left at the default of 15. The bundle ID is verified only for Rebelle
   4.1.1; check that Rebelle 7/8 still use it. The Windows exe names are **guesses** based on the
   installer name "Rebelle 8.exe".
+  **Zoom in is ⌘= / Ctrl+= (`char` "=")** since 2 November 2026: the manual writes "Cmd + +"
+  ("Ctrl + +" on Windows), meaning the key that carries +, which is "=" on a US keyboard.
+  `char` "+" resolves to ⌘⇧= on every layout, US included, and Rebelle did not zoom in on
+  that (reported from Rebelle 8 on macOS). Windows needs no `hosts.windows` entry: it is the
+  same key with Ctrl.
 - **krita**: Ctrl in Krita's defaults is ⌘ on a Mac (Krita never sets
   `AA_MacDontSwapCtrlAndMeta`). Rotate is ⌘[ / ⌘] at 15° per press (`rotateCanvasLeft15`;
   4 and 6 also work; 5 resets). E toggles eraser mode. **Zoom in is Ctrl+= (`char` "=")**:

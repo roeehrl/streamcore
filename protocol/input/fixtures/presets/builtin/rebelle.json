@@ -211,7 +211,7 @@
   "fallbacks": {
     "zoomIn": {
       "key": {
-        "char": "+",
+        "char": "=",
         "hid": 46
       },
       "modifiers": 8

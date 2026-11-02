@@ -12,6 +12,16 @@ Pad needs to act when it re-pins. Entries before the move to this repository nam
 commits and pull requests in MyCNC's core repository, where the input model lived
 until then.
 
+## 2026-11-02 Rebelle preset: zoom in is Cmd =
+
+The built-in Rebelle preset's `fallbacks.zoomIn` is now ⌘= (`char` "=", `hid` 46,
+modifiers 8; Ctrl+= on Windows) instead of ⌘+. Pad resolves a shortcut by its
+character, so "+" went out as ⌘⇧= on every keyboard layout, US included, and Rebelle
+did not zoom in on that; ⌘= is the unshifted key Rebelle's manual means by "Cmd + +".
+The fixture copy in `protocol/input/fixtures/presets/builtin/` changed with it. Fit and
+Reset rotation are unchanged. **Pad doesn't need to act beyond re-pinning:** users who
+edited their Rebelle profile keep their own copy and don't get this change.
+
 ## 2026-11-01 Moved to the StreamCore repository (MyCNC core `e666931`)
 
 The input model, its C ABI, the `StreamCoreInput` package, `protocol/input` and the
