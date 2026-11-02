@@ -1,0 +1,237 @@
+{
+  "schema": 1,
+  "preset": "affinity-photo",
+  "appKey": "com.seriflabs.affinityphoto2",
+  "aliases": [
+    "com.seriflabs.affinityphoto",
+    "photo.exe"
+  ],
+  "name": "Affinity Photo 2",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "affinity-photo.paint-brush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.erase",
+          "name": "Erase",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.color-picker",
+          "name": "Picker",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "i",
+                "hid": 12
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.freehand-selection",
+          "name": "Lasso",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "l",
+                "hid": 15
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.move",
+          "name": "Move",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "v",
+                "hid": 25
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "affinity-photo.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "affinity-photo.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "affinity-photo.new-layer",
+          "name": "New Layer",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "n",
+                "hid": 17
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.deselect",
+          "name": "Deselect",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "d",
+                "hid": 7
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {
+          "id": "affinity-photo.fit",
+          "name": "Fit",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "0",
+                "hid": 39
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "affinity-photo.reset-rotation",
+          "name": "Reset Rot.",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "r",
+                "hid": 21
+              },
+              "modifiers": 11,
+              "hosts": {
+                "windows": {
+                  "key": {
+                    "char": "r",
+                    "hid": 21
+                  },
+                  "modifiers": 13
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "native"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8,
+      "hosts": {
+        "windows": {
+          "key": {
+            "char": "=",
+            "hid": 46
+          },
+          "modifiers": 8
+        }
+      }
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

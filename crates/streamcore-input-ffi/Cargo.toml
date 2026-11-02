@@ -1,0 +1,27 @@
+[package]
+name = "streamcore-input-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "JSON C ABI over streamcore-input for C# (P/Invoke) until uniffi-bindgen-cs supports UniFFI 0.32."
+
+[lib]
+name = "streamcore_input_ffi"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+streamcore-input = { path = "../streamcore-input" }
+serde_json.workspace = true
+
+# The one crate that may not inherit the workspace's `unsafe_code = "forbid"`:
+# a C ABI must dereference caller pointers. Unsafe stays denied by default and is
+# allowed only on the three exported functions, each block with a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+undocumented_unsafe_blocks = "deny"

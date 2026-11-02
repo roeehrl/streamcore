@@ -1,0 +1,37 @@
+{
+  "description": "Binary input payloads, little endian (Pad's binary protocol). keyPacket (0x22): u8 isDown (0 or 1), u16 HID usage, u8 literal modifiers (0...15). pencil (0x20): u8 count, then count samples of 39 bytes: u8 phase (hover 0, down 1, moved 2, up 3, hoverExit 4, cancel 5 with penV2 only), u8 kind (pen 0, eraser 1, finger 2), u8 button (left 0, right 1, middle 2), f32 x, y, force, altitude, azimuth, roll, hoverZ, f64 timestamp. Valid cases must decode to the fields and encode back to the same hex; invalid ones must fail to decode (exact length, known enum values, finite numbers).",
+  "keyPacket": {
+    "valid": [
+      {"name": "Z down with Cmd", "hex": "011d0008", "packet": {"isDown": true, "hidUsage": 29, "modifiers": 8}},
+      {"name": "left Command up", "hex": "00e30000", "packet": {"isDown": false, "hidUsage": 227, "modifiers": 0}},
+      {"name": "all literal modifiers, high usage", "hex": "0134120f", "packet": {"isDown": true, "hidUsage": 4660, "modifiers": 15}}
+    ],
+    "invalid": [
+      {"name": "three bytes", "hex": "011d00"},
+      {"name": "five bytes", "hex": "011d000800"},
+      {"name": "isDown 2", "hex": "021d0000"},
+      {"name": "platformKey bit", "hex": "011d0010"},
+      {"name": "unknown modifier bit", "hex": "011d0080"}
+    ]
+  },
+  "pencil": {
+    "valid": [
+      {"name": "one pen sample", "penV2": false, "samples": [{"phase": "down", "kind": "pen", "button": "left", "x": 0.25, "y": 0.75, "force": 0.5, "altitude": 1.5, "azimuth": -0.5, "roll": 0.0, "hoverZ": 0.0, "timestamp": 12.5}], "hex": "010100000000803e0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "eraser, right button, hover", "penV2": false, "samples": [{"phase": "hover", "kind": "eraser", "button": "right", "x": 0.25, "y": 0.75, "force": 0.5, "altitude": 1.5, "azimuth": -0.5, "roll": 0.0, "hoverZ": 0.5, "timestamp": 12.5}, {"phase": "hoverExit", "kind": "eraser", "button": "right", "x": 0.25, "y": 0.75, "force": 0.5, "altitude": 1.5, "azimuth": -0.5, "roll": 0.0, "hoverZ": 1.0, "timestamp": 13.0}], "hex": "020001010000803e0000403f0000003f0000c03f000000bf000000000000003f00000000000029400401010000803e0000403f0000003f0000c03f000000bf000000000000803f0000000000002a40"},
+      {"name": "cancel with penV2", "penV2": true, "samples": [{"phase": "moved", "kind": "finger", "button": "middle", "x": 0.25, "y": 0.75, "force": 0.5, "altitude": 1.5, "azimuth": -0.5, "roll": 0.0, "hoverZ": 0.0, "timestamp": 12.5}, {"phase": "cancel", "kind": "finger", "button": "middle", "x": 0.25, "y": 0.75, "force": 0.5, "altitude": 1.5, "azimuth": -0.5, "roll": 0.0, "hoverZ": 0.0, "timestamp": 12.75}], "hex": "020202020000803e0000403f0000003f0000c03f000000bf000000000000000000000000000029400502020000803e0000403f0000003f0000c03f000000bf00000000000000000000000000802940"},
+      {"name": "empty batch", "penV2": false, "samples": [], "hex": "00"}
+    ],
+    "invalid": [
+      {"name": "empty payload", "penV2": true, "hex": ""},
+      {"name": "count larger than the samples", "penV2": true, "hex": "020100000000803e0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "trailing byte", "penV2": true, "hex": "010100000000803e0000403f0000003f0000c03f000000bf0000000000000000000000000000294000"},
+      {"name": "truncated sample", "penV2": true, "hex": "010100000000803e0000403f0000003f0000c03f000000bf000000000000000000000000000029"},
+      {"name": "cancel without penV2", "penV2": false, "hex": "020202020000803e0000403f0000003f0000c03f000000bf000000000000000000000000000029400502020000803e0000403f0000003f0000c03f000000bf00000000000000000000000000802940"},
+      {"name": "unknown phase 6", "penV2": true, "hex": "010600000000803e0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "unknown kind 3", "penV2": true, "hex": "010103000000803e0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "unknown button 3", "penV2": true, "hex": "010100030000803e0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "NaN x", "penV2": true, "hex": "010100000000c07f0000403f0000003f0000c03f000000bf00000000000000000000000000002940"},
+      {"name": "infinite timestamp", "penV2": true, "hex": "010100000000803e0000403f0000003f0000c03f000000bf0000000000000000000000000000f07f"}
+    ]
+  }
+}

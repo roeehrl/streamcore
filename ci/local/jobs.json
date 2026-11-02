@@ -1,0 +1,65 @@
+{
+  "rust_targets": [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
+    "x86_64-apple-ios"
+  ],
+  "jobs": [
+    {
+      "context": "local/scrub",
+      "lane": "mac",
+      "timeout": 600,
+      "run": "scripts/scrub-check.sh"
+    },
+    {
+      "context": "local/fmt",
+      "lane": "mac",
+      "timeout": 600,
+      "run": "cargo fmt --all --check"
+    },
+    {
+      "context": "local/clippy",
+      "lane": "mac",
+      "timeout": 2400,
+      "run": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
+    },
+    {
+      "context": "local/test",
+      "lane": "mac",
+      "timeout": 2400,
+      "run": "cargo test --workspace --all-features --locked"
+    },
+    {
+      "context": "local/scheduling",
+      "lane": "mac",
+      "timeout": 1200,
+      "run": "cargo run --package streamcore-transport --example scheduling_probe --locked -- self-test && python3 ci/scheduling/test-probe.py"
+    },
+    {
+      "context": "local/input-changes",
+      "lane": "mac",
+      "timeout": 300,
+      "run": "python3 scripts/check-input-changes.py"
+    },
+    {
+      "context": "local/streamcore-input-apple",
+      "lane": "mac",
+      "timeout": 2400,
+      "run": "bash scripts/build-streamcore-input-apple.sh"
+    },
+    {
+      "context": "local/streamcore-input-android",
+      "lane": "mac",
+      "timeout": 2400,
+      "run": "bash scripts/build-streamcore-input-android.sh"
+    },
+    {
+      "context": "local/linux",
+      "lane": "linux",
+      "timeout": 3600,
+      "run": "ci/local/linux.sh"
+    }
+  ]
+}

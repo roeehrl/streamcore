@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "appKey": "org.krita",
+  "aliases": ["krita.exe"],
+  "name": "Krita",
+  "preset": "sample-krita",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {"id": "undo", "name": "Undo", "icon": "undo", "action": {"type": "shortcut", "shortcut": {"key": {"char": "z", "hid": 29}, "modifiers": 8}}},
+        {"id": "redo", "name": "Redo", "icon": "redo", "action": {"type": "shortcut", "shortcut": {"key": {"char": "z", "hid": 29}, "modifiers": 9}}},
+        {"id": "brush-bigger", "name": "Bigger", "color": "blue", "repeat": true, "action": {"type": "shortcut", "shortcut": {"key": {"char": "]", "hid": 48}, "modifiers": 0}}},
+        {"id": "pan", "name": "Pan", "action": {"type": "hold", "modifiers": 0, "shortcut": {"key": {"named": "space"}, "modifiers": 0}}},
+        {"id": "pick", "name": "Pick", "color": "amber", "action": {"type": "hold", "modifiers": 2}},
+        {"id": "menu", "name": "Menu", "action": {"type": "click", "button": "right"}},
+        {"id": "sig", "name": "Signature", "action": {"type": "text", "text": "Été à Nice"}},
+        {"id": "eraser", "name": "Eraser", "color": "red", "action": {"type": "pad", "pad": "eraserToggle"}},
+        {"id": "spacer", "name": "", "action": {"type": "none"}}
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {"id": "reset-rotation", "name": "Reset rotation", "action": {"type": "shortcut", "shortcut": {"key": {"char": "5", "hid": 34}, "modifiers": 0}}},
+        {"id": "full-screen", "name": "Full screen", "action": {"type": "shortcut", "shortcut": {"key": {"char": "f", "hid": 9}, "modifiers": 9}}}
+      ]
+    }
+  ],
+  "gestures": {
+    "twoFinger": "sendToApp",
+    "viewZoomLocked": false,
+    "delivery": "shortcuts",
+    "tap2": {"type": "pad", "pad": "undo"},
+    "tap3": {"type": "pad", "pad": "redo"},
+    "tap4": {"type": "pad", "pad": "toggleControls"},
+    "fingerPen1": {"type": "none"}
+  },
+  "pen": {
+    "followSystem": true,
+    "doubleTap": {"type": "pad", "pad": "eraserToggle"},
+    "squeeze": {"type": "click", "button": "right"},
+    "barrelRollRotatesBrush": true,
+    "lowerButton": {"type": "click", "button": "right"},
+    "upperButton": {"type": "hold", "modifiers": 2},
+    "eraserEnd": {"type": "pad", "pad": "eraserToggle"},
+    "buttonsWhileHovering": true,
+    "undoCancelledStrokes": true
+  },
+  "fallbacks": {
+    "zoomIn": {"key": {"char": "=", "hid": 46}, "modifiers": 0},
+    "zoomOut": {"key": {"char": "-", "hid": 45}, "modifiers": 0},
+    "rotateLeft": {"key": {"char": "4", "hid": 33}, "modifiers": 0},
+    "rotateRight": {"key": {"char": "6", "hid": 35}, "modifiers": 0},
+    "rotateStepDegrees": 15,
+    "zoomStep": 0.25,
+    "redo": {"key": {"char": "z", "hid": 29}, "modifiers": 9}
+  }
+}

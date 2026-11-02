@@ -1,0 +1,246 @@
+{
+  "schema": 1,
+  "preset": "rebelle",
+  "appKey": "com.escapemotions.rebelle",
+  "aliases": [
+    "rebelle 8.exe",
+    "rebelle 7.exe",
+    "rebelle.exe"
+  ],
+  "name": "Rebelle",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "rebelle.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "rebelle.pick-color",
+          "name": "Pick Color",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "i",
+                "hid": 12
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "rebelle.water",
+          "name": "Water",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "w",
+                "hid": 26
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "rebelle.blow",
+          "name": "Blow",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "o",
+                "hid": 18
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "wet",
+      "name": "Wet paint",
+      "keys": [
+        {
+          "id": "rebelle.dry",
+          "name": "Dry",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "y",
+                "hid": 28
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "rebelle.fast-dry",
+          "name": "Fast Dry",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "f",
+                "hid": 9
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "rebelle.show-wet",
+          "name": "Show Wet",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "h",
+                "hid": 11
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "rebelle.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "rebelle.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {
+          "id": "rebelle.fit",
+          "name": "Fit",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "0",
+                "hid": 39
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "rebelle.reset-rotation",
+          "name": "Reset Rot.",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "0",
+                "hid": 39
+              },
+              "modifiers": 12
+            }
+          }
+        },
+        {
+          "id": "rebelle.flip",
+          "name": "Flip View",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "f",
+                "hid": 9
+              },
+              "modifiers": 1
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "shortcuts"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "rotateLeft": {
+      "key": {
+        "named": "left"
+      },
+      "modifiers": 12
+    },
+    "rotateRight": {
+      "key": {
+        "named": "right"
+      },
+      "modifiers": 12
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

@@ -1,0 +1,22 @@
+# Generic patterns the scrub check rejects anywhere in the tree (POSIX extended regular expressions,
+# one per line, matched case-insensitively). Private literals (host names, addresses, people) live
+# outside the repository in the list named by STREAMCORE_SCRUB_DENYLIST; see scripts/scrub-check.sh.
+#
+# Allow one line by putting "scrub:allow" on it, with a reason.
+
+# Email addresses (noreply and allowed addresses are filtered out in scrub-check.sh)
+[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}
+
+# Private IPv4 ranges: RFC 1918 and carrier-grade NAT (Tailscale uses 100.64.0.0/10)
+(^|[^0-9.])10\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)
+(^|[^0-9.])172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)
+(^|[^0-9.])192\.168\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)
+(^|[^0-9.])100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)
+
+# Tailnet names
+\.ts\.net
+
+# Absolute paths on a developer's machine
+/Users/[A-Za-z0-9._-]+
+/home/[A-Za-z0-9._-]+/
+[A-Za-z]:\\\\?(Users|mycnc|pad)

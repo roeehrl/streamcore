@@ -1,0 +1,8 @@
+# Exact strings the generic patterns may match without failing (one per line, fixed strings).
+security@codonic.dev
+conduct@codonic.dev
+@users.noreply.github.com
+noreply@
+@example.com
+@example.org
+@example.net

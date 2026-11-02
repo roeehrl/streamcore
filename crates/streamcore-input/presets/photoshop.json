@@ -1,0 +1,184 @@
+{
+  "schema": 1,
+  "preset": "photoshop",
+  "appKey": "com.adobe.Photoshop",
+  "aliases": [
+    "photoshop.exe"
+  ],
+  "name": "Adobe Photoshop",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "photoshop.brush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "photoshop.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "photoshop.lasso",
+          "name": "Lasso",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "l",
+                "hid": 15
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "photoshop.eyedropper",
+          "name": "Eyedrop",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "i",
+                "hid": 12
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "photoshop.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "photoshop.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "photoshop.new-layer",
+          "name": "New Layer",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "n",
+                "hid": 17
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "photoshop.transform",
+          "name": "Transform",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "t",
+                "hid": 23
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "photoshop.deselect",
+          "name": "Deselect",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "d",
+                "hid": 7
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "native"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

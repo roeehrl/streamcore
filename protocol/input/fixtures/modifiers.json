@@ -1,0 +1,47 @@
+{
+  "description": "Modifiers bits: shift 1, control 2, option/alt 4, command 8, platformKey 16. Stored (profiles, latches): command is the primary modifier (Cmd on a Mac, Ctrl on Windows), platformKey the literal Cmd / Windows key. Literal (on the wire): command is Cmd on a Mac, the Windows key on a PC. 'resolve': stored -> literal per host. 'streamCore': literal Pad bits <-> StreamCore/MyCNC bits (capsLock 1, shift 2, control 4, option 8, command 16, function 32); capsLock and function have no Pad bit and are dropped going back; 'streamCoreInvalid' must fail in each direction. 'makesShortcuts': whether literal modifiers turn typed characters into shortcuts. 'labels': stored modifiers in the host's own convention.",
+  "resolve": [
+    {"stored": 0, "windows": 0, "mac": 0},
+    {"stored": 1, "windows": 1, "mac": 1},
+    {"stored": 8, "windows": 2, "mac": 8, "note": "Cmd+Z / Ctrl+Z"},
+    {"stored": 9, "windows": 3, "mac": 9, "note": "redo, Shift + primary"},
+    {"stored": 16, "windows": 8, "mac": 8, "note": "the literal platform key"},
+    {"stored": 6, "windows": 6, "mac": 6, "note": "Ctrl+Alt stay as they are"},
+    {"stored": 24, "windows": 10, "mac": 8, "note": "primary + platform key"},
+    {"stored": 31, "windows": 15, "mac": 15},
+    {"stored": 4, "windows": 4, "mac": 4, "note": "Alt / Option"},
+    {"stored": 18, "windows": 10, "mac": 10, "note": "Ctrl + the platform key"}
+  ],
+  "streamCore": [
+    {"literal": 0, "bits": 0},
+    {"literal": 1, "bits": 2},
+    {"literal": 2, "bits": 4},
+    {"literal": 4, "bits": 8},
+    {"literal": 8, "bits": 16},
+    {"literal": 15, "bits": 30}
+  ],
+  "fromStreamCore": [
+    {"bits": 1, "literal": 0, "note": "capsLock has no Pad bit"},
+    {"bits": 32, "literal": 0, "note": "function has no Pad bit"},
+    {"bits": 63, "literal": 15},
+    {"bits": 18, "literal": 9}
+  ],
+  "streamCoreInvalid": {
+    "literal": [16, 31, 32, 128],
+    "bits": [64, 128, 4096]
+  },
+  "makesShortcuts": [
+    {"literal": 0, "mac": false, "windows": false},
+    {"literal": 1, "mac": false, "windows": false},
+    {"literal": 2, "mac": true, "windows": true},
+    {"literal": 4, "mac": false, "windows": true},
+    {"literal": 8, "mac": true, "windows": true},
+    {"literal": 5, "mac": false, "windows": true}
+  ],
+  "labels": [
+    {"stored": 0, "mac": "", "windows": ""},
+    {"stored": 9, "mac": "⇧⌘", "windows": "Ctrl+Shift"},
+    {"stored": 15, "mac": "⌃⌥⇧⌘", "windows": "Ctrl+Alt+Shift"},
+    {"stored": 20, "mac": "⌥⌘", "windows": "Alt+Win"}
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "description": "Preset file shapes: a file holds one Profile, an array of them, or {\"profiles\": [...]}. Each profile without 'preset' gets the file's id (its name without .json). Invalid entries are skipped. 'expect' lists the appKey and preset id of every profile read, in order.",
+  "cases": [
+    {"name": "one profile", "id": "file-id", "file": {"schema": 1, "appKey": "a.exe", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": [{"appKey": "a.exe", "preset": "file-id"}]},
+    {"name": "an array, one with its own preset id", "id": "pack", "file": [{"schema": 1, "appKey": "a.exe", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, {"schema": 1, "appKey": "b.exe", "name": "B", "preset": "b-preset", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}], "expect": [{"appKey": "a.exe", "preset": "pack"}, {"appKey": "b.exe", "preset": "b-preset"}]},
+    {"name": "wrapped in profiles", "id": "wrapped", "file": {"profiles": [{"schema": 1, "appKey": "a.exe", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}]}, "expect": [{"appKey": "a.exe", "preset": "wrapped"}]},
+    {"name": "invalid entries are skipped", "id": "mixed", "file": [{"schema": 1, "appKey": "", "name": "bad", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, {"schema": 1, "appKey": "ok.exe", "name": "OK", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}], "expect": [{"appKey": "ok.exe", "preset": "mixed"}]}
+  ]
+}

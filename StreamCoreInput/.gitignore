@@ -1,0 +1,4 @@
+# Built by scripts/build-streamcore-input-apple.sh
+/Artifacts/
+/Sources/StreamCoreInput/Generated/
+/.build/

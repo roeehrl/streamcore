@@ -1,0 +1,17 @@
+[package]
+name = "streamcore-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "StreamCore logical sessions: host-owned resumable sessions, independent of transport lifetime."
+
+[dependencies]
+uniffi.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,215 @@
+{
+  "schema": 1,
+  "preset": "krita",
+  "appKey": "org.krita",
+  "aliases": [
+    "org.kde.krita",
+    "krita.exe"
+  ],
+  "name": "Krita",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "krita.brush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.color-sampler",
+          "name": "Sampler",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "p",
+                "hid": 19
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.fill",
+          "name": "Fill",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "f",
+                "hid": 9
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.move",
+          "name": "Move",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "t",
+                "hid": 23
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.transform",
+          "name": "Transform",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "t",
+                "hid": 23
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "krita.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "krita.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {
+          "id": "krita.mirror",
+          "name": "Mirror",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "m",
+                "hid": 16
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "krita.reset-rotation",
+          "name": "Reset Rot.",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "5",
+                "hid": 34
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "shortcuts",
+    "pan": "middleDrag"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "=",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "rotateLeft": {
+      "key": {
+        "char": "[",
+        "hid": 47
+      },
+      "modifiers": 8
+    },
+    "rotateRight": {
+      "key": {
+        "char": "]",
+        "hid": 48
+      },
+      "modifiers": 8
+    },
+    "rotateStepDegrees": 15,
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "description": "Built-in presets (one JSON file per preset, named by its id: crates/streamcore-input/presets, shipped byte-identical as presets/builtin/<id>.json beside this file) and which profile applies to an app. 'presets': every preset id that must load, each with updatedAt 2000-01-01T00:00:00Z and a fallbacks.redo; presets/builtin holds exactly these files, and each, read as a preset file with its id, gives the profile the built-in library has (round-trip it to check a binding). 'lookups': the preset for an app key (matching is case-insensitive over appKey and aliases; a Windows path reduces to its executable name; '*' is never returned here, null = no preset). 'resolve': the profile that applies given the user's stored profiles: the user's own for the app, else the app's preset, else the user's '*', else the '*' preset; expect names the profile by 'stored:<name>' or 'preset:<id>'. 'effective': the snapshot a client gets: every stored profile, then each preset with at least one key (appKey or alias) no stored profile covers.",
+  "presets": ["affinity", "affinity-designer", "affinity-photo", "clipstudiopaint", "default", "goodnotes", "illustrator", "krita", "notability", "photoshop", "rebelle"],
+  "lookups": [
+    {"appKey": "com.adobe.Photoshop", "preset": "photoshop"},
+    {"appKey": "com.adobe.photoshop", "preset": "photoshop"},
+    {"appKey": "photoshop.exe", "preset": "photoshop"},
+    {"appKey": "C:\\Program Files\\Adobe\\Adobe Photoshop 2026\\Photoshop.exe", "preset": "photoshop"},
+    {"appKey": "com.adobe.illustrator", "preset": "illustrator"},
+    {"appKey": "org.krita", "preset": "krita"},
+    {"appKey": "org.kde.krita", "preset": "krita"},
+    {"appKey": "C:\\Program Files\\Krita (x64)\\bin\\KRITA.EXE", "preset": "krita"},
+    {"appKey": "com.escapemotions.rebelle", "preset": "rebelle"},
+    {"appKey": "jp.co.celsys.CLIPSTUDIOPAINT", "preset": "clipstudiopaint"},
+    {"appKey": "clipstudiopaint.exe", "preset": "clipstudiopaint"},
+    {"appKey": "com.seriflabs.affinityphoto2", "preset": "affinity-photo"},
+    {"appKey": "com.seriflabs.affinitydesigner2", "preset": "affinity-designer"},
+    {"appKey": "com.canva.affinity", "preset": "affinity"},
+    {"appKey": "com.goodnotesapp.x", "preset": "goodnotes"},
+    {"appKey": "com.gingerlabs.Notability", "preset": "notability"},
+    {"appKey": "com.apple.TextEdit", "preset": null},
+    {"appKey": "*", "preset": null}
+  ],
+  "resolve": [
+    {"name": "preset applies when nothing is stored", "stored": [], "appKey": "org.krita", "expect": "preset:krita"},
+    {"name": "unknown app gets the * preset", "stored": [], "appKey": "com.apple.TextEdit", "expect": "preset:default"},
+    {"name": "stored profile beats the preset", "appKey": "krita.exe", "stored": [{"schema": 1, "appKey": "org.krita", "aliases": ["krita.exe"], "name": "My Krita", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expect": "stored:My Krita"},
+    {"name": "app preset beats a stored *", "appKey": "com.adobe.Photoshop", "stored": [{"schema": 1, "appKey": "*", "name": "My default", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expect": "preset:photoshop"},
+    {"name": "stored * beats the * preset", "appKey": "com.apple.TextEdit", "stored": [{"schema": 1, "appKey": "*", "name": "My default", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expect": "stored:My default"},
+    {"name": "a user profile for one key leaves the preset on the other keys", "appKey": "org.kde.krita", "stored": [{"schema": 1, "appKey": "org.krita", "name": "My Krita", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expect": "preset:krita"}
+  ],
+  "effective": [
+    {"name": "a stored profile hides the preset only for the keys it covers", "stored": [{"schema": 1, "appKey": "photoshop.exe", "name": "My Photoshop", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expectCount": 12, "expectAbsentPresets": [], "expectStored": ["My Photoshop"], "note": "photoshop.exe is covered; com.adobe.Photoshop still gets the preset, so the preset stays in the snapshot"},
+    {"name": "a stored profile for a new app adds to the presets", "stored": [{"schema": 1, "appKey": "com.apple.TextEdit", "name": "TextEdit", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expectCount": 12, "expectAbsentPresets": [], "expectStored": ["TextEdit"]},
+    {"name": "a profile with the preset's keys and aliases hides it", "stored": [{"schema": 1, "appKey": "com.adobe.Photoshop", "aliases": ["photoshop.exe"], "name": "My Photoshop", "updatedAt": "2026-05-01T00:00:00Z", "groups": []}], "expectCount": 11, "expectAbsentPresets": ["photoshop"], "expectStored": ["My Photoshop"]}
+  ]
+}

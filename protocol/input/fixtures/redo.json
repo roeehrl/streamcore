@@ -1,0 +1,19 @@
+{
+  "description": "Undo and the front app's redo, literal for the host (shortcuts.undo / shortcuts.redo). Redo: the app's own profile's fallbacks.redo (never the '*' profile's), else Shift+Cmd+Z on a Mac, else on Windows Ctrl+Shift+Z for the apps in PadWin's list (process name without .exe, case-insensitive: krita, photoshop, illustrator, indesign, afterfx, adobe premiere pro, affinity, photo, designer, publisher, blender, inkscape, zbrush) and Ctrl+Y for every other app. A path reduces to its executable name. A shortcut's 'hosts' entry for the host replaces its key and modifiers.",
+  "undo": [
+    {"host": "mac", "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 8, "phase": "tap"}},
+    {"host": "windows", "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 2, "phase": "tap"}}
+  ],
+  "redo": [
+    {"host": "mac", "appKey": "com.apple.TextEdit", "profile": null, "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 9, "phase": "tap"}},
+    {"host": "windows", "appKey": "krita.exe", "profile": null, "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 3, "phase": "tap"}},
+    {"host": "windows", "appKey": "C:\\Program Files\\Adobe\\Adobe Photoshop 2026\\Photoshop.exe", "profile": null, "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 3, "phase": "tap"}},
+    {"host": "windows", "appKey": "Designer.exe", "profile": null, "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 3, "phase": "tap"}},
+    {"host": "windows", "appKey": "notepad.exe", "profile": null, "expect": {"key": {"char": "y", "hid": 28}, "modifiers": 2, "phase": "tap"}},
+    {"host": "windows", "appKey": "x.exe", "profile": {"schema": 1, "appKey": "x.exe", "name": "X", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "fallbacks": {"redo": {"key": {"char": "y", "hid": 28}, "modifiers": 9}}}, "expect": {"key": {"char": "y", "hid": 28}, "modifiers": 3, "phase": "tap"}, "note": "the app's own redo, primary = Ctrl"},
+    {"host": "mac", "appKey": "x.exe", "profile": {"schema": 1, "appKey": "x.exe", "name": "X", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "fallbacks": {"redo": {"key": {"char": "y", "hid": 28}, "modifiers": 9}}}, "expect": {"key": {"char": "y", "hid": 28}, "modifiers": 9, "phase": "tap"}},
+    {"host": "windows", "appKey": "notepad.exe", "profile": {"schema": 1, "appKey": "*", "name": "X", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "fallbacks": {"redo": {"key": {"char": "y", "hid": 28}, "modifiers": 9}}}, "expect": {"key": {"char": "y", "hid": 28}, "modifiers": 2, "phase": "tap"}, "note": "the '*' redo is ignored"},
+    {"host": "windows", "appKey": "x.exe", "profile": {"schema": 1, "appKey": "x.exe", "name": "X", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "fallbacks": {"redo": {"key": {"char": "z", "hid": 29}, "modifiers": 9, "hosts": {"windows": {"key": {"char": "y", "hid": 28}, "modifiers": 8}}}}}, "expect": {"key": {"char": "y", "hid": 28}, "modifiers": 2, "phase": "tap"}, "name": "a redo with its own Windows key"},
+    {"host": "mac", "appKey": "x.exe", "profile": {"schema": 1, "appKey": "x.exe", "name": "X", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "fallbacks": {"redo": {"key": {"char": "z", "hid": 29}, "modifiers": 9, "hosts": {"windows": {"key": {"char": "y", "hid": 28}, "modifiers": 8}}}}}, "expect": {"key": {"char": "z", "hid": 29}, "modifiers": 9, "phase": "tap"}, "name": "the Mac uses the shared key"}
+  ]
+}

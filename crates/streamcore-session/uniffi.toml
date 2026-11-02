@@ -1,0 +1,9 @@
+# This crate's own binding files. A product that links several crates into one
+# library chooses the shared Swift and C module names in its global bindgen
+# config (uniffi-bindgen --config); the header keeps this
+# crate's name so the crates' headers can sit side by side in that C module.
+[bindings.swift]
+ffi_module_filename = "streamcore_sessionFFI"
+
+[bindings.kotlin]
+package_name = "uniffi.streamcore_session"

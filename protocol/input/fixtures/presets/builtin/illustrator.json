@@ -1,0 +1,198 @@
+{
+  "schema": 1,
+  "preset": "illustrator",
+  "appKey": "com.adobe.illustrator",
+  "aliases": [
+    "illustrator.exe"
+  ],
+  "name": "Adobe Illustrator",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "illustrator.pen",
+          "name": "Pen",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "p",
+                "hid": 19
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "illustrator.selection",
+          "name": "Select",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "v",
+                "hid": 25
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "illustrator.direct-selection",
+          "name": "Direct",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "a",
+                "hid": 4
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "illustrator.paintbrush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "illustrator.blob-brush",
+          "name": "Blob Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 1
+            }
+          }
+        },
+        {
+          "id": "illustrator.pencil",
+          "name": "Pencil",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "n",
+                "hid": 17
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "illustrator.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "illustrator.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "illustrator.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "illustrator.group",
+          "name": "Group",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "g",
+                "hid": 10
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "native"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "=",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

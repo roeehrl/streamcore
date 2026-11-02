@@ -1,0 +1,29 @@
+[package]
+name = "streamcore-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Platform-independent stream input logic: Pad/StreamCore wire types, app profiles, modifier latching, typing routes and two-finger gestures."
+
+[lib]
+name = "streamcore_input"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+uniffi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "streamcore-input-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[lints]
+workspace = true

@@ -1,0 +1,147 @@
+{
+  "schema": 1,
+  "preset": "goodnotes",
+  "appKey": "com.goodnotesapp.x",
+  "aliases": [
+    "com.goodnotesapp.goodnotesmac"
+  ],
+  "name": "Goodnotes",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "goodnotes.pen",
+          "name": "Pen",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "p",
+                "hid": 19
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "goodnotes.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "goodnotes.highlighter",
+          "name": "Highlight",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "h",
+                "hid": 11
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "goodnotes.lasso",
+          "name": "Lasso",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "v",
+                "hid": 25
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "goodnotes.shapes",
+          "name": "Shapes",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "s",
+                "hid": 22
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "goodnotes.text",
+          "name": "Text",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "t",
+                "hid": 23
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pen": {
+    "doubleTap": {
+      "type": "shortcut",
+      "shortcut": {
+        "key": {
+          "char": "e",
+          "hid": 8
+        },
+        "modifiers": 0
+      }
+    },
+    "squeeze": {
+      "type": "shortcut",
+      "shortcut": {
+        "key": {
+          "char": "e",
+          "hid": 8
+        },
+        "modifiers": 0
+      }
+    }
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

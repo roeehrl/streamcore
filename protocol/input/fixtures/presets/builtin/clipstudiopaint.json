@@ -1,0 +1,205 @@
+{
+  "schema": 1,
+  "preset": "clipstudiopaint",
+  "appKey": "jp.co.celsys.CLIPSTUDIOPAINT",
+  "aliases": [
+    "clipstudiopaint.exe"
+  ],
+  "name": "Clip Studio Paint",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "clipstudiopaint.pen",
+          "name": "Pen",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "p",
+                "hid": 19
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.brush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.eraser",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.eyedropper",
+          "name": "Eyedrop",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "i",
+                "hid": 12
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.selection",
+          "name": "Selection",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "m",
+                "hid": 16
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.fill",
+          "name": "Fill",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "g",
+                "hid": 10
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "clipstudiopaint.new-layer",
+          "name": "New Layer",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "n",
+                "hid": 17
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.transform",
+          "name": "Transform",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "t",
+                "hid": 23
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "clipstudiopaint.deselect",
+          "name": "Deselect",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "d",
+                "hid": 7
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {
+          "id": "clipstudiopaint.fit",
+          "name": "Fit",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "0",
+                "hid": 39
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "named": "keypadPlus"
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "named": "keypadMinus"
+      },
+      "modifiers": 8
+    },
+    "rotateLeft": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 0
+    },
+    "rotateRight": {
+      "key": {
+        "char": "^"
+      },
+      "modifiers": 0
+    },
+    "rotateStepDegrees": 5,
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

@@ -1,0 +1,144 @@
+{
+  "schema": 1,
+  "preset": "notability",
+  "appKey": "com.gingerlabs.Notability",
+  "name": "Notability",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "notability.tool1",
+          "name": "Text",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "1",
+                "hid": 30
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "notability.tool2",
+          "name": "Pen",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "2",
+                "hid": 31
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "notability.tool3",
+          "name": "Highlight",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "3",
+                "hid": 32
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "notability.tool4",
+          "name": "Eraser",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "4",
+                "hid": 33
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "notability.tool5",
+          "name": "Lasso",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "5",
+                "hid": 34
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "notability.tool6",
+          "name": "Hand",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "6",
+                "hid": 35
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pen": {
+    "doubleTap": {
+      "type": "shortcut",
+      "shortcut": {
+        "key": {
+          "char": "4",
+          "hid": 33
+        },
+        "modifiers": 8
+      }
+    },
+    "squeeze": {
+      "type": "shortcut",
+      "shortcut": {
+        "key": {
+          "char": "4",
+          "hid": 33
+        },
+        "modifiers": 8
+      }
+    }
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

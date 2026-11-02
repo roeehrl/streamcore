@@ -1,0 +1,29 @@
+[package]
+name = "streamcore-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "StreamCore secure transport: pinned identities, OPAQUE pairing, versioned hello, QUIC and TLS/TCP sessions and bounded multiplexed lanes."
+
+[dependencies]
+streamcore-media = { path = "../streamcore-media" }
+uniffi.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+quinn.workspace = true
+sha2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zeroize.workspace = true
+opaque-ke.workspace = true
+argon2.workspace = true
+rand.workspace = true
+hmac.workspace = true
+
+[lints]
+workspace = true

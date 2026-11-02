@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "preset": "default",
+  "appKey": "*",
+  "name": "All other apps",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "default.undo",
+          "name": "Undo",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "z",
+                "hid": 29
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "default.redo",
+          "name": "Redo",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "z",
+                "hid": 29
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "default.copy",
+          "name": "Copy",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "c",
+                "hid": 6
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "default.paste",
+          "name": "Paste",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "v",
+                "hid": 25
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "default.cut",
+          "name": "Cut",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "x",
+                "hid": 27
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "default.select-all",
+          "name": "Select All",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "a",
+                "hid": 4
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "default.save",
+          "name": "Save",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "s",
+                "hid": 22
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "fallbacks": {
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

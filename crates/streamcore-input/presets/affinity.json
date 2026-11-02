@@ -1,0 +1,236 @@
+{
+  "schema": 1,
+  "preset": "affinity",
+  "appKey": "com.canva.affinity",
+  "aliases": [
+    "affinity.exe"
+  ],
+  "name": "Affinity",
+  "updatedAt": "2000-01-01T00:00:00Z",
+  "groups": [
+    {
+      "id": "tools",
+      "name": "Tools",
+      "keys": [
+        {
+          "id": "affinity.brush",
+          "name": "Brush",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "b",
+                "hid": 5
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity.erase",
+          "name": "Erase",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "e",
+                "hid": 8
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity.pen",
+          "name": "Pen",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "p",
+                "hid": 19
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity.color-picker",
+          "name": "Picker",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "i",
+                "hid": 12
+              },
+              "modifiers": 0
+            }
+          }
+        },
+        {
+          "id": "affinity.move",
+          "name": "Move",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "v",
+                "hid": 25
+              },
+              "modifiers": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "brush",
+      "name": "Brush",
+      "keys": [
+        {
+          "id": "affinity.size-down",
+          "name": "Size −",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "[",
+                "hid": 47
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        },
+        {
+          "id": "affinity.size-up",
+          "name": "Size +",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "]",
+                "hid": 48
+              },
+              "modifiers": 0
+            }
+          },
+          "repeat": true
+        }
+      ]
+    },
+    {
+      "id": "edit",
+      "name": "Edit",
+      "keys": [
+        {
+          "id": "affinity.new-layer",
+          "name": "New Layer",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "n",
+                "hid": 17
+              },
+              "modifiers": 9
+            }
+          }
+        },
+        {
+          "id": "affinity.deselect",
+          "name": "Deselect",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "d",
+                "hid": 7
+              },
+              "modifiers": 8
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "view",
+      "name": "View",
+      "keys": [
+        {
+          "id": "affinity.fit",
+          "name": "Fit",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "0",
+                "hid": 39
+              },
+              "modifiers": 8
+            }
+          }
+        },
+        {
+          "id": "affinity.reset-rotation",
+          "name": "Reset Rot.",
+          "action": {
+            "type": "shortcut",
+            "shortcut": {
+              "key": {
+                "char": "r",
+                "hid": 21
+              },
+              "modifiers": 11,
+              "hosts": {
+                "windows": {
+                  "key": {
+                    "char": "r",
+                    "hid": 21
+                  },
+                  "modifiers": 13
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "gestures": {
+    "delivery": "native"
+  },
+  "fallbacks": {
+    "zoomIn": {
+      "key": {
+        "char": "+",
+        "hid": 46
+      },
+      "modifiers": 8,
+      "hosts": {
+        "windows": {
+          "key": {
+            "char": "=",
+            "hid": 46
+          },
+          "modifiers": 8
+        }
+      }
+    },
+    "zoomOut": {
+      "key": {
+        "char": "-",
+        "hid": 45
+      },
+      "modifiers": 8
+    },
+    "redo": {
+      "key": {
+        "char": "z",
+        "hid": 29
+      },
+      "modifiers": 9
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "description": "Client actions with the defaults every Pad client uses when a profile leaves one out (the schema has none). 'defaults': the action per slot (actions.default / default_action). 'effective': the profile's own action for a slot, else the default (effective_action); a profile's action is used as it is, even an unknown type from a newer version. 'taps' (tap_action): 2, 3, 4 fingers map to tap2..tap4, anything else is 'none'. 'fingerPen' (finger_pen_action): 0 fingers 'none', 1 and 2 fingerPen1/2, three or more fingerPen3. 'pencil' (pencil_gesture_response): with pen.followSystem (default true) the iPad's Apple Pencil setting decides (switchEraser -> eraserSwap, switchPrevious -> previousTool, the palette settings -> palette, ignore / runSystemShortcut / unknown -> nothing); otherwise the profile's doubleTap / squeeze (or the default): eraserToggle -> eraserSwap, previousTool -> previousTool, hover or an unknown type -> nothing, everything else -> perform.",
+  "defaults": {
+    "tap2": {"type": "pad", "pad": "undo"},
+    "tap3": {"type": "pad", "pad": "redo"},
+    "tap4": {"type": "pad", "pad": "toggleControls"},
+    "fingerPen1": {"type": "pad", "pad": "eraserToggle"},
+    "fingerPen2": {"type": "pad", "pad": "hover"},
+    "fingerPen3": {"type": "click", "button": "right"},
+    "doubleTap": {"type": "pad", "pad": "eraserToggle"},
+    "squeeze": {"type": "click", "button": "right"},
+    "lowerButton": {"type": "click", "button": "right"},
+    "upperButton": {"type": "click", "button": "middle"},
+    "eraserEnd": {"type": "pad", "pad": "eraserToggle"}
+  },
+  "effective": [
+    {"name": "set in the profile", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "gestures": {"tap2": {"type": "shortcut", "shortcut": {"key": {"char": "z"}, "modifiers": 8}}}}, "slot": "tap2", "expect": {"type": "shortcut", "shortcut": {"key": {"char": "z"}, "modifiers": 8}}},
+    {"name": "an explicit none is kept", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "gestures": {"tap4": {"type": "none"}}}, "slot": "tap4", "expect": {"type": "none"}},
+    {"name": "unset falls back", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false}}, "slot": "upperButton", "expect": {"type": "click", "button": "middle"}},
+    {"name": "a newer action type is kept", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"eraserEnd": {"type": "macro"}}}, "slot": "eraserEnd", "expect": {"type": "macro"}}
+  ],
+  "taps": [
+    {"fingers": 1, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "none"}},
+    {"fingers": 2, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "pad", "pad": "undo"}},
+    {"fingers": 4, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "pad", "pad": "toggleControls"}},
+    {"fingers": 5, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "none"}}
+  ],
+  "fingerPen": [
+    {"fingers": 0, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "none"}},
+    {"fingers": 1, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "expect": {"type": "pad", "pad": "eraserToggle"}},
+    {"fingers": 4, "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "gestures": {"fingerPen3": {"type": "hold", "modifiers": 4}}}, "expect": {"type": "hold", "modifiers": 4}}
+  ],
+  "pencil": [
+    {"name": "follows the system by default", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "gesture": "doubleTap", "system": "switchEraser", "expect": {"type": "eraserSwap"}},
+    {"name": "system palette", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "gesture": "squeeze", "system": "showContextualPalette", "expect": {"type": "palette"}},
+    {"name": "system off", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "gesture": "squeeze", "system": "ignore", "expect": {"type": "nothing"}},
+    {"name": "the system runs its own shortcut", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": []}, "gesture": "doubleTap", "system": "runSystemShortcut", "expect": {"type": "nothing"}},
+    {"name": "own actions: default double-tap swaps the eraser", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false}}, "gesture": "doubleTap", "system": "switchPrevious", "expect": {"type": "eraserSwap"}},
+    {"name": "own actions: default squeeze right-clicks", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false}}, "gesture": "squeeze", "system": "ignore", "expect": {"type": "perform", "action": {"type": "click", "button": "right"}}},
+    {"name": "own actions: previous tool", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false, "doubleTap": {"type": "pad", "pad": "previousTool"}}}, "gesture": "doubleTap", "system": "ignore", "expect": {"type": "previousTool"}},
+    {"name": "own actions: hover is not a gesture", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false, "squeeze": {"type": "pad", "pad": "hover"}}}, "gesture": "squeeze", "system": "ignore", "expect": {"type": "nothing"}},
+    {"name": "own actions: a pad action is performed", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false, "squeeze": {"type": "pad", "pad": "keyboard"}}}, "gesture": "squeeze", "system": "ignore", "expect": {"type": "perform", "action": {"type": "pad", "pad": "keyboard"}}},
+    {"name": "own actions: an unknown type does nothing", "profile": {"schema": 1, "appKey": "*", "name": "A", "updatedAt": "2026-01-01T00:00:00Z", "groups": [], "pen": {"followSystem": false, "squeeze": {"type": "macro"}}}, "gesture": "squeeze", "system": "ignore", "expect": {"type": "nothing"}}
+  ]
+}
