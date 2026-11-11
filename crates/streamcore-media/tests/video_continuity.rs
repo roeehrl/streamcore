@@ -200,3 +200,46 @@ fn interleaved_120_fps_streams_recover_independently() {
         }
     }
 }
+
+#[test]
+fn every_permit_release_calls_the_hook_once_and_close_races_admit_nothing() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use streamcore_media::stream::VideoWorkQueue;
+    let released = Arc::new(AtomicUsize::new(0));
+    let counter = released.clone();
+    let queue = VideoWorkQueue::with_release_hook(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    let first = queue.acquire().unwrap();
+    let second = queue.acquire().unwrap();
+    assert_eq!(queue.in_flight(), 2);
+    first.release();
+    first.release();
+    drop(first);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+    drop(second);
+    assert_eq!(released.load(Ordering::SeqCst), 2);
+    assert_eq!(queue.in_flight(), 0);
+
+    // An acquire racing a close either wins before it or gets nothing after it.
+    for _ in 0..200 {
+        let queue = Arc::new(VideoWorkQueue::new());
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let (q, c) = (queue.clone(), closed.clone());
+            scope.spawn(move || {
+                q.close();
+                c.store(true, Ordering::SeqCst);
+            });
+            for _ in 0..50 {
+                let was_closed = closed.load(Ordering::SeqCst);
+                let permit = queue.acquire();
+                assert!(!(was_closed && permit.is_some()));
+            }
+        });
+        assert!(queue.is_closed() && queue.acquire().is_none());
+    }
+}
