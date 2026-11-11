@@ -13,3 +13,8 @@ package_name = "uniffi.streamcore_video"
 # `openCapture`.
 [bindings.swift.rename]
 "CaptureBackend.open" = "openCapture"
+
+# UniFFI Kotlin objects are AutoCloseable: `close()` frees the Rust object. The
+# async stream close is `closeStream()` in Kotlin.
+[bindings.kotlin.rename]
+"StreamController.close" = "closeStream"

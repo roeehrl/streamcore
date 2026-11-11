@@ -120,8 +120,9 @@ uncompleted counts as refused. From P2, `VideoSink` replaces `VideoOut`.
 
 ## Close
 
-- `begin_close()` (Swift and Kotlin `async close()`) revokes the sink, posts `Close` and returns at
-  once. The completion is an `ObserverJob::Closed` on the observer queue; the async `close()`
+- `begin_close()` revokes the sink, posts `Close` and returns at once; the async `close()` (Kotlin
+  `closeStream()`, since UniFFI's Kotlin objects already use `close()` to free themselves) does the
+  same and then waits without blocking. The completion is an `ObserverJob::Closed` on the observer queue; the async `close()`
   resolves at the same time.
 - `close_and_wait(timeout)` is only for synchronous native teardown (rule 6). It returns `Closed`,
   or `StopUnknown` when the stop failed, did not answer within the op timeout, or the wait timed
@@ -148,3 +149,12 @@ pipeline tests onto mock traits; `executor_rules.rs` covers the inline drain, th
 re-create, the bounded invalidate, close, late callbacks and reentrancy; `lifecycle.rs` the
 operation state machine; `stress.rs` seeded shuffles and many-thread runs. `StreamCoreVideo/`
 runs the Swift binding smoke test.
+
+## Binding names
+
+UniFFI 0.32.2 shapes three names. The encoder trait is `StreamEncoder` (Rust keeps `Encoder` as an
+alias): Swift's standard library has its own `Encoder`, and a Swift-only rename of a foreign trait
+changes an FFI symbol and fails to link. `CaptureBackend::open` is `openCapture` in Swift, because
+the escaped keyword would otherwise land in the C header. The async `close()` is `closeStream()` in
+Kotlin. Generated Swift for async foreign-trait methods needs Swift 5 language mode (it fails
+Swift 6's sending checks); the stream traits are synchronous and unaffected.
