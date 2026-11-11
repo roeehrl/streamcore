@@ -179,10 +179,18 @@ natively:
 
 - **Windows:** QueryPerformanceCounter ticks × 10⁹ / QueryPerformanceFrequency. WGC's
   `SystemRelativeTime` is already in 100 ns units of that clock: multiply by 100.
+  Until WGC's `SystemRelativeTime` is checked on a native display (it was later than the
+  FrameArrived stamp in a remote-desktop session), Windows stages start at H1.
 - **macOS:** `mach_absolute_time` × timebase (the clock of `SCStreamFrameInfo.displayTime` and the
   host `CMClock`). It stops during sleep; `mach_continuous_time` does not, and would not match
   ScreenCaptureKit's or VideoToolbox's timestamps.
 - **Linux:** `CLOCK_MONOTONIC`.
+
+**Windows timer period (host rule).** The Windows backend holds a 1 ms timer period
+(`timeBeginPeriod(1)` plus the timer-resolution power-throttling opt-out) from capture start
+to stop, reference-counted across streams and never while idle. Quick Sync's encoder waits on
+the system timer: about 15 ms per encode at the default 15.6 ms tick, about 6 ms at 1 ms. See
+`crates/streamcore-video-windows/README.md`.
 
 The executor's own `Clock` (`MonotonicClock`, measured from the stream's creation) drives timers
 only. Timestamps the executor writes (a recovery frame's submission time) are derived from the last

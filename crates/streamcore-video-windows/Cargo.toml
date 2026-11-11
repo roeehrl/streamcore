@@ -1,0 +1,71 @@
+[package]
+name = "streamcore-video-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "P5: Windows video backends for streamcore-video (WGC capture, D3D11 video-processor convert, Media Foundation hardware H.264) and a per-stage bench. The Windows code builds only with the `bench` feature."
+
+[features]
+default = []
+# The Windows backends and the bench. Off by default, so default workspace builds are unchanged;
+# off Windows the feature builds only the portable modules.
+bench = ["dep:windows", "dep:streamcore-video", "dep:streamcore-media"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+streamcore-video = { path = "../streamcore-video", optional = true }
+streamcore-media = { path = "../streamcore-media", optional = true }
+windows = { workspace = true, optional = true, features = [
+    "Foundation",
+    "Foundation_Metadata",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "System",
+    "System_Profile",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Media",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+] }
+
+[[bin]]
+name = "streamcore-video-windows-bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+# Not `[lints] workspace = true`: every D3D11, DXGI and Media Foundation call is an `unsafe fn`
+# in windows-rs, so this crate cannot inherit `unsafe_code = "forbid"` (design doc 3.1, Q1). As in
+# streamcore-input-ffi, unsafe stays denied crate-wide; it is allowed only in `src/win/sys/`,
+# which wraps each API family in safe types, and every block carries a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+undocumented_unsafe_blocks = "deny"
