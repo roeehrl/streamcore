@@ -6,6 +6,7 @@ members = [
     "crates/streamcore-input",
     "crates/streamcore-input-ffi",
     "crates/streamcore-video",
+    "crates/streamcore-video-windows",
 ]
 resolver = "3"
 
@@ -33,6 +34,7 @@ opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristret
 argon2 = { version = "=0.5.3", features = ["zeroize"] }
 rand = "=0.8.5"
 hmac = "=0.12.1"
+windows = "=0.62.2"
 async-trait = "=0.1.92"
 
 [workspace.lints.rust]
