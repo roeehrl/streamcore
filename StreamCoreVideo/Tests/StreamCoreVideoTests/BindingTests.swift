@@ -131,7 +131,7 @@ final class FakeEncoder: StreamEncoder, @unchecked Sendable {
         return .submitted
     }
     func setRate(update: RateUpdate) throws {}
-    func invalidate() { output.sync {} }
+    func invalidate() -> InvalidateOutcome { output.sync {}; return .completed }
 }
 
 final class Encoders: EncoderFactory, @unchecked Sendable {

@@ -141,10 +141,15 @@ pub trait StreamEncoder: Send + Sync {
     fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError>;
     /// The one allowed wait (3.5): completes or discards pending output and
     /// returns within the stream's invalidate bound (500 ms). An adapter whose
-    /// platform call has no timeout runs it off the executor and waits with one
-    /// ([`crate::run_bounded`]). If it overruns, the executor stops counting this
-    /// session's frames against admission and reports `EncoderFailed`.
-    fn invalidate(&self);
+    /// platform call has no timeout runs it off the executor, waits with a bound
+    /// of its own below the stream's ([`crate::run_bounded`], 450 ms in the
+    /// shipped adapters) and returns [`InvalidateOutcome::TimedOut`] when that
+    /// bound passes. On `TimedOut`, or when the call itself overran the stream's
+    /// bound (a backstop), the executor treats the session as hung: it stops
+    /// counting the session's frames against admission (releases their
+    /// permits), counts `invalidate_timeouts` and posts `EncoderFailed`. Outputs
+    /// the session produces later carry its old generation and are discarded.
+    fn invalidate(&self) -> InvalidateOutcome;
 }
 
 /// Implemented by Rust; post-only; callable from any thread. Outputs must be
@@ -160,6 +165,21 @@ pub trait EncoderEvents: Send + Sync {
     fn dropped(&self, submit_seq: u64, reason: DropReason);
     /// The encoder can take input again after a `Busy` submit.
     fn input_ready(&self);
+    /// The session failed on its own, outside any `submit` (a lost device, a
+    /// fatal driver error), typically with no frame in flight, so no `dropped`
+    /// can carry the error: on a still screen the stream would otherwise learn
+    /// of it only at the next capture. A leaf call like the others: it posts
+    /// and returns, and carries this port's encoder generation (a call from a
+    /// replaced session is stale and ignored). The executor reacts as to a
+    /// failed submit: when `recoverable` (and `error` is not
+    /// `EncoderFailed { recoverable: false }`), it records a loss, reports
+    /// `ObserverJob::EncoderFailed` and rebuilds the encoder with a new
+    /// generation and IDR, more than 3 rebuilds in 10 s failing the stream (the
+    /// `DeviceLost` rule); otherwise it fails the stream with `error`'s wire
+    /// code. Frames still in the session are dropped as usual, by the adapter
+    /// or by the rebuild's `invalidate`; report the error once, either here or
+    /// as a frame's drop reason.
+    fn session_failed(&self, error: MediaError, recoverable: bool);
 }
 
 /// P1's send hop (3.5): the consumer's existing send path. From P2, `VideoSink`

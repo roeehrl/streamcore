@@ -18,11 +18,13 @@ implemented in P1 and says how each rule is enforced and tested.
 - The executor never blocks: no sleeps, no `.await`, no synchronous waits, with two bounded
   exceptions:
   - `Encoder::invalidate`, bounded by `StreamTimings::invalidate_bound_ns` (500 ms). An adapter
-    whose platform call has no timeout runs it off the executor and waits with one (`run_bounded`).
-    When the call overruns the bound, the executor posts `ObserverJob::EncoderFailed`, counts it
-    (`invalidate_timeouts`) and releases the hung session's permits, so a hung flush cannot stall
-    admission; a re-create continues with the new session. The hung session's later outputs carry
-    the old generation and are discarded.
+    whose platform call has no timeout runs it off the executor and waits with a bound of its own,
+    below the stream's (`run_bounded`; 450 ms in the shipped adapters), and returns
+    `InvalidateOutcome::TimedOut` when that bound passes. On `TimedOut`, or when the call itself
+    overruns the stream's bound (a backstop), the session is hung: the executor posts
+    `ObserverJob::EncoderFailed`, counts it (`invalidate_timeouts`) and releases the hung session's
+    permits, so a hung flush cannot stall admission; a re-create continues with the new session.
+    The hung session's later outputs carry the old generation and are discarded.
   - `EncoderFactory::create` (MFT activation or an NVENC open can take over a second). The executor
     runs it on a helper thread and waits at most `StreamTimings::create_bound_ns` (3 s). On overrun
     the start or re-create fails with `stream.encoder` (`create_timeouts`), and the late session is
@@ -79,6 +81,17 @@ never by a public call. After a `Busy` submit the frame stays retained; the enco
 `input_ready` once it can take input (MF `METransformNeedInput`), so a still screen still gets its
 frame encoded.
 
+A session can also die with nothing in flight (a lost device, a fatal driver error): no `dropped`
+can carry the error, and on a still screen no submit would meet it. The encoder then calls
+`EncoderEvents::session_failed(error, recoverable)`, a post-only leaf call that carries the
+encoder's generation like the other encoder events (a replaced session's call is stale). The
+executor reacts as to a failed submit: a recoverable error records a loss, posts
+`ObserverJob::EncoderFailed` and rebuilds the encoder with a new generation and IDR (more than 3
+rebuilds in 10 s fail the stream, the `DeviceLost` rule); `recoverable: false` (a lost device, as
+the shipped adapters report it) or `EncoderFailed { recoverable: false }` fails the stream. An
+encoder reports a failure once: as the drop reason of the frames it held, or, with none, through
+`session_failed`. It is not part of the per-frame C ABI.
+
 ## Leaf calls
 
 These may run on any thread. Each uses atomics or at most one short, non-nested Rust lock that is
@@ -113,8 +126,8 @@ releases it explicitly after `VideoOut::send` returns for that frame's packets, 
 is dropped or stale. A native encoder keeps its own reference until it has posted the frame's
 `encoded` or `dropped`, then drops it; on `Busy` or `Failed` it drops it before returning. When a
 session is torn down, the executor drops (but does not release) its references, so a permit that
-native code still holds keeps counting. The exception is an `invalidate` that overran its bound:
-that session's permits are released (see above).
+native code still holds keeps counting. The exception is a hung `invalidate` (one that returned
+`TimedOut` or overran the stream's bound): that session's permits are released (see above).
 
 ## Reentrancy rule
 

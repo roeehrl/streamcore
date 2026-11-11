@@ -174,6 +174,11 @@ pub(crate) enum Event {
     InputReady {
         encoder: u64,
     },
+    SessionFailed {
+        encoder: u64,
+        error: MediaError,
+        recoverable: bool,
+    },
     Encoded {
         encoder: u64,
         frame: EncodedFrame,
@@ -862,6 +867,16 @@ impl EncoderEvents for EncoderPort {
         if let Some(executor) = self.executor.upgrade() {
             executor.post(Event::InputReady {
                 encoder: self.encoder,
+            });
+        }
+    }
+
+    fn session_failed(&self, error: MediaError, recoverable: bool) {
+        if let Some(executor) = self.executor.upgrade() {
+            executor.post(Event::SessionFailed {
+                encoder: self.encoder,
+                error,
+                recoverable,
             });
         }
     }

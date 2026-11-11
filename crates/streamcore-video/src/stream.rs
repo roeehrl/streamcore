@@ -339,6 +339,11 @@ impl StreamState {
                     self.submit_due(cx);
                 }
             }
+            Event::SessionFailed {
+                encoder,
+                error,
+                recoverable,
+            } => self.on_session_failed(cx, encoder, error, recoverable),
             Event::Encoded { encoder, frame } => self.on_encoded(cx, encoder, frame),
             Event::Dropped {
                 encoder,
@@ -968,7 +973,7 @@ impl StreamState {
                 move || creating.create(spec, events),
                 |late| {
                     if let Ok(encoder) = late {
-                        encoder.invalidate();
+                        let _ = encoder.invalidate();
                     }
                 },
             );
@@ -985,7 +990,8 @@ impl StreamState {
                             .announced_codec
                             .is_some_and(|announced| announced != info.codec)
                     {
-                        encoder.invalidate();
+                        // Never installed: no frame of it is in flight.
+                        let _ = encoder.invalidate();
                         return Err(MediaError::Unsupported);
                     }
                     self.announced_codec = Some(info.codec);
@@ -1016,8 +1022,10 @@ impl StreamState {
     /// `invalidate` (the one allowed wait), then forget the session. In-flight
     /// entries of this session drop Rust's permit references without releasing
     /// them: a permit native code still holds keeps counting (2.5.1). An
-    /// invalidate that overran its bound reports `EncoderFailed` and releases
-    /// the hung session's permits, so a hung flush cannot stall admission.
+    /// invalidate that reported `TimedOut`, or overran the stream's bound (a
+    /// backstop for an adapter that returns late), counts as hung: it reports
+    /// `EncoderFailed` and releases the hung session's permits, so a hung flush
+    /// cannot stall admission.
     fn teardown_encoder(&mut self, cx: &Shared) {
         let Some(slot) = self.encoder.take() else {
             return;
@@ -1025,9 +1033,9 @@ impl StreamState {
         slot.sink.close();
         let started = Instant::now();
         debug_assert!(is_current(cx.id));
-        slot.encoder.invalidate();
+        let outcome = slot.encoder.invalidate();
         let bound = Duration::from_nanos(self.timings.invalidate_bound_ns);
-        let hung = started.elapsed() >= bound;
+        let hung = outcome == InvalidateOutcome::TimedOut || started.elapsed() >= bound;
         let entries: Vec<_> = self
             .in_flight
             .keys()
@@ -1093,27 +1101,56 @@ impl StreamState {
                 self.record_loss(cx, seq.unwrap_or(self.submitted_seq.saturating_add(1)));
                 self.submit_due(cx);
             }
-            MediaError::DeviceLost => {
-                let now = cx.clock.now_ns();
-                self.device_losses.push_back(now);
-                while self
-                    .device_losses
-                    .front()
-                    .is_some_and(|t| now.saturating_sub(*t) > DEVICE_LOSS_WINDOW_NS)
-                {
-                    self.device_losses.pop_front();
-                }
-                if self.device_losses.len() > MAX_DEVICE_LOSSES {
-                    self.fail(cx, codes::ENCODER);
-                } else {
-                    self.schedule_recreate(cx);
-                }
-            }
+            MediaError::DeviceLost => self.rebuild_encoder(cx),
             MediaError::OutOfResources => {
                 self.stalled = true;
             }
             error => self.fail(cx, error.wire_code(codes::ENCODE)),
         }
+    }
+
+    /// A new session with a new generation and IDR on the next wake; more than
+    /// 3 rebuilds in 10 s fail the stream.
+    fn rebuild_encoder(&mut self, cx: &Arc<Shared>) {
+        let now = cx.clock.now_ns();
+        self.device_losses.push_back(now);
+        while self
+            .device_losses
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) > DEVICE_LOSS_WINDOW_NS)
+        {
+            self.device_losses.pop_front();
+        }
+        if self.device_losses.len() > MAX_DEVICE_LOSSES {
+            self.fail(cx, codes::ENCODER);
+        } else {
+            self.schedule_recreate(cx);
+        }
+    }
+
+    /// `EncoderEvents::session_failed`: the session died outside any submit.
+    fn on_session_failed(
+        &mut self,
+        cx: &Arc<Shared>,
+        generation: u64,
+        error: MediaError,
+        recoverable: bool,
+    ) {
+        if !self.is_current_encoder(generation) || self.closing {
+            self.stats.stale_events += 1;
+            return;
+        }
+        let recoverable =
+            recoverable && error != (MediaError::EncoderFailed { recoverable: false });
+        if !recoverable {
+            self.fail(cx, error.wire_code(codes::ENCODE));
+            return;
+        }
+        self.stalled = false;
+        self.notify(cx, ObserverJob::EncoderFailed { error });
+        // Whatever the dead session still held may never arrive.
+        self.record_loss(cx, self.submitted_seq);
+        self.rebuild_encoder(cx);
     }
 
     // -----------------------------------------------------------------------

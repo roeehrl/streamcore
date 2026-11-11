@@ -13,8 +13,9 @@
 //! Failures. A failed event, a failed `ProcessOutput`, a `GetEvent` that keeps failing or a lost
 //! device ends the session: the event thread drops every frame still in the encoder (the oldest
 //! with `DeviceLost`, or `EncoderFailed { recoverable: true }` so a transient driver error rebuilds
-//! the encoder; the stream reacts once), later submits fail with the same error (refused under the
-//! book's lock, so no submit can slip in between), and the thread exits. A `ProcessInput` that fails otherwise
+//! the encoder; the stream reacts once) or, with nothing in flight, reports it with
+//! `session_failed` (`DeviceLost` non-recoverable), later submits fail with the same error (refused
+//! under the book's lock, so no submit can slip in between), and the thread exits. A `ProcessInput` that fails otherwise
 //! loses its frame but not its `NeedInput` credit.
 //!
 //! Teardown. Dropping the encoder hands `END_STREAMING`, `IMFShutdown` and `ShutdownObject` to an
@@ -46,8 +47,8 @@ use streamcore_video::bitstream::annexb_to_length_prefixed;
 use streamcore_video::{
     BitstreamForm, Codec, ColorPrimaries, ColorTags, DropReason, EncodeTimings, EncodedFrame,
     EncoderCaps, EncoderEvents, EncoderFactory, EncoderInfo, EncoderSpec, FeatureSupport,
-    MediaError, PixelFormat, RateUpdate, StreamEncoder, SubmitOpts, SubmitResult, SurfaceId,
-    TransferFunction, VideoSinkHandle, YCbCrMatrix, run_bounded,
+    InvalidateOutcome, MediaError, PixelFormat, RateUpdate, StreamEncoder, SubmitOpts,
+    SubmitResult, SurfaceId, TransferFunction, VideoSinkHandle, YCbCrMatrix, run_bounded,
 };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -477,17 +478,18 @@ impl Inner {
     }
 
     /// A session-ending MFT error. Later submits fail with it; every frame in the encoder is
-    /// dropped, the oldest with the error (`DeviceLost` or `EncoderFailed { recoverable: true }`:
-    /// either rebuilds the encoder) and the rest as no-output; with nothing in flight,
-    /// `input_ready` makes the stream submit again and meet the error.
+    /// dropped, the oldest with the error (`DeviceLost` or `EncoderFailed { recoverable: true }`)
+    /// and the rest as no-output; with nothing in flight, `session_failed` reports it
+    /// (`DeviceLost` as non-recoverable), so a still screen learns of it without a submit.
     fn fail(&self, failure: mf::Failure) {
         self.fail_with(failure, None);
     }
 
     /// `fail`, with `first` (a frame already taken out of the book) reported first.
     fn fail_with(&self, failure: mf::Failure, first: Option<Meta>) {
+        let device_lost = failure.device_lost;
         self.record_error(failure.message);
-        let error = if failure.device_lost {
+        let error = if device_lost {
             MediaError::DeviceLost
         } else {
             MediaError::EncoderFailed { recoverable: true }
@@ -500,13 +502,17 @@ impl Inner {
         }
         let metas: Vec<Meta> = first.into_iter().chain(taken.unwrap_or_default()).collect();
         lock(&self.accepted).clear();
+        // Decided from what `book.fail()` took under the book's lock: a submit racing this either
+        // got in first (and is dropped here with the error) or is refused with `Failed`.
         let reported = !metas.is_empty();
-        let mut reason = Some(DropReason::Error { error });
+        let mut reason = Some(DropReason::Error {
+            error: error.clone(),
+        });
         for m in metas {
             self.drop_frame(m, reason.take().unwrap_or(DropReason::NoOutput));
         }
         if !reported && !self.invalidated.load(Ordering::Acquire) {
-            self.events.input_ready();
+            self.events.session_failed(error, !device_lost);
         }
     }
 
@@ -693,12 +699,12 @@ impl StreamEncoder for MfEncoder {
             .map_err(|_| MediaError::Unsupported)
     }
 
-    fn invalidate(&self) {
+    fn invalidate(&self) -> InvalidateOutcome {
         // Discard pending output (`COMMAND_FLUSH`), bounded: a flush that hangs is left on its
         // helper thread, and this session's frames are dropped (their permits released) now, so
-        // a hung flush does not hold admission.
+        // a hung flush does not hold admission. `TimedOut` tells the stream the session hung.
         let Some(inner) = &self.inner else {
-            return;
+            return InvalidateOutcome::Completed;
         };
         inner.invalidated.store(true, Ordering::Release);
         let helper = inner.clone();
@@ -707,10 +713,12 @@ impl StreamEncoder for MfEncoder {
             let _ = helper.encoder.flush();
             helper.abandon_all();
         });
-        if !finished {
-            inner.record_error("MFT flush did not finish within 450 ms".into());
-            inner.abandon_all();
+        if finished {
+            return InvalidateOutcome::Completed;
         }
+        inner.record_error("MFT flush did not finish within 450 ms".into());
+        inner.abandon_all();
+        InvalidateOutcome::TimedOut
     }
 }
 

@@ -464,8 +464,14 @@ impl CaptureBackend for FakeCapture {
 pub enum InvalidateMode {
     /// Return at once; pending outputs stay with the test.
     Quick,
-    /// The platform call never returns: the adapter waits with `run_bounded`.
+    /// The platform call never returns: the adapter waits with `run_bounded`
+    /// past the stream's bound and reports `Completed` (the executor's elapsed
+    /// backstop must catch it).
     Stuck,
+    /// The platform call never returns: the adapter waits with `run_bounded`
+    /// for this bound, below the stream's, and reports `TimedOut` (as the
+    /// shipped adapters do, at 450 ms).
+    TimesOut(Duration),
 }
 
 pub struct Pending {
@@ -602,8 +608,8 @@ impl Encoder for FakeEncoder {
         lock(&self.rates).push(update);
         Ok(())
     }
-    fn invalidate(&self) {
-        self.invalidate_now();
+    fn invalidate(&self) -> InvalidateOutcome {
+        self.invalidate_now()
     }
 }
 
@@ -636,19 +642,39 @@ impl FakeEncoder {
         SubmitResult::Submitted
     }
 
-    fn invalidate_now(&self) {
+    fn invalidate_now(&self) -> InvalidateOutcome {
         let _call = self.log.outbound();
         self.invalidated.fetch_add(1, Ordering::SeqCst);
-        if *lock(&self.invalidate_mode) == InvalidateMode::Stuck {
-            let unstick = self.unstick.clone();
-            run_bounded(Duration::from_millis(500), move || {
-                let (stuck, cv) = &*unstick;
-                let mut released = lock(stuck);
-                while !*released {
-                    released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
-                }
-            });
+        let (bound, report) = match *lock(&self.invalidate_mode) {
+            InvalidateMode::Quick => return InvalidateOutcome::Completed,
+            InvalidateMode::Stuck => (Duration::from_millis(500), false),
+            InvalidateMode::TimesOut(bound) => (bound, true),
+        };
+        let unstick = self.unstick.clone();
+        let finished = run_bounded(bound, move || {
+            let (stuck, cv) = &*unstick;
+            let mut released = lock(stuck);
+            while !*released {
+                released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+            }
+        });
+        if finished || !report {
+            InvalidateOutcome::Completed
+        } else {
+            InvalidateOutcome::TimedOut
         }
+    }
+
+    /// The session dies with nothing submitted (`EncoderEvents::session_failed`).
+    pub fn fail_session(&self, error: MediaError, recoverable: bool) {
+        self.events.session_failed(error, recoverable);
+    }
+
+    /// Let a `Stuck` or `TimesOut` platform call return.
+    pub fn unstick(&self) {
+        let (stuck, cv) = &*self.unstick;
+        *lock(stuck) = true;
+        cv.notify_all();
     }
 }
 
