@@ -268,7 +268,7 @@ everything else. Rust backends call the traits directly.
 | encoder output | `streamcore_video_encoded(sink, &output)`: payload and configuration copied once, straight from the encoder's buffer, plus metadata; posts `dropped` itself when the bytes are refused | `submit_encoded` + `EncoderEvents::encoded` |
 | wake, drain | the attached `wake(queue)`; `streamcore_video_run(port)` | `SerialQueue::wake`, `StreamPort::run` |
 | send | the attached `send(out, &packet)`: metadata and the bytes' address and length, lent until `streamcore_video_packet_release(key)`, so the bytes are not copied out | `VideoOut::send` |
-| send completion | `streamcore_video_packet_complete(key, accepted)`, before or after the release (a consumer may copy the bytes at once and complete later); the receipt is kept until completed or the stream closes | `SinkReceipt::complete` |
+| send completion | `streamcore_video_packet_complete(key, accepted)`, before or after the release (a consumer may copy the bytes at once and complete later); the receipt is kept until completed or the stream closes; a released packet not completed within 5 s, or beyond 64 waiting per stream, counts as refused | `SinkReceipt::complete` |
 
 Native code names Rust objects by key (`StreamPort::native_key`, `VideoSinkHandle::native_key`, the
 packet's `key`), never by pointer, and a key whose object is gone names nothing. The attached
@@ -280,7 +280,10 @@ as it may call it: the queue and `VideoOut` until `Closed` (the wake holds a clo
 the call), the encoder while its session is current, the capture backend while a lease's weak
 reference to it upgrades. A NULL function keeps the UniFFI call. Every rule above applies to the C
 forms unchanged. A panic inside a C call does not unwind into native code: it is caught, the
-stream fails with `stream.output`, and the call returns its "not taken" value. A permit released
+stream fails with `stream.output`, and the call returns its "not taken" value. A panic inside a
+drain (UniFFI or C, a backend callback or Rust) fails and closes the stream (`stream.output`, the
+capture is stopped and the close completes); if that panics too, the stream is abandoned: posts
+are refused, native references dropped and the close completes with `StopUnknown`. A permit released
 after a drain's last check is posted when the drain ends. `streamcore_video_encoded` is the crate's only `unsafe` code: it reads the
 caller's output struct and byte ranges for the duration of the call; the other exports need
 `allow(unsafe_code)` only for `no_mangle`. Swift helpers are in

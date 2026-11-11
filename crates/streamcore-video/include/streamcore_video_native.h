@@ -140,7 +140,9 @@ bool streamcore_video_encoded(uint64_t sink, const streamcore_video_encoded_outp
 void streamcore_video_packet_complete(uint64_t packet, bool accepted);
 
 // Ends the loan of a packet's bytes: its descriptor and bytes are freed; the send is not
-// completed by it. Once; any thread.
+// completed by it. Once; any thread. A released packet must be completed within 5 s, and at
+// most 64 released packets per stream wait for their completion; beyond either, the oldest
+// counts as refused (a loss).
 void streamcore_video_packet_release(uint64_t packet);
 
 #ifdef __cplusplus

@@ -396,17 +396,26 @@ fn blocking_entry_points_are_refused_on_executors_and_network_workers() {
     s.close();
 }
 
+/// Debug builds assert (the panic hook reports "rule 6"); the drain contains
+/// the panic like any other, failing and closing the stream.
 #[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "rule 6")]
 fn close_and_wait_on_an_executor_asserts_in_debug_builds() {
     let s = Manual::new();
     s.start_running();
     let controller = s.controller.clone();
+    s.frame(1_000);
     *lock(&s.encoder().on_submit) = Some(Box::new(move || {
         let _ = controller.close_and_wait(10);
     }));
-    s.frame(1_000);
+    s.encoder().complete(1);
+    s.pump();
+    s.frame(2_000);
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::OUTPUT.to_string()]);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    assert_eq!(s.controller.close_outcome(), Some(CloseOutcome::Closed));
 }
 
 #[test]

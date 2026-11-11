@@ -841,6 +841,13 @@ impl StreamState {
         self.request_stop(cx);
     }
 
+    /// A drain panicked: report `stream.output` and close, as for a failure the
+    /// consumer cannot recover from.
+    pub(crate) fn fail_after_panic(&mut self, cx: &Arc<Shared>) {
+        self.fail(cx, codes::OUTPUT);
+        self.on_close(cx);
+    }
+
     fn on_close(&mut self, cx: &Arc<Shared>) {
         if self.closing {
             return;

@@ -10,6 +10,7 @@ use crate::traits::*;
 use crate::types::*;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::task::Waker;
@@ -484,14 +485,19 @@ impl Shared {
             None => drop(batch),
             Some(mut state) => {
                 let marker = DrainMarker::enter(self.id);
-                for event in batch {
-                    state.handle(self, event);
-                }
-                while self.permit_released.swap(false, Ordering::AcqRel) {
-                    state.handle(self, Event::PermitReleased);
-                }
-                state.after_drain(self);
-                if state.is_closed() {
+                let drain = &mut state;
+                let drained = catch_unwind(AssertUnwindSafe(move || {
+                    for event in batch {
+                        drain.handle(self, event);
+                    }
+                    while self.permit_released.swap(false, Ordering::AcqRel) {
+                        drain.handle(self, Event::PermitReleased);
+                    }
+                    drain.after_drain(self);
+                }));
+                if drained.is_err() && !self.recover(&mut state) {
+                    self.abandon(state);
+                } else if state.is_closed() {
                     self.finalize(state);
                 } else {
                     *lock(&self.state) = Some(state);
@@ -523,14 +529,65 @@ impl Shared {
         match state {
             Some(mut state) => {
                 let marker = DrainMarker::enter(self.id);
-                state.handle_frame_inline(self, event);
-                state.publish(self);
-                *lock(&self.state) = Some(state);
+                let drain = &mut state;
+                let drained = catch_unwind(AssertUnwindSafe(move || {
+                    drain.handle_frame_inline(self, event);
+                    drain.publish(self);
+                }));
+                if drained.is_err() && !self.recover(&mut state) {
+                    self.abandon(state);
+                } else if state.is_closed() {
+                    self.finalize(state);
+                } else {
+                    *lock(&self.state) = Some(state);
+                }
                 drop(marker);
             }
             None => self.post(event),
         }
         self.end_drain();
+    }
+
+    /// A drain panicked (a backend callback, or Rust): fail the stream
+    /// (`stream.output`) and close it, so the capture stops and the close
+    /// completes as for any failure. False when that panics too.
+    fn recover(self: &Arc<Self>, state: &mut StreamState) -> bool {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.revoke();
+            state.fail_after_panic(self);
+            state.after_drain(self);
+        }))
+        .is_ok()
+    }
+
+    /// The stream cannot run any more: refuse every post, drop every native
+    /// reference and complete the close with `StopUnknown` (native state is
+    /// unknown). The capture is not stopped: nothing can be called safely.
+    fn abandon(&self, state: Box<StreamState>) {
+        self.revoked.store(true, Ordering::Release);
+        let leftovers = {
+            let mut mailbox = lock(&self.mailbox);
+            mailbox.closed = true;
+            std::mem::take(&mut mailbox.events)
+        };
+        let queue = {
+            let mut queue = lock(&self.queue);
+            *lock(&self.native) = NativeStream::default();
+            queue.take()
+        };
+        *lock(&self.capture_port) = Weak::new();
+        native::close_stream(self.id);
+        let out = lock(&self.out).take();
+        {
+            let mut published = lock(&self.published);
+            published.phase = StreamPhase::Closed;
+        }
+        // Dropping the state releases its leases and permits; a panic there is
+        // contained as well.
+        let _ = catch_unwind(AssertUnwindSafe(move || {
+            drop((state, leftovers, queue, out))
+        }));
+        self.close_slot.complete(CloseOutcome::StopUnknown);
     }
 
     fn finalize(&self, state: Box<StreamState>) {

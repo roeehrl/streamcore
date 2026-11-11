@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use streamcore_media::media::{MAX_FRAME_LENGTH, VIDEO_HEADER_LENGTH};
 
 // ---------------------------------------------------------------------------
@@ -53,9 +54,48 @@ fn next_key() -> u64 {
 static SINKS: Mutex<BTreeMap<u64, Weak<VideoSinkHandle>>> = Mutex::new(BTreeMap::new());
 static PORTS: Mutex<BTreeMap<u64, Weak<StreamPort>>> = Mutex::new(BTreeMap::new());
 static PACKETS: Mutex<BTreeMap<u64, Arc<NativePacket>>> = Mutex::new(BTreeMap::new());
-/// Receipts of lent packets, by packet key, with their stream's executor id:
-/// kept until completed or the stream closes, independently of the bytes.
-static RECEIPTS: Mutex<BTreeMap<u64, (u64, SinkReceipt)>> = Mutex::new(BTreeMap::new());
+/// Receipts of lent packets, by packet key: kept until completed or the stream
+/// closes, independently of the bytes, but a released packet not completed
+/// within `RELEASED_GRACE`, or beyond `RELEASED_CAP` such packets per stream,
+/// counts as refused.
+static RECEIPTS: Mutex<BTreeMap<u64, Lent>> = Mutex::new(BTreeMap::new());
+
+struct Lent {
+    /// The stream's executor id.
+    stream: u64,
+    receipt: SinkReceipt,
+    /// When native code released the bytes.
+    released: Option<Instant>,
+}
+
+/// How long a released packet may wait for its completion (a send path
+/// completes a packet once written; minutes-long waits mean it never will).
+pub const RELEASED_GRACE: Duration = Duration::from_secs(5);
+/// Released packets waiting for their completion, per stream.
+pub const RELEASED_CAP: usize = 64;
+
+/// Refuse the stream's released packets past the grace period or the cap
+/// (oldest first). Dropped outside the lock.
+fn expire_released(stream: u64) {
+    let now = Instant::now();
+    let expired: Vec<Lent> = {
+        let mut receipts = lock(&RECEIPTS);
+        let mut released: Vec<(u64, Instant)> = receipts
+            .iter()
+            .filter(|(_, lent)| lent.stream == stream)
+            .filter_map(|(key, lent)| lent.released.map(|at| (*key, at)))
+            .collect();
+        released.sort_by_key(|(_, at)| *at);
+        let over = released.len().saturating_sub(RELEASED_CAP);
+        released
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, at))| *index < over || now.duration_since(*at) > RELEASED_GRACE)
+            .filter_map(|(_, (key, _))| receipts.remove(key))
+            .collect()
+    };
+    drop(expired);
+}
 
 /// Runs an export's body; a panic must not unwind into native code. The
 /// stream concerned, if any, is failed (`stream.output`) and `fallback`
@@ -548,8 +588,16 @@ pub(crate) fn send(
         _bytes: bytes,
     });
     let address = std::ptr::from_ref(&packet.descriptor);
-    lock(&RECEIPTS).insert(key, (stream, receipt));
+    lock(&RECEIPTS).insert(
+        key,
+        Lent {
+            stream,
+            receipt,
+            released: None,
+        },
+    );
     lock(&PACKETS).insert(key, packet);
+    expire_released(stream);
     // No lock held: native code may complete and release the packet inside.
     (callback.1)(callback.0.get(), address);
 }
@@ -561,19 +609,26 @@ pub(crate) fn send(
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_packet_complete(packet: u64, accepted: bool) {
-    let receipt = lock(&RECEIPTS).remove(&packet);
-    if let Some((_, receipt)) = receipt {
-        guarded((), || None, || receipt.complete(accepted));
+    let lent = lock(&RECEIPTS).remove(&packet);
+    if let Some(lent) = lent {
+        guarded((), || None, || lent.receipt.complete(accepted));
     }
 }
 
 /// Ends the loan of the packet's bytes: its descriptor and bytes are freed.
-/// It does not complete the send. Any thread.
+/// It does not complete the send, but the completion must then come within
+/// `RELEASED_GRACE` (and at most `RELEASED_CAP` such packets wait per stream),
+/// else the packet counts as refused. Any thread.
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_packet_release(packet: u64) {
-    let packet = lock(&PACKETS).remove(&packet);
-    drop(packet);
+    let bytes = lock(&PACKETS).remove(&packet);
+    if bytes.is_some()
+        && let Some(lent) = lock(&RECEIPTS).get_mut(&packet)
+    {
+        lent.released = Some(Instant::now());
+    }
+    drop(bytes);
 }
 
 /// The stream `stream` closed: its packets never completed count as refused
@@ -583,7 +638,7 @@ pub(crate) fn close_stream(stream: u64) {
         let mut receipts = lock(&RECEIPTS);
         let keys: Vec<u64> = receipts
             .iter()
-            .filter(|(_, (owner, _))| *owner == stream)
+            .filter(|(_, lent)| lent.stream == stream)
             .map(|(key, _)| *key)
             .collect();
         keys.into_iter()

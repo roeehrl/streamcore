@@ -423,3 +423,83 @@ fn a_restarted_capture_needs_a_full_frame_first() {
     s.close();
     s.assert_clean();
 }
+
+/// A backend callback that panics inside a drain fails and closes the stream:
+/// the capture stops, the close completes and nothing leaks.
+fn panicking_submit_closes_the_stream(inline: bool) {
+    let s = Manual::new();
+    s.start_running();
+    s.frame(1_000);
+    let encoder = s.encoder();
+    encoder.complete(1);
+    s.pump();
+    while s.out.finish_any(0, true) {}
+    s.pump();
+    *lock(&encoder.on_submit) = Some(Box::new(|| panic!("backend bug")));
+    if inline {
+        // The capture callback's inline drain submits.
+        s.frame(2_000);
+    } else {
+        // A busy submit retained the frame; the drain run by `input_ready` submits.
+        encoder.busy_next.store(true, Ordering::SeqCst);
+        *lock(&encoder.on_submit) = None;
+        s.frame(2_000);
+        *lock(&encoder.on_submit) = Some(Box::new(|| panic!("backend bug")));
+        encoder.ready();
+    }
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::OUTPUT.to_string()]);
+    assert_eq!(s.capture.count(Op::Stop), 1, "the capture stops");
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    assert_eq!(s.controller.close_outcome(), Some(CloseOutcome::Closed));
+    assert_eq!(s.observer.closed(), Some(CloseOutcome::Closed));
+    assert_eq!(s.controller.phase(), StreamPhase::Closed);
+    s.assert_clean();
+}
+
+#[test]
+fn a_panic_in_an_inline_drain_closes_the_stream() {
+    panicking_submit_closes_the_stream(true);
+}
+
+#[test]
+fn a_panic_in_a_queued_drain_closes_the_stream() {
+    panicking_submit_closes_the_stream(false);
+}
+
+/// Released packets waiting for a completion are bounded per stream: past the
+/// cap the oldest counts as refused.
+#[test]
+fn released_packets_never_completed_are_bounded() {
+    let s = Manual::native();
+    s.start_running();
+    s.frame(1_000);
+    let encoder = s.encoder();
+    let mut released = 0;
+    for n in 1..=(RELEASED_CAP as u64 + 2) {
+        if n > 1 {
+            s.frame_native(n * 1_000);
+        }
+        encoder.complete_all();
+        s.pump();
+        // Config packets complete at once; the sample's bytes are released only.
+        let keys: Vec<u64> = lock(&s.out.state)
+            .receipts
+            .drain(..)
+            .filter_map(|(_, receipt)| match receipt {
+                Receipt::Native(key) => Some(key),
+                Receipt::Uniffi(_) => None,
+            })
+            .collect();
+        for key in keys {
+            streamcore_video_packet_release(key);
+            released += 1;
+        }
+        s.pump();
+    }
+    assert!(released > RELEASED_CAP);
+    assert!(s.controller.stats().packets_refused >= 1);
+    s.close();
+    s.assert_clean();
+}
