@@ -1,0 +1,33 @@
+# Lints the Windows-only crate on a GitHub-hosted Windows runner. Clippy only: the crate's
+# hardware paths (WGC capture, the video processor, the hardware encoder) need a real GPU and
+# an interactive session, which hosted runners don't have; they are measured on a lab PC.
+name: windows-clippy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-clippy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Clippy (streamcore-video and streamcore-video-windows, all features)
+        shell: bash
+        run: >
+          cargo clippy --locked --all-targets --all-features
+          -p streamcore-video -p streamcore-video-windows -- -D warnings
