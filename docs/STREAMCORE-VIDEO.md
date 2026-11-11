@@ -316,11 +316,13 @@ pub trait Encoder: Send + Sync {
     fn info(&self) -> EncoderInfo;                   // codec created, hardware, low latency confirmed
     fn submit(&self, frame: SurfaceId, opts: SubmitOpts, permit: Arc<VideoWorkPermit>) -> SubmitResult;  // never blocks or replaces the session
     fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError>;
-    fn invalidate(&self);                            // the one allowed wait (3.5): pending output, bounded in time
+    fn invalidate(&self) -> InvalidateOutcome;       // the one allowed wait (3.5): pending output, bounded in time; Completed | TimedOut (hung)
 }
 pub trait EncoderEvents: Send + Sync {               // Rust; post-only; any thread
     fn encoded(&self, frame: EncodedFrame);          // metadata + payload token
     fn dropped(&self, submit_seq: u64, reason: DropReason);   // includes no-output completions
+    fn input_ready(&self);                           // after a Busy submit
+    fn session_failed(&self, error: MediaError, recoverable: bool);  // the session died with no frame to carry the error
 }
 ```
 

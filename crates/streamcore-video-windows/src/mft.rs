@@ -168,6 +168,16 @@ pub fn permit_target(min_inputs_before_output: Option<u64>) -> u8 {
     min_inputs_before_output.unwrap_or(1).clamp(1, 3) as u8
 }
 
+/// What a session failure reports, from `MftBook::fail`'s result (`taken`, read under the book's
+/// lock) and `first` (a frame already taken out of the book): the frames to drop, `first` and then
+/// the oldest, and whether this is the session's first failure. Only the first failure reports
+/// `session_failed`, once, after its drops; a later one (`taken` is `None`) only drops `first`.
+pub fn failure_report<M>(first: Option<M>, taken: Option<Vec<M>>) -> (Vec<M>, bool) {
+    let first_failure = taken.is_some();
+    let frames = first.into_iter().chain(taken.unwrap_or_default()).collect();
+    (frames, first_failure)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +275,29 @@ mod tests {
         assert_eq!(b.fail(), None);
         assert_eq!(b.submit(30, "s3", 3), (Accept::Failed("s3"), Some(3)));
         assert_eq!(b.need_input(), None);
+    }
+
+    #[test]
+    fn a_failure_reports_the_session_once_with_or_without_frames() {
+        // Frames in flight: dropped, and the session reported.
+        let mut b: MftBook<&str, u32> = MftBook::default();
+        b.need_input();
+        assert_eq!(b.submit(10, "s1", 1), (Accept::Now("s1"), None));
+        assert_eq!(failure_report(None, b.fail()), (vec![1], true));
+        // Nothing in flight: still reported, once.
+        let mut b: MftBook<&str, u32> = MftBook::default();
+        assert_eq!(failure_report(None, b.fail()), (vec![], true));
+        assert_eq!(failure_report(None, b.fail()), (vec![], false));
+        // The device-lost feed path: its frame first, then the session, once.
+        let mut b: MftBook<&str, u32> = MftBook::default();
+        b.need_input();
+        b.need_input();
+        assert_eq!(b.submit(10, "s1", 1), (Accept::Now("s1"), None));
+        assert_eq!(b.submit(20, "s2", 2), (Accept::Now("s2"), None));
+        let first = b.input_failed(20, false);
+        assert_eq!(failure_report(first, b.fail()), (vec![2, 1], true));
+        // A later feed failure on the failed session drops its frame only.
+        assert_eq!(failure_report(Some(3), b.fail()), (vec![3], false));
     }
 
     #[test]

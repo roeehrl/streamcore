@@ -132,7 +132,11 @@ pub(crate) struct StreamState {
     recreate_scheduled: bool,
     /// Busy or out of resources: wait for an output, a drop or a new frame.
     stalled: bool,
-    device_losses: VecDeque<u64>,
+    failure_rebuilds: VecDeque<u64>,
+    /// The session whose failure already scheduled its rebuild: a second
+    /// report of the same failure (a `DeviceLost` drop, then `session_failed`)
+    /// neither rebuilds again nor counts again.
+    failed_generation: Option<u64>,
 
     latest: Option<Retained>,
     /// (H1 of the latest frame, executor clock then): maps the executor clock to
@@ -165,8 +169,8 @@ pub(crate) struct StreamState {
     stats: StatsSnapshot,
 }
 
-const DEVICE_LOSS_WINDOW_NS: u64 = 10_000_000_000;
-const MAX_DEVICE_LOSSES: usize = 3;
+const FAILURE_REBUILD_WINDOW_NS: u64 = 10_000_000_000;
+const MAX_FAILURE_REBUILDS: usize = 3;
 const MAX_STOP_WAITERS: usize = 16;
 
 /// Rust is the single validator (2.5.8): nothing reaches native allocation
@@ -267,7 +271,8 @@ impl StreamState {
             announced_codec: None,
             recreate_scheduled: false,
             stalled: false,
-            device_losses: VecDeque::new(),
+            failure_rebuilds: VecDeque::new(),
+            failed_generation: None,
             latest: None,
             time_anchor: None,
             last_pts_ns: 0,
@@ -339,6 +344,11 @@ impl StreamState {
                     self.submit_due(cx);
                 }
             }
+            Event::SessionFailed {
+                encoder,
+                error,
+                recoverable,
+            } => self.on_session_failed(cx, encoder, error, recoverable),
             Event::Encoded { encoder, frame } => self.on_encoded(cx, encoder, frame),
             Event::Dropped {
                 encoder,
@@ -968,7 +978,7 @@ impl StreamState {
                 move || creating.create(spec, events),
                 |late| {
                     if let Ok(encoder) = late {
-                        encoder.invalidate();
+                        let _ = encoder.invalidate();
                     }
                 },
             );
@@ -985,7 +995,8 @@ impl StreamState {
                             .announced_codec
                             .is_some_and(|announced| announced != info.codec)
                     {
-                        encoder.invalidate();
+                        // Never installed: no frame of it is in flight.
+                        let _ = encoder.invalidate();
                         return Err(MediaError::Unsupported);
                     }
                     self.announced_codec = Some(info.codec);
@@ -1016,8 +1027,10 @@ impl StreamState {
     /// `invalidate` (the one allowed wait), then forget the session. In-flight
     /// entries of this session drop Rust's permit references without releasing
     /// them: a permit native code still holds keeps counting (2.5.1). An
-    /// invalidate that overran its bound reports `EncoderFailed` and releases
-    /// the hung session's permits, so a hung flush cannot stall admission.
+    /// invalidate that reported `TimedOut`, or overran the stream's bound (a
+    /// backstop for an adapter that returns late), counts as hung: it reports
+    /// `EncoderFailed` and releases the hung session's permits, so a hung flush
+    /// cannot stall admission.
     fn teardown_encoder(&mut self, cx: &Shared) {
         let Some(slot) = self.encoder.take() else {
             return;
@@ -1025,9 +1038,9 @@ impl StreamState {
         slot.sink.close();
         let started = Instant::now();
         debug_assert!(is_current(cx.id));
-        slot.encoder.invalidate();
+        let outcome = slot.encoder.invalidate();
         let bound = Duration::from_nanos(self.timings.invalidate_bound_ns);
-        let hung = started.elapsed() >= bound;
+        let hung = outcome == InvalidateOutcome::TimedOut || started.elapsed() >= bound;
         let entries: Vec<_> = self
             .in_flight
             .keys()
@@ -1093,26 +1106,95 @@ impl StreamState {
                 self.record_loss(cx, seq.unwrap_or(self.submitted_seq.saturating_add(1)));
                 self.submit_due(cx);
             }
-            MediaError::DeviceLost => {
-                let now = cx.clock.now_ns();
-                self.device_losses.push_back(now);
-                while self
-                    .device_losses
-                    .front()
-                    .is_some_and(|t| now.saturating_sub(*t) > DEVICE_LOSS_WINDOW_NS)
-                {
-                    self.device_losses.pop_front();
-                }
-                if self.device_losses.len() > MAX_DEVICE_LOSSES {
-                    self.fail(cx, codes::ENCODER);
-                } else {
-                    self.schedule_recreate(cx);
-                }
-            }
+            MediaError::DeviceLost => self.rebuild_encoder(cx),
             MediaError::OutOfResources => {
                 self.stalled = true;
             }
             error => self.fail(cx, error.wire_code(codes::ENCODE)),
+        }
+    }
+
+    /// A rebuild caused by an encoder failure (a `DeviceLost` drop or any
+    /// `session_failed` that does not fail the stream): a new session with a
+    /// new generation and IDR on the next wake. All of them share one budget:
+    /// more than 3 in 10 s fail the stream. Rebuilds the executor starts itself
+    /// (colour change, codec fallback, resize) call `schedule_recreate`
+    /// directly and do not count.
+    fn rebuild_encoder(&mut self, cx: &Arc<Shared>) {
+        let generation = self.encoder.as_ref().map(|slot| slot.generation);
+        if generation.is_some() && generation == self.failed_generation {
+            return;
+        }
+        self.failed_generation = generation;
+        let now = cx.clock.now_ns();
+        self.failure_rebuilds.push_back(now);
+        while self
+            .failure_rebuilds
+            .front()
+            .is_some_and(|t| now.saturating_sub(*t) > FAILURE_REBUILD_WINDOW_NS)
+        {
+            self.failure_rebuilds.pop_front();
+        }
+        if self.failure_rebuilds.len() > MAX_FAILURE_REBUILDS {
+            self.fail(cx, codes::ENCODER);
+        } else {
+            self.schedule_recreate(cx);
+        }
+    }
+
+    /// `EncoderEvents::session_failed`: the session died outside any submit.
+    fn on_session_failed(
+        &mut self,
+        cx: &Arc<Shared>,
+        generation: u64,
+        error: MediaError,
+        recoverable: bool,
+    ) {
+        if !self.is_current_encoder(generation) || self.closing {
+            self.stats.stale_events += 1;
+            return;
+        }
+        if self.failed_generation == Some(generation) {
+            // Already reported (a frame's `DeviceLost` drop): its rebuild is
+            // scheduled and counted. Until it runs the session is still
+            // current, so the generation check alone cannot catch this.
+            self.stats.stale_events += 1;
+            return;
+        }
+        // Keyed on the error type, as for a dropped frame: `DeviceLost` always
+        // rebuilds (a GPU reset is often survived by re-creating the device),
+        // whatever `recoverable` says; the rebuild budget decides.
+        if error == MediaError::DeviceLost {
+            self.stalled = false;
+            self.lose_in_flight(cx, generation);
+            self.rebuild_encoder(cx);
+            return;
+        }
+        let recoverable =
+            recoverable && error != (MediaError::EncoderFailed { recoverable: false });
+        if !recoverable {
+            self.fail(cx, error.wire_code(codes::ENCODE));
+            return;
+        }
+        self.stalled = false;
+        self.notify(cx, ObserverJob::EncoderFailed { error });
+        self.lose_in_flight(cx, generation);
+        self.rebuild_encoder(cx);
+    }
+
+    /// Frames the dead session still holds will never be output, and their
+    /// drops will arrive stale once the rebuild has replaced the session: count
+    /// them lost now. With nothing in flight no frame was lost, and the
+    /// rebuild's IDR restarts the stream, so no loss is recorded.
+    fn lose_in_flight(&mut self, cx: &Shared, generation: u64) {
+        let newest = self
+            .in_flight
+            .keys()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, seq)| *seq)
+            .max();
+        if let Some(seq) = newest {
+            self.record_loss(cx, seq);
         }
     }
 

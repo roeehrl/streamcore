@@ -482,6 +482,17 @@ pub enum SubmitResult {
     Failed { error: MediaError },
 }
 
+/// What [`crate::StreamEncoder::invalidate`] reports (3.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum InvalidateOutcome {
+    /// Pending output was completed or discarded within the adapter's bound.
+    Completed,
+    /// The platform call overran the adapter's bound and was left running. The
+    /// executor treats the session as hung: it releases the session's permits,
+    /// counts `invalidate_timeouts` and posts `ObserverJob::EncoderFailed`.
+    TimedOut,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct RateUpdate {
     pub bitrate_bps: u64,
@@ -643,6 +654,8 @@ pub struct StatsSnapshot {
     pub packets_refused: u64,
     pub recoveries: u64,
     pub encoders_created: u64,
+    /// `invalidate` calls that reported [`InvalidateOutcome::TimedOut`] or
+    /// overran `StreamTimings::invalidate_bound_ns`.
     pub invalidate_timeouts: u64,
     /// `EncoderFactory::create` calls that overran their bound.
     pub create_timeouts: u64,
@@ -679,7 +692,8 @@ pub enum ObserverJob {
         layout: DisplayLayout,
     },
     /// An encoder session failed and was replaced (or abandoned): an
-    /// `invalidate` that overran its bound. The stream continues.
+    /// `invalidate` that timed out, or a recoverable
+    /// [`crate::EncoderEvents::session_failed`]. The stream continues.
     EncoderFailed {
         error: MediaError,
     },
