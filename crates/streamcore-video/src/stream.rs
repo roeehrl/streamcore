@@ -163,7 +163,11 @@ pub(crate) fn validate(spec: &CaptureSpec, plan: &StreamPlan) -> Result<(), Medi
     let fps = i64::from(plan.fps);
     if !dims(plan.encode_width, plan.encode_height)
         || !dims(spec.pixel_width, spec.pixel_height)
-        || !valid_video_settings(i64::from(plan.encode_width.max(plan.encode_height)), fps, 0.0)
+        || !valid_video_settings(
+            i64::from(plan.encode_width.max(plan.encode_height)),
+            fps,
+            0.0,
+        )
         || plan.bitrate_bps == 0
         || !(1..=3).contains(&plan.permit_target)
         || spec.queue_depth == 0
@@ -868,7 +872,9 @@ impl StreamState {
                     let info = encoder.info();
                     // The announced codec is the one created; a replacement keeps it.
                     if info.codec != codec
-                        || self.announced_codec.is_some_and(|announced| announced != info.codec)
+                        || self
+                            .announced_codec
+                            .is_some_and(|announced| announced != info.codec)
                     {
                         encoder.invalidate();
                         return Err(MediaError::Unsupported);
@@ -1109,7 +1115,10 @@ impl StreamState {
         let opts = SubmitOpts {
             submit_seq: seq,
             pts_ns,
-            capture_ns: latest.info.source_present_ns.unwrap_or(latest.info.capture_ns),
+            capture_ns: latest
+                .info
+                .source_present_ns
+                .unwrap_or(latest.info.capture_ns),
             force_keyframe,
         };
         debug_assert!(is_current(cx.id));

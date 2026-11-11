@@ -58,7 +58,8 @@ impl StreamController {
     /// Rate, capture parameters or encode size.
     pub fn update(&self, update: StreamUpdate) -> OpToken {
         let op = self.next_command();
-        self.shared.post(Event::Command(Command::Update(op, update)));
+        self.shared
+            .post(Event::Command(Command::Update(op, update)));
         op
     }
 

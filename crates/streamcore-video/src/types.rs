@@ -24,8 +24,14 @@ pub struct OpToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum SurfaceKind {
     IoSurface,
-    D3d11Texture { adapter_luid: u64 },
-    DmaBuf { fourcc: u32, modifier: u64, planes: u8 },
+    D3d11Texture {
+        adapter_luid: u64,
+    },
+    DmaBuf {
+        fourcc: u32,
+        modifier: u64,
+        planes: u8,
+    },
     CpuMapped,
 }
 
@@ -183,11 +189,22 @@ pub enum OnSourceGone {
 
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum CaptureTarget {
-    Display { display_id: u32 },
-    Window { window_id: u64 },
-    App { app_id: String },
-    Region { display_id: u32, rect: NormalizedRect },
-    Canvas { display_ids: Vec<u32> },
+    Display {
+        display_id: u32,
+    },
+    Window {
+        window_id: u64,
+    },
+    App {
+        app_id: String,
+    },
+    Region {
+        display_id: u32,
+        rect: NormalizedRect,
+    },
+    Canvas {
+        display_ids: Vec<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -533,7 +550,9 @@ pub struct StreamPlan {
 pub enum OpOutcome {
     Completed,
     /// Refused or failed; `code` is a wire code (3.7).
-    Rejected { code: String },
+    Rejected {
+        code: String,
+    },
     /// A native operation did not answer in time; the capture is retained.
     OutcomeUnknown,
 }
@@ -584,14 +603,30 @@ pub struct StatsSnapshot {
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum ObserverJob {
     /// The capture runs; `info.codec` is the codec actually created.
-    Started { plan: StreamPlan, info: EncoderInfo },
-    Failed { code: String },
-    OpResult { op: OpToken, outcome: OpOutcome },
-    SourceGone { reason: SourceGone },
-    LayoutChanged { epoch: u64 },
-    Stats { snapshot: StatsSnapshot },
+    Started {
+        plan: StreamPlan,
+        info: EncoderInfo,
+    },
+    Failed {
+        code: String,
+    },
+    OpResult {
+        op: OpToken,
+        outcome: OpOutcome,
+    },
+    SourceGone {
+        reason: SourceGone,
+    },
+    LayoutChanged {
+        epoch: u64,
+    },
+    Stats {
+        snapshot: StatsSnapshot,
+    },
     /// The close completed: nothing more is called on any backend.
-    Closed { outcome: CloseOutcome },
+    Closed {
+        outcome: CloseOutcome,
+    },
 }
 
 /// Metadata for one packet handed to [`crate::VideoOut::send`].

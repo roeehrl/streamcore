@@ -19,7 +19,9 @@ use streamcore_media::stream::VideoWorkQueue;
 /// Poison-tolerant lock: every lock here is a short leaf, and a panic elsewhere
 /// must not wedge teardown.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // ---------------------------------------------------------------------------
