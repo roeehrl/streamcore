@@ -30,7 +30,8 @@ pub struct Log {
     pub after_close: AtomicUsize,
     /// Outbound calls made outside a drain.
     pub off_executor: AtomicUsize,
-    /// Permits native code holds right now, across every encoder.
+    /// Frames inside encoders right now (submitted, output not yet posted),
+    /// across every encoder: bounded by the 3 permits.
     pub native_permits: AtomicUsize,
     pub peak_native_permits: AtomicUsize,
     /// A call into a backend while another backend call of this stream is
@@ -460,13 +461,12 @@ impl FakeEncoder {
     fn take(&self, seq: u64) -> Option<Pending> {
         let mut pending = lock(&self.pending);
         let index = pending.iter().position(|p| p.seq == seq)?;
+        self.log.native_permits.fetch_sub(1, Ordering::SeqCst);
         Some(pending.remove(index))
     }
 
     fn drop_permit(&self, mut pending: Pending) {
-        if pending.permit.take().is_some() {
-            self.log.native_permits.fetch_sub(1, Ordering::SeqCst);
-        }
+        pending.permit.take();
     }
 
     /// Produce the output for `seq` from an "output thread": bytes first, then

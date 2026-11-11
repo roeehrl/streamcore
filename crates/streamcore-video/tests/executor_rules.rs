@@ -443,3 +443,33 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         std::thread::park_timeout(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn a_session_whose_idr_was_lost_sends_nothing_until_a_new_idr() {
+    let s = Manual::new();
+    s.start_running();
+    let encoder = s.encoder();
+    s.frame(1_000);
+    s.frame(2_000);
+    assert_eq!(encoder.pending_seqs(), vec![1, 2]);
+    assert!(lock(&encoder.submits)[0].force_keyframe);
+    assert!(!lock(&encoder.submits)[1].force_keyframe);
+    encoder.drop_output(1, DropReason::NoOutput);
+    encoder.complete(2);
+    s.pump();
+    // The delta would open a generation without a keyframe: it is a loss.
+    assert!(s.out.packets().is_empty());
+    let submits = lock(&encoder.submits).clone();
+    assert_eq!(submits.len(), 3);
+    assert!(
+        submits[2].force_keyframe,
+        "the retained frame is re-sent as an IDR"
+    );
+    encoder.complete(3);
+    s.pump();
+    let packets = s.out.packets();
+    assert!(packets[0].meta.config && packets[1].meta.keyframe);
+    s.close();
+    s.assert_clean();
+    s.assert_wire_order();
+}

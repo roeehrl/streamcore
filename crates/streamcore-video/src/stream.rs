@@ -1190,8 +1190,8 @@ impl StreamState {
             .and_then(|token| sink.take(token))
             .or_else(|| self.last_config.clone());
         let needs_config = slot.needs_config;
-        let Some(payload) = payload.filter(|_| config.is_some()) else {
-            // No bytes or no configuration to send them with: a loss.
+        let Some(payload) = payload else {
+            // The bytes never arrived: a loss.
             if let Some(entry) = entry {
                 entry.finish();
             }
@@ -1201,6 +1201,22 @@ impl StreamState {
             return;
         };
         let config_changed = needs_config || config != self.last_config;
+        if config.is_none() || (config_changed && !frame.keyframe) {
+            // Nothing to configure a decoder with, or a delta that would open a
+            // generation: this session's IDR was lost or overtaken. Count the
+            // frame as lost and re-send the retained image as an IDR now.
+            if let Some(entry) = entry {
+                entry.finish();
+            }
+            self.stats.encoder_drops += 1;
+            self.force_keyframe = true;
+            self.record_loss(cx, frame.submit_seq);
+            if let Some(latest) = &mut self.latest {
+                latest.pending = true;
+            }
+            self.submit_due(cx);
+            return;
+        }
         let headers = match self.packetizer.next(
             frame.keyframe,
             config_changed,
