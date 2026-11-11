@@ -35,6 +35,13 @@ pub enum SurfaceKind {
     CpuMapped,
 }
 
+/// How a consumer of a surface waits for the producer's GPU work (3.2). Handle
+/// fields name a shareable OS object; `0` means the producer's own in-process
+/// object on the stream's device (an `ID3D11Fence` or `MTLSharedEvent` the
+/// producing backend owns and looks up through its slot table), so no shared
+/// handle is created or closed. A non-zero handle is owned by the producer and
+/// stays valid while the surface is leased. When one native backend owns every
+/// stage, the fence is informational (threading doc, "Outputs").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GpuFence {
     None,
@@ -291,6 +298,11 @@ pub struct CaptureCaps {
     pub surface_kinds: Vec<SurfaceKind>,
     pub pool_depth: u8,
     pub virtual_displays: bool,
+    /// For a `Region` target: true when the capture already holds only the
+    /// region (macOS `sourceRect`); false when it delivers the whole display
+    /// and the converter crops [`ConvertJob::source`] (WGC). A region the
+    /// backend cannot crop needs `ConvertPath::Convert`.
+    pub region_in_surface: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -341,6 +353,10 @@ pub struct ConvertJob {
     pub width: u32,
     pub height: u32,
     pub color: ColorTags,
+    /// The part of the input to convert, in input pixels (even origin and
+    /// size); `None` converts the whole input. Set for a `Region` target whose
+    /// capture holds the whole display ([`CaptureCaps::region_in_surface`]).
+    pub source: Option<Rect>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -632,6 +648,9 @@ pub struct StatsSnapshot {
     pub create_timeouts: u64,
     pub stale_events: u64,
     pub wire_generation: u64,
+    /// Skip cause (a): frames the capture backend dropped unseen
+    /// ([`crate::CaptureEvents::skipped`]).
+    pub capture_skipped: u64,
 }
 
 /// Jobs for the consumer, posted to its [`crate::ObserverQueue`] and never run on
@@ -673,6 +692,20 @@ pub enum ObserverJob {
     },
 }
 
+/// A frame's stage times (9.2) as the backends reported them, host-monotonic
+/// nanoseconds: H0 and H1 from the capture's [`SurfaceInfo`], H3 and H4 from
+/// the encoder's [`EncodeTimings`]. A recovery re-encode keeps the image's H0
+/// and H1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Record)]
+pub struct FrameTiming {
+    /// H0, the source present time, where the platform reports it.
+    pub source_present_ns: Option<u64>,
+    /// H1, the capture callback.
+    pub capture_ns: u64,
+    /// H3 and H4.
+    pub encode: EncodeTimings,
+}
+
 /// Metadata for one packet handed to [`crate::VideoOut::send`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct VideoOutMeta {
@@ -681,6 +714,9 @@ pub struct VideoOutMeta {
     pub droppable: bool,
     pub keyframe: bool,
     pub config: bool,
+    /// The frame's stage times, for the consumer's trace (P1; frames.v4 carries
+    /// them on the wire from P2).
+    pub timing: FrameTiming,
 }
 
 /// Time bounds of the executor. Defaults are the reference host's values.

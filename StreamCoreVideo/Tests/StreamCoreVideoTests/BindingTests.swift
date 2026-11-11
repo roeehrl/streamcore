@@ -38,7 +38,7 @@ final class Capture: CaptureBackend, @unchecked Sendable {
 
     func caps() -> CaptureCaps {
         CaptureCaps(targetKinds: [.display], windowFit: false, liveRegionMove: false, cursorModes: [.composited],
-                    surfaceKinds: [.ioSurface], poolDepth: 5, virtualDisplays: false)
+                    surfaceKinds: [.ioSurface], poolDepth: 5, virtualDisplays: false, regionInSurface: true)
     }
     func enumerate() throws -> SourceCatalog { SourceCatalog(displays: [], windows: []) }
     func observeLayout(display: UInt32) -> DisplayLayout? { nil }

@@ -279,6 +279,8 @@ pub(crate) struct Shared {
     pub(crate) next_command: AtomicU64,
     /// Frames replaced in the mailbox before delivery (skip cause b).
     pub(crate) mailbox_replaced: AtomicU64,
+    /// Frames the capture backend dropped unseen (skip cause a).
+    pub(crate) capture_skipped: AtomicU64,
 }
 
 impl Shared {
@@ -314,6 +316,7 @@ impl Shared {
                 close_slot: CloseSlot::default(),
                 next_command: AtomicU64::new(1),
                 mailbox_replaced: AtomicU64::new(0),
+                capture_skipped: AtomicU64::new(0),
             }
         })
     }
@@ -577,6 +580,14 @@ impl CaptureEvents for CapturePort {
                 capture: id,
                 layout,
             });
+        }
+    }
+
+    fn skipped(&self, _id: CaptureId, _member: Option<u8>, count: u32) {
+        if let Some(executor) = self.executor.upgrade() {
+            executor
+                .capture_skipped
+                .fetch_add(u64::from(count), Ordering::Relaxed);
         }
     }
 }
