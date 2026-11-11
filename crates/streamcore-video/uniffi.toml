@@ -7,3 +7,9 @@ ffi_module_filename = "streamcore_videoFFI"
 
 [bindings.kotlin]
 package_name = "uniffi.streamcore_video"
+
+# `open` is a Swift keyword, and UniFFI 0.32.2 copies its escaped Swift spelling
+# into the C header's vtable, which no C compiler accepts: in Swift the method is
+# `openCapture`.
+[bindings.swift.rename]
+"CaptureBackend.open" = "openCapture"

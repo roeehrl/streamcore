@@ -58,7 +58,7 @@ enum TimerKind {
 
 struct EncoderSlot {
     generation: u64,
-    encoder: Arc<dyn Encoder>,
+    encoder: Arc<dyn StreamEncoder>,
     info: EncoderInfo,
     /// The mapped output tags and source format this session was created for.
     color: ColorTags,

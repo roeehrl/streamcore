@@ -338,3 +338,16 @@ fn op_tokens_fence_stale_answers() {
     s.close();
     s.assert_clean();
 }
+
+#[test]
+fn every_wire_code_is_documented_in_the_protocol_file() {
+    let doc = include_str!("../../../protocol/STREAM-CODES.md");
+    for code in codes::ALL {
+        assert!(
+            doc.contains(&format!("`{code}`")),
+            "{code} is not in protocol/STREAM-CODES.md"
+        );
+    }
+    let documented = doc.matches("| `stream.").count() + doc.matches("| `session.").count();
+    assert_eq!(documented, codes::ALL.len());
+}

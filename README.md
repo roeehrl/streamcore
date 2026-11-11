@@ -22,9 +22,11 @@ wire protocol will change.
 | `crates/streamcore-session` | Host-owned logical sessions that survive transport replacement, and resume references. |
 | `crates/streamcore-transport` | Pinned identities, OPAQUE pairing, the versioned hello, QUIC and TLS/TCP sessions, the five bounded multiplexed lanes and the secure channel. Its `examples/` hold the two-machine `network_probe` and the `scheduling_probe`. |
 | `crates/streamcore-input`, `crates/streamcore-input-ffi` | The input model (Pad's apps and MyCNC) and its JSON C ABI (`include/streamcore_input.h`). `crates/streamcore-input/CHANGES.md` is the change log apps read before re-pinning. |
+| `crates/streamcore-video` | The video control plane ([design](docs/STREAMCORE-VIDEO.md)): backend traits (UniFFI foreign traits), one serial executor per stream, lifecycle, latest-frame retention and recovery. P1 core; no platform backend yet. |
 | `StreamCoreInput/` | The input model's Swift package (XCFramework plus UniFFI bindings, built by a script below). |
-| `protocol/` | [`LANES.md`](protocol/LANES.md) (lane scheduling and limits), [`BINARY.md`](protocol/BINARY.md) (binary frame layouts), [`input/`](protocol/input/README.md) (input fixtures every binding runs). |
-| `docs/` | [Secure channel](docs/SECURE-CHANNEL.md), [sessions](docs/SESSIONS.md), [capture pipeline](docs/CAPTURE-PIPELINE.md), [input model](docs/INPUT-MODEL.md), [input ownership](docs/INPUT-OWNERSHIP.md). |
+| `StreamCoreVideo/` | The video crate's Swift binding smoke test (`scripts/build-streamcore-video-apple.sh`). |
+| `protocol/` | [`LANES.md`](protocol/LANES.md) (lane scheduling and limits), [`BINARY.md`](protocol/BINARY.md) (binary frame layouts), [`STREAM-CODES.md`](protocol/STREAM-CODES.md) (stream wire codes), [`input/`](protocol/input/README.md) (input fixtures every binding runs). |
+| `docs/` | [Secure channel](docs/SECURE-CHANNEL.md), [sessions](docs/SESSIONS.md), [capture pipeline](docs/CAPTURE-PIPELINE.md), [input model](docs/INPUT-MODEL.md), [input ownership](docs/INPUT-OWNERSHIP.md), [video design](docs/STREAMCORE-VIDEO.md), [video threading rules](docs/VIDEO-THREADING.md). |
 | `scripts/` | Input builds, the input change-log check, the scrub check and `ci.sh` (the Rust checks). |
 | `ci/` | [Local CI](ci/local/README.md) jobs and the Linux lane; the [scheduling probe](ci/scheduling/README.md) harness. |
 
@@ -32,7 +34,7 @@ Every crate calls `uniffi::setup_scaffolding!()` and has a `uniffi.toml` naming 
 own header (`<crate>FFI.h`) and Kotlin package (`uniffi.<crate>`). A product that
 links several crates into one library (as MyCNC does) picks the shared Swift and C
 module names in its own global bindgen config. Dependencies run one way:
-`streamcore-transport` depends on `streamcore-media`; nothing here names a product type.
+`streamcore-transport` and `streamcore-video` depend on `streamcore-media`; nothing here names a product type.
 The secure channel takes each product's lane rule as a `multiplex::LanePolicy`
 (`channel::connect_secure_with` / `listen_secure_with`); `connect_secure` /
 `listen_secure` use the binary kinds alone.

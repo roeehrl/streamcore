@@ -87,11 +87,15 @@ pub trait EncoderFactory: Send + Sync {
         &self,
         spec: EncoderSpec,
         events: Arc<dyn EncoderEvents>,
-    ) -> Result<Arc<dyn Encoder>, MediaError>;
+    ) -> Result<Arc<dyn StreamEncoder>, MediaError>;
 }
 
+/// The design's `Encoder` (3.4); [`crate::Encoder`] is an alias. Named
+/// `StreamEncoder` because Swift's standard library already has an `Encoder`
+/// (Codable), and UniFFI 0.32.2 cannot rename a foreign trait in Swift only (the
+/// rename also changes an FFI symbol, which then fails to link).
 #[uniffi::export(rust, foreign)]
-pub trait Encoder: Send + Sync {
+pub trait StreamEncoder: Send + Sync {
     /// Codec created, hardware, low latency confirmed.
     fn info(&self) -> EncoderInfo;
     /// Never blocks and never replaces the session. Keep `permit` until this

@@ -29,6 +29,8 @@ pub use executor::{
     Clock, MonotonicClock, NETWORK_THREAD_NAME, SinkReceipt, StreamPort, VideoSinkHandle,
     blocking_allowed, on_executor,
 };
+/// The design's name for [`StreamEncoder`]: Rust backends may implement either.
+pub use traits::StreamEncoder as Encoder;
 pub use traits::*;
 pub use types::*;
 
