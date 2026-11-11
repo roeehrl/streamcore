@@ -1,9 +1,11 @@
 use std::{sync::Arc, time::Duration};
+use streamcore_media::binary::{ClockPing, ClockPong, Frame};
 use streamcore_transport::{
     channel::{
         ChannelPath, ChannelTransport, SecureChannel, SecureListener, SessionOptions,
         connect_secure, listen_secure,
     },
+    clock::{CLOCK_CAPABILITY, monotonic_now_us},
     identity::PeerIdentity,
 };
 
@@ -14,8 +16,23 @@ fn options() -> SessionOptions {
     }
 }
 
+fn clock_options() -> SessionOptions {
+    SessionOptions {
+        capabilities: vec!["inventory.v1".into(), CLOCK_CAPABILITY.into()],
+        required: vec!["inventory.v1".into(), CLOCK_CAPABILITY.into()],
+    }
+}
+
 async fn channels(
     transport: ChannelTransport,
+) -> (Arc<SecureListener>, Arc<SecureChannel>, Arc<SecureChannel>) {
+    channels_with(transport, options(), options()).await
+}
+
+async fn channels_with(
+    transport: ChannelTransport,
+    host_options: SessionOptions,
+    client_options: SessionOptions,
 ) -> (Arc<SecureListener>, Arc<SecureChannel>, Arc<SecureChannel>) {
     let host = Arc::new(PeerIdentity::generate().unwrap());
     let client = Arc::new(PeerIdentity::generate().unwrap());
@@ -23,7 +40,7 @@ async fn channels(
         "127.0.0.1:0".into(),
         host.clone(),
         vec![client.certificate()],
-        options(),
+        host_options,
     )
     .await
     .unwrap();
@@ -37,7 +54,7 @@ async fn channels(
             transport,
             delay_ms: 0,
         }],
-        options(),
+        client_options,
         streamcore_transport::OperationCancellation::new(),
     )
     .await
@@ -242,4 +259,115 @@ async fn completed_goodbye_is_delivered_before_peer_close() {
         assert_eq!(server.receive().await.unwrap(), b"goodbye");
         assert!(server.receive().await.is_err());
     }
+}
+
+#[tokio::test]
+async fn typed_pings_are_answered_by_the_core_and_estimate_a_shared_clock() {
+    for transport in [ChannelTransport::Quic, ChannelTransport::TlsTcp] {
+        let (_listener, server, client) =
+            channels_with(transport, clock_options(), clock_options()).await;
+        assert!(client.clock_estimate().is_none());
+        let before = monotonic_now_us();
+        for _ in 0..5 {
+            client.send_clock_ping().unwrap();
+            // The host application sees the ping but does not answer it.
+            let ping = server.receive().await.unwrap();
+            let (frame, _) = Frame::read(&ping).unwrap().unwrap();
+            assert_eq!(frame.kind, 2);
+            let ping = ClockPing::decode(frame.payload).unwrap();
+            assert!(ping.send_us >= before);
+            let pong = client.receive().await.unwrap();
+            let (frame, _) = Frame::read(&pong).unwrap().unwrap();
+            assert_eq!(frame.kind, 3);
+            let pong = ClockPong::decode(frame.payload).unwrap();
+            assert_eq!(pong.nonce, ping.nonce);
+            assert!(pong.receive_us >= ping.send_us && pong.send_us >= pong.receive_us);
+        }
+        let estimate = client.clock_estimate().unwrap();
+        assert_eq!(estimate.samples, 5);
+        // One process, one clock: the true offset is zero and lies in the bound.
+        assert!(estimate.offset_us.unsigned_abs() <= estimate.error_us);
+        assert!(estimate.rtt_us <= estimate.last_rtt_us.max(estimate.rtt_us));
+        // Only the core may send pings and pongs under clock.v1.
+        for kind in [2, 3] {
+            let raw = Frame { kind, payload: &[] }.encode().unwrap();
+            assert!(client.enqueue_application_frame(raw.clone()).is_err());
+            assert!(server.enqueue_application_frame(raw).is_err());
+        }
+        // Either side may ping.
+        server.send_clock_ping().unwrap();
+        let ping = client.receive().await.unwrap();
+        assert_eq!(ping[0], 2);
+        assert_eq!(server.receive().await.unwrap()[0], 3);
+        assert_eq!(server.clock_estimate().unwrap().samples, 1);
+    }
+}
+
+#[tokio::test]
+async fn without_clock_v1_pings_stay_application_frames() {
+    let (_listener, server, client) = channels(ChannelTransport::TlsTcp).await;
+    assert!(client.send_clock_ping().is_err());
+    let empty = Frame {
+        kind: 2,
+        payload: &[],
+    }
+    .encode()
+    .unwrap();
+    client.enqueue_application_frame(empty.clone()).unwrap();
+    assert_eq!(server.receive().await.unwrap(), empty);
+    assert!(client.clock_estimate().is_none());
+}
+
+#[tokio::test]
+async fn a_malformed_typed_ping_closes_the_channel() {
+    let (_listener, server, client) =
+        channels_with(ChannelTransport::TlsTcp, clock_options(), clock_options()).await;
+    // The raw lane interface carries no frame check; the peer's core refuses it.
+    let bad = Frame {
+        kind: 2,
+        payload: &[0; 3],
+    }
+    .encode()
+    .unwrap();
+    client
+        .enqueue(
+            streamcore_transport::multiplex::ChannelLane::Interactive,
+            bad,
+        )
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), server.receive())
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn clock_v1_is_a_hard_capability_break() {
+    let host = Arc::new(PeerIdentity::generate().unwrap());
+    let client = Arc::new(PeerIdentity::generate().unwrap());
+    let listener = listen_secure(
+        "127.0.0.1:0".into(),
+        host.clone(),
+        vec![client.certificate()],
+        clock_options(),
+    )
+    .await
+    .unwrap();
+    let accept = listener.clone();
+    let _server = tokio::spawn(async move { accept.accept().await });
+    let old = connect_secure(
+        client,
+        host.certificate(),
+        vec![ChannelPath {
+            address: listener.address(),
+            transport: ChannelTransport::TlsTcp,
+            delay_ms: 0,
+        }],
+        options(),
+        streamcore_transport::OperationCancellation::new(),
+    )
+    .await;
+    assert!(old.is_err());
 }

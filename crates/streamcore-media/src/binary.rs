@@ -355,6 +355,71 @@ impl<'a> FilePacket<'a> {
     }
 }
 
+/// Typed ping body (outer kind `0x02`) under `clock.v1`: the sender's nonce and its
+/// monotonic send time in microseconds. Exactly 16 bytes, little endian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPing {
+    pub nonce: u64,
+    pub send_us: u64,
+}
+impl ClockPing {
+    pub const LENGTH: usize = 16;
+    pub fn decode(bytes: &[u8]) -> Result<Self, MediaError> {
+        if bytes.len() != Self::LENGTH {
+            return Err(MediaError);
+        }
+        let mut r = Reader::new(bytes);
+        Ok(Self {
+            nonce: u64::from_le_bytes(r.take()?),
+            send_us: u64::from_le_bytes(r.take()?),
+        })
+    }
+    pub fn encode(&self) -> [u8; Self::LENGTH] {
+        let mut out = [0; Self::LENGTH];
+        out[..8].copy_from_slice(&self.nonce.to_le_bytes());
+        out[8..].copy_from_slice(&self.send_us.to_le_bytes());
+        out
+    }
+}
+
+/// Typed pong body (outer kind `0x03`) under `clock.v1`: the ping's nonce, then the
+/// answering peer's monotonic receive and send times in microseconds. Exactly 24
+/// bytes, little endian; the send time is never earlier than the receive time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockPong {
+    pub nonce: u64,
+    pub receive_us: u64,
+    pub send_us: u64,
+}
+impl ClockPong {
+    pub const LENGTH: usize = 24;
+    pub fn decode(bytes: &[u8]) -> Result<Self, MediaError> {
+        if bytes.len() != Self::LENGTH {
+            return Err(MediaError);
+        }
+        let mut r = Reader::new(bytes);
+        let pong = Self {
+            nonce: u64::from_le_bytes(r.take()?),
+            receive_us: u64::from_le_bytes(r.take()?),
+            send_us: u64::from_le_bytes(r.take()?),
+        };
+        if pong.send_us < pong.receive_us {
+            return Err(MediaError);
+        }
+        Ok(pong)
+    }
+    pub fn encode(&self) -> Result<[u8; Self::LENGTH], MediaError> {
+        if self.send_us < self.receive_us {
+            return Err(MediaError);
+        }
+        let mut out = [0; Self::LENGTH];
+        out[..8].copy_from_slice(&self.nonce.to_le_bytes());
+        out[8..16].copy_from_slice(&self.receive_us.to_le_bytes());
+        out[16..].copy_from_slice(&self.send_us.to_le_bytes());
+        Ok(out)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Frame<'a> {
     pub kind: u8,

@@ -17,7 +17,7 @@ overtake one another. A caller must not assume global wire order.
 
 | ID | Lane | Default traffic (`binary_lanes`) | Receive byte window |
 | --- | --- | --- | --- |
-| 0 | Interactive | Every frame kind without another default: input (`0x20`), keepalive and product control | 4 MiB |
+| 0 | Interactive | Every frame kind without another default: input (`0x20`), ping and pong (under `clock.v1` sent and answered by the core, [BINARY.md](BINARY.md#typed-ping-and-pong-clockv1)) and product control | 4 MiB |
 | 1 | Video | Video frames (`0x10`) | 32 MiB + 5 bytes |
 | 2 | Audio | Audio packets (`0x11`) | 2 MiB |
 | 3 | Terminal | Terminal data (`0x30`) | 8 MiB |

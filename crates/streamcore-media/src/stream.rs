@@ -1,5 +1,5 @@
-//! Stream continuity policy shared by native renderers. No pixel, NALU or
-//! codec-config buffers cross this interface.
+//! Stream continuity policy shared by native renderers. Pixels never cross this
+//! interface; encoded bytes cross only through the send and receive calls.
 use crate::media::VideoMetadata;
 use std::sync::{
     Arc, Mutex,
