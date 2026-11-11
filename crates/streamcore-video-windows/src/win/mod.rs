@@ -92,7 +92,6 @@ pub fn run(options: &Options) -> Result<(), Error> {
     // The process MTA: helper threads (encoder create, bounded invalidate) join it.
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = sys::com::MediaFoundation::start().map_err(err("MFStartup"))?;
-    let _timer = options.timer_1ms.then(sys::com::TimerPeriod::one_ms);
     let adapters = report::build();
     match options.command {
         Command::Report => {
@@ -103,7 +102,10 @@ pub fn run(options: &Options) -> Result<(), Error> {
             let (luid, output) = select(options, &adapters)?;
             let (_, encode) = sizes(&output, options.size);
             let bitrate = options.bitrate_for(encode.0, encode.1);
-            let p = probe::run(luid, encode.0, encode.1, options.fps, bitrate)?;
+            // The probe has no capture: it holds the period itself, as a stream would.
+            let _timer = options.timer_period.then(sys::com::TimerPeriod::acquire);
+            let mut p = probe::run(luid, encode.0, encode.1, options.fps, bitrate)?;
+            p.timer = timer_report(options.timer_period);
             probe::print(&p);
             write_json(options.json.as_deref(), &p)
         }
@@ -113,5 +115,15 @@ pub fn run(options: &Options) -> Result<(), Error> {
             bench::print(&b);
             write_json(options.json.as_deref(), &b)
         }
+    }
+}
+
+/// The timer period as requested and as the first hold applied it.
+pub(crate) fn timer_report(requested: bool) -> crate::model::TimerReport {
+    let status = sys::com::TimerPeriod::status();
+    crate::model::TimerReport {
+        requested,
+        period_1ms: requested && status.period_1ms,
+        throttling_opt_out: requested && status.throttling_opt_out,
     }
 }

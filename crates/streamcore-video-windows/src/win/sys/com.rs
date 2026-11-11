@@ -17,7 +17,10 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
-    CreateWaitableTimerExW, GetSystemTimes, SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS,
+    CreateWaitableTimerExW, GetCurrentProcess, GetSystemTimes,
+    PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetEvent, SetProcessInformation,
+    SetWaitableTimer, TIMER_ALL_ACCESS,
 };
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT, DispatcherQueueOptions,
@@ -256,22 +259,88 @@ pub fn system_times() -> Option<(u64, u64, u64)> {
     Some((ft(idle), ft(kernel), ft(user)))
 }
 
-/// `timeBeginPeriod(1)` for this process until dropped: waits inside the process (ours and the
-/// MFT's) wake within about 1 ms instead of the default 15.6 ms tick.
-pub struct TimerPeriod(bool);
+/// How many streams hold the 1 ms timer period, and what the first hold applied.
+static TIMER_HOLDERS: std::sync::Mutex<(u32, TimerPeriodStatus)> = std::sync::Mutex::new((
+    0,
+    TimerPeriodStatus {
+        period_1ms: false,
+        throttling_opt_out: false,
+    },
+));
+
+/// The power-throttling state for timer resolution: `opt_out` asks Windows to honour this
+/// process's timer resolution even when its windows are minimized, occluded or absent (a tray
+/// or service host); otherwise the system decides again.
+fn honour_timer_resolution(opt_out: bool) -> bool {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: if opt_out {
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+        } else {
+            0
+        },
+        StateMask: 0,
+    };
+    // SAFETY: the pseudo-handle of this process and a valid, correctly sized state.
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&raw const state).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .is_ok()
+}
+
+/// A hold on a 1 ms system timer period for this process, taken while a stream captures and
+/// released when it stops (never held while idle). Reference-counted across streams: the
+/// first hold calls `timeBeginPeriod(1)` and opts the process out of timer-resolution
+/// throttling, the last release undoes both. Quick Sync's encoder MFT waits on this timer: at the
+/// default 15.6 ms tick an encode takes about 15 ms, at 1 ms about 6 ms.
+pub struct TimerPeriod(());
+
+/// What the first hold managed to apply.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimerPeriodStatus {
+    pub period_1ms: bool,
+    pub throttling_opt_out: bool,
+}
 
 impl TimerPeriod {
-    pub fn one_ms() -> Self {
-        // SAFETY: no pointers; paired with timeEndPeriod in Drop.
-        Self(unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0)
+    pub fn acquire() -> Self {
+        let mut holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
+        if holders.0 == 0 {
+            let throttling_opt_out = honour_timer_resolution(true);
+            // SAFETY: no pointers; paired with timeEndPeriod on the last release.
+            let period_1ms = unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0;
+            holders.1 = TimerPeriodStatus {
+                period_1ms,
+                throttling_opt_out,
+            };
+        }
+        holders.0 += 1;
+        Self(())
+    }
+
+    /// What the current (or last) first hold applied.
+    pub fn status() -> TimerPeriodStatus {
+        TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner()).1
     }
 }
 
 impl Drop for TimerPeriod {
     fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: ends the period begun in `one_ms`.
-            unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        let mut holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
+        holders.0 = holders.0.saturating_sub(1);
+        if holders.0 == 0 {
+            if holders.1.period_1ms {
+                // SAFETY: ends the period begun by the first hold.
+                unsafe { windows::Win32::Media::timeEndPeriod(1) };
+            }
+            if holders.1.throttling_opt_out {
+                honour_timer_resolution(false);
+            }
         }
     }
 }

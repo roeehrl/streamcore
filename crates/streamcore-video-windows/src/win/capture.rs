@@ -10,7 +10,7 @@
 //! the permits in flight plus one buffer for WGC to write.
 
 use super::surfaces::{Entry, Surfaces};
-use super::sys::com::now_ns;
+use super::sys::com::{TimerPeriod, now_ns};
 use super::sys::d3d::{
     Gpu, OutputDesc, capture_item_for_monitor, enumerate_adapters, texture_from_surface,
     texture_size,
@@ -47,6 +47,8 @@ struct Running {
     session: GraphicsCaptureSession,
     frame_token: i64,
     closed_token: Option<i64>,
+    /// The 1 ms timer period, held while this capture runs (dropped with `Running`).
+    _timer: Option<TimerPeriod>,
 }
 
 struct Capture {
@@ -68,6 +70,8 @@ pub struct WgcCapture {
     gpu: Arc<Gpu>,
     surfaces: Arc<Surfaces>,
     recorder: Option<Arc<Recorder>>,
+    /// Hold the 1 ms timer period while a capture runs (`TimerPeriod`).
+    timer_period: bool,
     outputs: Vec<OutputDesc>,
     state: Mutex<State>,
     me: Weak<WgcCapture>,
@@ -98,6 +102,7 @@ impl WgcCapture {
         gpu: Arc<Gpu>,
         surfaces: Arc<Surfaces>,
         recorder: Option<Arc<Recorder>>,
+        timer_period: bool,
     ) -> Result<Arc<Self>, String> {
         let outputs = enumerate_adapters()
             .map_err(|e| format!("enumerate adapters: {e}"))?
@@ -108,6 +113,7 @@ impl WgcCapture {
             gpu,
             surfaces,
             recorder,
+            timer_period,
             outputs,
             state: Mutex::new(State::default()),
             me: me.clone(),
@@ -194,6 +200,7 @@ impl WgcCapture {
         {
             self.note(format!("MinUpdateInterval refused: {e}"));
         }
+        let timer = self.timer_period.then(TimerPeriod::acquire);
         session.StartCapture().map_err(|_| MediaError::Internal)?;
         let mut state = self.lock();
         if let Some(cap) = state.captures.get_mut(&id) {
@@ -202,6 +209,7 @@ impl WgcCapture {
                 session,
                 frame_token,
                 closed_token,
+                _timer: timer,
             });
         }
         Ok(())

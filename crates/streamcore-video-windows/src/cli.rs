@@ -24,7 +24,8 @@ options:
   --buffers N                WGC frame-pool buffers (default permits + 3)
   --no-min-update-interval   do not set GraphicsCaptureSession.MinUpdateInterval
   --cursor                   capture the cursor
-  --timer-1ms                raise this process's timer resolution to 1 ms (timeBeginPeriod)
+  --timer-period on|off      hold a 1 ms timer period while capturing (bench) or encoding (probe),
+                             with the power-throttling opt-out (default on)
   --json PATH                also write the report as JSON
 ";
 
@@ -76,7 +77,7 @@ pub struct Options {
     pub buffers: Option<u8>,
     pub min_update_interval: bool,
     pub cursor: bool,
-    pub timer_1ms: bool,
+    pub timer_period: bool,
     pub json: Option<String>,
 }
 
@@ -97,7 +98,7 @@ impl Options {
             buffers: None,
             min_update_interval: true,
             cursor: false,
-            timer_1ms: false,
+            timer_period: true,
             json: None,
         }
     }
@@ -198,7 +199,13 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
             }
             "--no-min-update-interval" => o.min_update_interval = false,
             "--cursor" => o.cursor = true,
-            "--timer-1ms" => o.timer_1ms = true,
+            "--timer-period" => {
+                o.timer_period = match it.next().as_deref() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    other => return Err(format!("--timer-period: bad value {other:?}")),
+                }
+            }
             "--json" => o.json = Some(it.next().ok_or("--json needs a path")?),
             other => return Err(format!("unknown option {other}")),
         }

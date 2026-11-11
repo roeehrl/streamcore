@@ -22,10 +22,23 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   until the converter's fence passes that blit, even when the executor releases the surface
   as soon as `convert` returns (`Surfaces::retire` / `reap`). Frames the pool dropped unseen
   are reported with `CaptureEvents::skipped`.
-- **Timer resolution.** Intel's Quick Sync H.264 MFT waits on the system timer: at the default
-  15.6 ms tick one encode takes about 15 ms, at 1 ms about 6 ms (an Intel integrated GPU,
-  720p). A host should hold `timeBeginPeriod(1)` while it streams (`TimerPeriod`, bench
-  `--timer-1ms`).
+- **Timer resolution (host rule).** Intel's Quick Sync H.264 MFT waits on the system timer.
+  While a capture runs, the backend holds a reference-counted `TimerPeriod`: the first hold
+  calls `timeBeginPeriod(1)` and opts the process out of timer-resolution power throttling
+  (`SetProcessInformation(ProcessPowerThrottling)`, `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`
+  in the control mask, state 0), so it also holds for a tray or service host with no visible
+  window. The last release undoes both, and nothing is held while idle. A host that embeds the
+  backend doesn't need to do anything; a host with its own encoder path should do the same.
+  It costs power while streaming, which these measurements justify (720p, an Intel integrated
+  GPU, a remote-desktop session at 32 Hz, 11 Nov 2026):
+
+  | | encode p50 / p99 (probe, one in flight) | capture → encoded p50 / p99 (synthetic bench) |
+  |---|---|---|
+  | default 15.6 ms tick | 14.3 / 16.1 ms | 15.5 / 23.8 ms |
+  | `TimerPeriod` held | 6.2 / 7.8 ms | 8.2 / 9.8 ms |
+  | `TimerPeriod` held, console minimized | 6.1 / 7.6 ms | |
+
+  The bench's `--timer-period off` measures without it.
 - **Stream changes.** On `MF_E_TRANSFORM_STREAM_CHANGE` the output type is adopted and the
   pending frame comes with the next `METransformHaveOutput`; calling `ProcessOutput` again at
   once fails with E_UNEXPECTED on Quick Sync.

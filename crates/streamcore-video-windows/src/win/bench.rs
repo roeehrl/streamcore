@@ -89,7 +89,12 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     let gpu = Arc::new(Gpu::create(Some(luid)).map_err(err("D3D11 device"))?);
     let surfaces = Arc::new(Surfaces::default());
     let recorder = Arc::new(Recorder::default());
-    let capture = WgcCapture::new(gpu.clone(), surfaces.clone(), Some(recorder.clone()))?;
+    let capture = WgcCapture::new(
+        gpu.clone(),
+        surfaces.clone(),
+        Some(recorder.clone()),
+        options.timer_period,
+    )?;
     let converter = VpConverter::new(
         gpu.clone(),
         surfaces.clone(),
@@ -338,6 +343,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         permit_target: permits,
         pool_buffers: buffers,
         min_update_interval_set: min_interval_ns > 0,
+        timer: super::timer_report(options.timer_period),
         encoder: session.setup.clone().unwrap_or_default(),
         min_inputs_before_output_probe: min_inputs,
         inputs_before_first_output: session.inputs_before_first_output,
@@ -423,10 +429,11 @@ pub fn print(r: &BenchReport) {
         r.warmup_seconds
     );
     println!(
-        "permits {}  WGC buffers {}  MinUpdateInterval {}  bitrate {}  min_inputs_before_output (probe) {:?}  inputs before first output {:?}  max in encoder {:?}",
+        "permits {}  WGC buffers {}  MinUpdateInterval {}  timer {:?}  bitrate {}  min_inputs_before_output (probe) {:?}  inputs before first output {:?}  max in encoder {:?}",
         r.permit_target,
         r.pool_buffers,
         r.min_update_interval_set,
+        r.timer,
         r.bitrate,
         r.min_inputs_before_output_probe,
         r.inputs_before_first_output,

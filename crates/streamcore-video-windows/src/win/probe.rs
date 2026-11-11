@@ -175,6 +175,7 @@ pub fn run(
 
 pub fn print(r: &ProbeReport) {
     println!("OS build {}  adapter {}", r.os_build, r.adapter);
+    println!("timer {:?}", r.timer);
     let e = &r.encoder;
     println!(
         "encoder {} ({}), async {}, D3D11-aware {}, low latency confirmed {}, provides samples {}",

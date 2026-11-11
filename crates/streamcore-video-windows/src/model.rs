@@ -103,6 +103,17 @@ pub struct ProbeReport {
     pub encode_ms: Option<Summary>,
     pub sps: Option<Sps>,
     pub errors: Vec<String>,
+    /// The 1 ms timer period was requested, and what was applied.
+    pub timer: TimerReport,
+}
+
+/// The 1 ms timer period (`--timer-period`): requested, `timeBeginPeriod(1)` accepted, and the
+/// process opted out of timer-resolution power throttling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimerReport {
+    pub requested: bool,
+    pub period_1ms: bool,
+    pub throttling_opt_out: bool,
 }
 
 /// One bench run (`bench --mode synthetic|desktop`).
@@ -122,6 +133,7 @@ pub struct BenchReport {
     pub permit_target: u8,
     pub pool_buffers: u8,
     pub min_update_interval_set: bool,
+    pub timer: TimerReport,
     pub encoder: EncoderSetup,
     /// `min_inputs_before_output` the probe found, and what the bench saw in the stream.
     pub min_inputs_before_output_probe: Option<u64>,

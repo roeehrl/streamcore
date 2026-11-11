@@ -13,7 +13,9 @@
 # writes $DIR\run-NAME.cmd, registers a one-shot scheduled task for that user (`/IT`, no stored
 # password), starts it, waits for it, deletes the task (also on exit or interrupt) and copies
 # $DIR\out\NAME.txt and NAME.json to target/bench-out/. `ssh-run` runs a command that needs no
-# desktop (`report`, `probe`) directly over SSH.
+# desktop (`report`, `probe`) directly over SSH. With STREAMCORE_BENCH_MINIMIZED=1, `run` starts the
+# bench in a minimized console window (to check that the 1 ms timer period holds when Windows 11
+# would otherwise throttle timer resolution for a process with no visible window).
 #
 # The machine needs Rust (rustup) with the toolchain in rust-toolchain.toml, the MSVC build
 # tools, OpenSSH server with cmd as the default shell, and, for `run`, a user logged on at the
@@ -74,6 +76,10 @@ run_task() {
   # Written locally and copied, so no shell mangles the backslashes.
   {
     printf '@echo off\r\n'
+    if [ "${STREAMCORE_BENCH_MINIMIZED:-0}" = 1 ]; then
+      # Re-run this script in a minimized window and wait for it.
+      printf 'if not "%%1"=="min" (start "" /min /wait cmd /c "%%~f0" min & exit /b)\r\n'
+    fi
     printf 'cd /d %s\r\n' "$DIR"
     printf 'if not exist out mkdir out\r\n'
     printf 'del out\\%s.done 2>nul\r\n' "$name"
