@@ -1,11 +1,17 @@
 //! Bounded ordered lanes. QUIC gets one stream per lane; TLS interleaves 16KiB
 //! records. Credits are returned on application consumption, not socket receipt.
-use crate::channel::ChannelError;
+use crate::{
+    channel::ChannelError,
+    clock::{Clock, monotonic_now_us},
+};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
-use streamcore_media::binary::Frame;
+use streamcore_media::binary::{ClockPing, ClockPong, Frame};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, Notify, oneshot, watch},
@@ -72,7 +78,8 @@ pub fn application_lane(bytes: &[u8], policy: LanePolicy) -> Result<ChannelLane,
 #[derive(uniffi::Object)]
 pub struct PendingSend {
     consumed: AsyncMutex<Option<oneshot::Receiver<Result<(), ChannelError>>>>,
-    result: AsyncMutex<Option<oneshot::Receiver<Result<(), ChannelError>>>>,
+    result: AsyncMutex<Option<oneshot::Receiver<Result<u64, ChannelError>>>>,
+    written_us: AtomicU64,
     closed: watch::Sender<bool>,
 }
 #[uniffi::export]
@@ -92,8 +99,17 @@ impl PendingSend {
         tokio::select! {
             biased;
             _ = closed.changed() => Err(ChannelError::Closed),
-            result = result => result.unwrap_or(Err(ChannelError::Closed)),
+            result = result => {
+                let at = result.unwrap_or(Err(ChannelError::Closed))?;
+                self.written_us.store(at, Ordering::Relaxed);
+                Ok(())
+            }
         }
+    }
+    /// When the last fragment was handed to the transport (`clock::monotonic_now_us`),
+    /// once [`Self::written`] has completed successfully.
+    pub fn written_at_us(&self) -> Option<u64> {
+        Some(self.written_us.load(Ordering::Relaxed)).filter(|at| *at != 0)
     }
     /// The peer's message consumer took this complete message. This is not an
     /// acknowledgement that a command was executed or a file was committed.
@@ -111,12 +127,29 @@ impl PendingSend {
         tokio::select! { biased; _ = closed.changed() => Err(ChannelError::Closed), result = result => result.unwrap_or(Err(ChannelError::Closed)) }
     }
 }
+/// A lane-0 clock frame whose send time is written just before its first
+/// fragment goes to the writer (`clock.v1`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stamp {
+    None,
+    Ping(u64),
+    Pong,
+}
+// Byte offsets of the send time inside the enveloped frame: 5-byte envelope, then
+// the typed body (protocol/BINARY.md).
+const PING_SEND_AT: usize = 5 + 8;
+const PONG_SEND_AT: usize = 5 + 16;
+enum ClockMessage {
+    Ping(ClockPing),
+    Pong(ClockPong),
+}
 struct Outgoing {
+    stamp: Stamp,
     consumed: Option<oneshot::Sender<Result<(), ChannelError>>>,
     sequence: u64,
     data: Arc<Vec<u8>>,
     offset: usize,
-    done: oneshot::Sender<Result<(), ChannelError>>,
+    done: oneshot::Sender<Result<u64, ChannelError>>,
 }
 struct Outstanding {
     sequence: u64,
@@ -153,10 +186,24 @@ struct Assembly {
     sequence: u64,
     total: usize,
     data: Vec<u8>,
+    first_us: u64,
+}
+struct Ready {
+    sequence: u64,
+    data: Vec<u8>,
+    first_us: u64,
+    complete_us: u64,
+}
+/// One received message and when its first and last fragments arrived
+/// (`clock::monotonic_now_us`).
+pub(crate) struct Received {
+    pub(crate) data: Vec<u8>,
+    pub(crate) first_us: u64,
+    pub(crate) complete_us: u64,
 }
 struct Receiver {
     partial: [Option<Assembly>; LANES],
-    ready: [VecDeque<(u64, Vec<u8>)>; LANES],
+    ready: [VecDeque<Ready>; LANES],
     bytes: [usize; LANES],
     count: [usize; LANES],
     sequences: [u64; LANES],
@@ -195,11 +242,21 @@ pub(crate) struct Multiplexer {
     pub(crate) closed: watch::Sender<bool>,
     pub(crate) quic: Option<quinn::Connection>,
     pub(crate) endpoint: Option<quinn::Endpoint>,
+    /// Present when both peers negotiated `clock.v1`.
+    pub(crate) clock: Option<Clock>,
 }
 impl Multiplexer {
+    #[cfg(test)]
     pub(crate) fn new(
         quic: Option<quinn::Connection>,
         endpoint: Option<quinn::Endpoint>,
+    ) -> Arc<Self> {
+        Self::with_clock(quic, endpoint, false)
+    }
+    pub(crate) fn with_clock(
+        quic: Option<quinn::Connection>,
+        endpoint: Option<quinn::Endpoint>,
+        clock: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             sender: Mutex::new(Sender::default()),
@@ -210,6 +267,7 @@ impl Multiplexer {
             closed: watch::channel(false).0,
             quic,
             endpoint,
+            clock: clock.then(Clock::default),
         })
     }
     pub(crate) fn close(&self) {
@@ -253,6 +311,31 @@ impl Multiplexer {
         lane: ChannelLane,
         data: Vec<u8>,
     ) -> Result<Arc<PendingSend>, ChannelError> {
+        self.enqueue_stamped(lane, data, Stamp::None)
+    }
+    /// Sends a typed ping on lane 0; its send time is stamped as it is written.
+    pub(crate) fn ping(&self) -> Result<(), ChannelError> {
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or(ChannelError::InvalidConfiguration)?;
+        let nonce = clock.next_nonce();
+        let body = ClockPing { nonce, send_us: 0 }.encode();
+        let frame = Frame {
+            kind: 2,
+            payload: &body,
+        }
+        .encode()
+        .map_err(|_| ChannelError::InvalidConfiguration)?;
+        self.enqueue_stamped(ChannelLane::Interactive, frame, Stamp::Ping(nonce))
+            .map(|_| ())
+    }
+    fn enqueue_stamped(
+        &self,
+        lane: ChannelLane,
+        data: Vec<u8>,
+        stamp: Stamp,
+    ) -> Result<Arc<PendingSend>, ChannelError> {
         let lane = lane.index();
         if data.is_empty() || data.len() > WINDOWS[lane] {
             return Err(ChannelError::InvalidConfiguration);
@@ -280,6 +363,7 @@ impl Multiplexer {
         s.bytes += data.len();
         s.count += 1;
         s.queues[lane].push_back(Outgoing {
+            stamp,
             consumed: Some(consumed),
             sequence: 0,
             data: Arc::new(data),
@@ -291,6 +375,7 @@ impl Multiplexer {
         Ok(Arc::new(PendingSend {
             consumed: AsyncMutex::new(Some(consumed_rx)),
             result: AsyncMutex::new(Some(rx)),
+            written_us: AtomicU64::new(0),
             closed: self.closed.clone(),
         }))
     }
@@ -314,13 +399,17 @@ impl Multiplexer {
             let Some(front) = s.queues[lane].front() else {
                 continue;
             };
+            let (offset, length) = (front.offset, front.data.len());
+            if offset == 0 && (s.credits[lane] < length || s.outstanding[lane].len() >= MESSAGES) {
+                continue;
+            }
+            let front = s.queues[lane].front_mut().ok_or(ChannelError::Closed)?;
+            if offset == 0 && front.stamp != Stamp::None {
+                self.stamp(front)?;
+            }
             let data = front.data.clone();
-            let offset = front.offset;
             let mut sequence = front.sequence;
             if offset == 0 {
-                if s.credits[lane] < data.len() || s.outstanding[lane].len() >= MESSAGES {
-                    continue;
-                }
                 s.credits[lane] -= data.len();
                 sequence = s.sequences[lane].checked_add(1).ok_or(ChannelError::Io)?;
                 s.sequences[lane] = sequence;
@@ -357,6 +446,76 @@ impl Multiplexer {
         }
         Ok(None)
     }
+    /// Writes the send time into a clock frame that has not been fragmented yet;
+    /// the queue holds its only reference until then.
+    fn stamp(&self, packet: &mut Outgoing) -> Result<(), ChannelError> {
+        let now = monotonic_now_us();
+        let data = Arc::get_mut(&mut packet.data).ok_or(ChannelError::Io)?;
+        let at = match packet.stamp {
+            Stamp::None => return Ok(()),
+            Stamp::Ping(nonce) => {
+                if let Some(clock) = &self.clock {
+                    clock.sent(nonce, now);
+                }
+                PING_SEND_AT
+            }
+            Stamp::Pong => PONG_SEND_AT,
+        };
+        data.get_mut(at..at + 8)
+            .ok_or(ChannelError::Io)?
+            .copy_from_slice(&now.to_le_bytes());
+        packet.stamp = Stamp::None;
+        Ok(())
+    }
+    /// Lane 0 under `clock.v1`: validates a typed ping or pong before it is
+    /// delivered. Malformed bodies fail closed.
+    fn clock_message(&self, message: &[u8]) -> Result<Option<ClockMessage>, ChannelError> {
+        if self.clock.is_none() || !matches!(message.first(), Some(2 | 3)) {
+            return Ok(None);
+        }
+        let Some((frame, _)) = Frame::read(message).map_err(|_| ChannelError::Io)? else {
+            return Err(ChannelError::Io);
+        };
+        Ok(Some(if frame.kind == 2 {
+            ClockMessage::Ping(ClockPing::decode(frame.payload).map_err(|_| ChannelError::Io)?)
+        } else {
+            ClockMessage::Pong(ClockPong::decode(frame.payload).map_err(|_| ChannelError::Io)?)
+        }))
+    }
+    /// Answers a typed ping and records a pong. Both are still delivered to the
+    /// application.
+    fn clock_answer(&self, message: ClockMessage, received_us: u64) -> Result<(), ChannelError> {
+        let Some(clock) = &self.clock else {
+            return Ok(());
+        };
+        match message {
+            ClockMessage::Ping(ping) => {
+                let body = ClockPong {
+                    nonce: ping.nonce,
+                    receive_us: received_us,
+                    send_us: received_us,
+                }
+                .encode()
+                .map_err(|_| ChannelError::Io)?;
+                let pong = Frame {
+                    kind: 3,
+                    payload: &body,
+                }
+                .encode()
+                .map_err(|_| ChannelError::Io)?;
+                // A full queue drops this answer; the peer's estimate tolerates
+                // lost pings.
+                match self.enqueue_stamped(ChannelLane::Interactive, pong, Stamp::Pong) {
+                    Ok(_) | Err(ChannelError::Backpressure) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            ClockMessage::Pong(pong) => {
+                clock.answered(pong, received_us);
+                Ok(())
+            }
+        }
+    }
     fn take_credit(&self, s: &mut Sender) -> Result<Option<Record>, ChannelError> {
         let Some((lane, sequence, bytes)) = s.grants.pop_front() else {
             return Ok(None);
@@ -377,7 +536,7 @@ impl Multiplexer {
             .ok_or(ChannelError::Closed)?;
         s.count -= 1;
         s.bytes -= packet.data.len();
-        let _ = packet.done.send(Ok(()));
+        let _ = packet.done.send(Ok(monotonic_now_us().max(1)));
         Ok(())
     }
     fn ingest(&self, record: &[u8], only: Option<usize>) -> Result<(), ChannelError> {
@@ -448,6 +607,7 @@ impl Multiplexer {
                 sequence,
                 total,
                 data: Vec::with_capacity(total),
+                first_us: monotonic_now_us(),
             });
         }
         let assembly = r.partial[lane].as_mut().ok_or(ChannelError::Io)?;
@@ -457,13 +617,33 @@ impl Multiplexer {
         }
         assembly.data.extend_from_slice(&record[18..]);
         if assembly.data.len() == total {
+            let received_us = monotonic_now_us();
             let complete = r.partial[lane].take().ok_or(ChannelError::Io)?;
-            r.ready[lane].push_back((complete.sequence, complete.data));
+            // A typed ping or pong is checked before delivery and answered
+            // outside the receiver lock (sender -> receiver is the lock order).
+            let clock = if lane == 0 {
+                self.clock_message(&complete.data)?
+            } else {
+                None
+            };
+            r.ready[lane].push_back(Ready {
+                sequence: complete.sequence,
+                data: complete.data,
+                first_us: complete.first_us,
+                complete_us: received_us,
+            });
             self.ready.notify_one();
+            drop(r);
+            if let Some(message) = clock {
+                self.clock_answer(message, received_us)?;
+            }
         }
         Ok(())
     }
     pub(crate) async fn receive(&self) -> Result<Vec<u8>, ChannelError> {
+        self.receive_timed().await.map(|received| received.data)
+    }
+    pub(crate) async fn receive_timed(&self) -> Result<Received, ChannelError> {
         let mut closed = self.closed.subscribe();
         let _reader = self.receive_lock.lock().await;
         loop {
@@ -473,21 +653,27 @@ impl Multiplexer {
                 for _ in 0..ORDER.len() {
                     let lane = ORDER[r.cursor];
                     r.cursor = (r.cursor + 1) % ORDER.len();
-                    if let Some((sequence, data)) = r.ready[lane].pop_front() {
-                        packet = Some((lane, sequence, data));
+                    if let Some(ready) = r.ready[lane].pop_front() {
+                        packet = Some((lane, ready));
                         break;
                     }
                 }
                 packet
             };
-            if let Some((lane, sequence, data)) = packet {
+            if let Some((lane, ready)) = packet {
                 let mut sender = self.sender.lock().map_err(|_| ChannelError::Closed)?;
                 if !*self.closed.borrow() {
-                    sender.grants.push_back((lane, sequence, data.len()));
+                    sender
+                        .grants
+                        .push_back((lane, ready.sequence, ready.data.len()));
                 }
                 drop(sender);
                 self.notify(0);
-                return Ok(data);
+                return Ok(Received {
+                    data: ready.data,
+                    first_us: ready.first_us,
+                    complete_us: ready.complete_us,
+                });
             }
             if *closed.borrow_and_update() {
                 return Err(ChannelError::Closed);

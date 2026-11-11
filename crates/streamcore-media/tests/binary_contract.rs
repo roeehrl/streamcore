@@ -1,5 +1,5 @@
 use streamcore_media::{
-    binary::{AudioPacket, FilePacket, Frame, InputEvent, TerminalPacket},
+    binary::{AudioPacket, ClockPing, ClockPong, FilePacket, Frame, InputEvent, TerminalPacket},
     media::MAX_FRAME_LENGTH,
 };
 
@@ -141,4 +141,57 @@ fn frame_headers_reject_oversize_before_the_body_and_leave_coalesced_tail() {
     let (second, tail) = Frame::read(&joined[consumed..]).unwrap().unwrap();
     assert_eq!(second, first);
     assert_eq!(consumed + tail, joined.len());
+}
+#[test]
+fn typed_ping_and_pong_fixtures_are_exact_little_endian_and_fixed_length() {
+    // clock.v1 fixtures (protocol/BINARY.md, "Typed ping and pong").
+    let ping = ClockPing {
+        nonce: 0x0102_0304_0506_0708,
+        send_us: 0x1112_1314_1516_1718,
+    };
+    let ping_bytes = [
+        8, 7, 6, 5, 4, 3, 2, 1, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+    ];
+    assert_eq!(ping.encode(), ping_bytes);
+    assert_eq!(ClockPing::decode(&ping_bytes).unwrap(), ping);
+    let pong = ClockPong {
+        nonce: 1,
+        receive_us: u64::MAX - 1,
+        send_us: u64::MAX,
+    };
+    let mut pong_bytes = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    pong_bytes.extend([0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    pong_bytes.extend([0xff; 8]);
+    assert_eq!(pong.encode().unwrap().to_vec(), pong_bytes);
+    assert_eq!(ClockPong::decode(&pong_bytes).unwrap(), pong);
+    // Wrong lengths (including the legacy empty keepalive body) are invalid.
+    for end in 0..ping_bytes.len() {
+        assert!(ClockPing::decode(&ping_bytes[..end]).is_err());
+    }
+    for end in 0..pong_bytes.len() {
+        assert!(ClockPong::decode(&pong_bytes[..end]).is_err());
+    }
+    let mut long = ping_bytes.to_vec();
+    long.push(0);
+    assert!(ClockPing::decode(&long).is_err());
+    pong_bytes.push(0);
+    assert!(ClockPong::decode(&pong_bytes).is_err());
+    // A pong cannot be sent before it was received.
+    let backwards = ClockPong {
+        nonce: 1,
+        receive_us: 2,
+        send_us: 1,
+    };
+    assert!(backwards.encode().is_err());
+    let mut bytes = vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
+    bytes.extend([1, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(ClockPong::decode(&bytes).is_err());
+    // Both ride the existing envelope kinds.
+    let framed = Frame {
+        kind: 2,
+        payload: &ping.encode(),
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(&framed[..5], &[2, 0, 0, 0, 16]);
 }

@@ -115,12 +115,43 @@ Invalid input cannot reach native injection through the production Swift decoder
   function. Other bits are invalid. Click counts and key codes use the full stated
   unsigned range; native adapters enforce their own platform mapping.
 
+## Typed ping and pong (`clock.v1`)
+
+With the `clock.v1` capability (`clock::CLOCK_CAPABILITY`), ping `0x02` and pong
+`0x03` carry fixed little-endian bodies, and the StreamCore core sends and answers
+them on lane 0; applications never send or answer either kind. It is a hard break:
+consumers require `clock.v1`, and a peer without it fails negotiation. Without it,
+both kinds stay ordinary application frames (the untyped echo with any body).
+
+| Kind | Payload, in order | Bytes |
+| --- | --- | --- |
+| `0x02` ping | nonce u64, sender's send time u64 µs | 16 |
+| `0x03` pong | the ping's nonce u64, answerer's receive time u64 µs, answerer's send time u64 µs | 24 |
+
+Times are microseconds of the sending process's own monotonic clock, which has an
+arbitrary origin (`clock::monotonic_now_us`). The ping's send time and the pong's
+send time are written as the message's first fragment is handed to the writer; the
+pong's receive time is taken when the ping's last fragment arrives. A pong whose send
+time is earlier than its receive time, any other body length, or a typed frame of
+either kind from an application is invalid; an invalid body closes the channel. A
+pong whose nonce matches no recent ping is ignored. Both kinds are still delivered
+to the application after the core has handled them, as liveness signals.
+
+From the four times `t1` (ping sent), `t2`, `t3` (pong times) and `t4` (pong
+received), one sample gives round trip `(t4 − t1) − (t3 − t2)` and offset
+`((t2 − t1) + (t3 − t4)) / 2` (peer clock minus local clock), true within ± half
+that round trip. `SecureChannel::clock_estimate` reports the minimum-round-trip
+sample of the last 10 s, its bound, and the drift fitted over the low-delay samples
+of up to 256 kept. One-way figures derived from it carry the same bound. Fixtures:
+`crates/streamcore-media/tests/binary_contract.rs`.
+
 ## Envelope and verification
 
 The outer type byte accepts control `0x01`, ping `0x02`, pong `0x03`, video `0x10`,
 audio `0x11`, input `0x20`, terminal `0x30` and file `0x40`. Its length is the sole
-big-endian integer in this contract. The envelope accepts empty payloads (keepalive
-uses them); each typed codec imposes its own body requirements. Unknown types and
+big-endian integer in this contract. The envelope accepts empty payloads (an untyped
+keepalive without `clock.v1` uses them); each typed codec imposes its own body
+requirements. Unknown types and
 oversized lengths fail before waiting for the body. Swift's frame encoder rejects
 oversized outbound payloads before narrowing the length to u32. Rust's borrowed
 frame reader returns consumed length so coalesced frames remain distinct; Swift's

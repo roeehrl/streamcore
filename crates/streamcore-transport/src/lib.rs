@@ -5,6 +5,7 @@
 //! [`multiplex::LanePolicy`].
 
 pub mod channel;
+pub mod clock;
 pub mod identity;
 pub mod multiplex;
 pub mod pairing;

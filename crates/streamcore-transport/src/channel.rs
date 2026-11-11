@@ -3,6 +3,7 @@
 //! aborts the Rust task and closes any partially consumed/written frame.
 
 use crate::{
+    clock::{CLOCK_CAPABILITY, ClockEstimate, monotonic_now_us},
     identity::{PeerIdentity, certificate_fingerprint},
     multiplex::{ChannelLane, LanePolicy, Multiplexer, PendingSend, binary_lanes},
     protocol::{self, Hello},
@@ -71,6 +72,16 @@ async fn on_runtime<T: Send + 'static>(
         .map_err(|_| ChannelError::Runtime)?
 }
 
+/// A received message with its arrival times (`clock::monotonic_now_us`).
+#[derive(Clone, uniffi::Record)]
+pub struct TimedMessage {
+    pub payload: Vec<u8>,
+    /// When its first fragment arrived.
+    pub first_byte_us: u64,
+    /// When its last fragment arrived and it became complete.
+    pub complete_us: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct SecureChannel {
     io: Arc<Multiplexer>,
@@ -89,7 +100,8 @@ impl Drop for SecureChannel {
 
 impl SecureChannel {
     fn from_session(mut session: Session, lanes: LanePolicy) -> Arc<Self> {
-        let io = Multiplexer::new(session.quic.take(), session.endpoint.take());
+        let clock = session.capabilities.iter().any(|c| c == CLOCK_CAPABILITY);
+        let io = Multiplexer::with_clock(session.quic.take(), session.endpoint.take(), clock);
         let reader = std::mem::replace(&mut session.reader, Box::new(tokio::io::empty()));
         let writer = std::mem::replace(&mut session.writer, Box::new(tokio::io::sink()));
         let quic = session.kind == TransportKind::Quic;
@@ -158,12 +170,32 @@ impl SecureChannel {
         self.io.enqueue(lane, payload)
     }
 
+    /// Under `clock.v1` the core alone sends pings and pongs; an application
+    /// frame of either kind is refused.
     pub fn enqueue_application_frame(
         &self,
         payload: Vec<u8>,
     ) -> Result<Arc<PendingSend>, ChannelError> {
         let lane = crate::multiplex::application_lane(&payload, self.lanes)?;
+        if self.io.clock.is_some() && matches!(payload.first(), Some(2 | 3)) {
+            return Err(ChannelError::InvalidConfiguration);
+        }
         self.io.enqueue(lane, payload)
+    }
+
+    /// Sends a typed ping on lane 0 (`clock.v1` only). The peer's core answers
+    /// it; the answer updates [`Self::clock_estimate`] and is also delivered to
+    /// the application as a pong frame, for liveness.
+    pub fn send_clock_ping(&self) -> Result<(), ChannelError> {
+        self.io.ping()
+    }
+
+    /// The peer clock relative to ours, once a typed ping has been answered.
+    pub fn clock_estimate(&self) -> Option<ClockEstimate> {
+        self.io
+            .clock
+            .as_ref()
+            .and_then(|clock| clock.estimate(monotonic_now_us()))
     }
 
     /// Convenience for generic control-lane probes. Applications enqueue complete
@@ -180,6 +212,26 @@ impl SecureChannel {
                 .await?;
             guard.completed = true;
             Ok(())
+        })
+        .await
+    }
+
+    /// [`Self::receive`] plus when the message's first and last fragments
+    /// arrived, for receive-side stage timing.
+    pub async fn receive_timed(&self) -> Result<TimedMessage, ChannelError> {
+        let io = self.io.clone();
+        on_runtime(async move {
+            let mut guard = CloseOnInterruptedFrame {
+                io: io.clone(),
+                completed: false,
+            };
+            let received = io.receive_timed().await?;
+            guard.completed = true;
+            Ok(TimedMessage {
+                payload: received.data,
+                first_byte_us: received.first_us,
+                complete_us: received.complete_us,
+            })
         })
         .await
     }

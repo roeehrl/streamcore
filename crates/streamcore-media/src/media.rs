@@ -1,5 +1,5 @@
-//! `frames.v3` media headers. Payload slices stay in native buffers; UniFFI
-//! carries only the small metadata used by the stream state machine.
+//! `frames.v3` media headers. Pixels never reach Rust; encoded bytes cross only
+//! through the send and receive calls. UniFFI carries only stream metadata.
 pub const FRAME_CAPABILITY: &str = "frames.v3";
 pub const MAX_FRAME_LENGTH: usize = 32 * 1024 * 1024;
 pub const VIDEO_HEADER_LENGTH: usize = 29;
