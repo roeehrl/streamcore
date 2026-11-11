@@ -82,8 +82,13 @@ struct Retained {
 
 struct InFlight {
     permit: Arc<VideoWorkPermit>,
-    _surface: Arc<SurfaceLease>,
+    /// The capture surface the encoder reads: `None` on the convert path, where
+    /// the hold ends when `convert` returns (the converter's contract).
+    _surface: Option<Arc<SurfaceLease>>,
     _converted: Option<SurfaceLease>,
+    /// H0 and H1 of the submitted image.
+    source_present_ns: Option<u64>,
+    capture_ns: u64,
 }
 
 impl InFlight {
@@ -148,6 +153,9 @@ pub(crate) struct StreamState {
     armed: Option<(u64, TimerToken)>,
 
     layout_epoch: u64,
+    /// A `Region` target whose capture holds the whole display: the converter
+    /// crops `ConvertJob::source` (read from `CaptureCaps` at start).
+    crop_region: bool,
     closing: bool,
     closed: Option<CloseOutcome>,
     pub(crate) keepalive: Option<Arc<Shared>>,
@@ -208,6 +216,22 @@ fn valid_region(rect: &NormalizedRect) -> bool {
         && rect.y + rect.height <= 1.0
 }
 
+/// A normalized region in pixels of a `width` × `height` surface, with an even
+/// origin and size (4:2:0 chroma), at least 2 × 2 and inside the surface.
+fn crop_rect(rect: &NormalizedRect, width: u32, height: u32) -> Rect {
+    let even = |v: f64| (v.max(0.0) as u32) & !1;
+    let x = even(rect.x * f64::from(width)).min(width.saturating_sub(2));
+    let y = even(rect.y * f64::from(height)).min(height.saturating_sub(2));
+    let w = even(rect.width * f64::from(width)).clamp(2, width - x);
+    let h = even(rect.height * f64::from(height)).clamp(2, height - y);
+    Rect {
+        x,
+        y,
+        width: w & !1,
+        height: h & !1,
+    }
+}
+
 fn valid_surface(info: &SurfaceInfo) -> bool {
     info.id != 0 && (2..=8192).contains(&info.width) && (2..=8192).contains(&info.height)
 }
@@ -258,6 +282,7 @@ impl StreamState {
             next_timer: 0,
             armed: None,
             layout_epoch: 0,
+            crop_region: false,
             closing: false,
             closed: None,
             keepalive: None,
@@ -384,6 +409,9 @@ impl StreamState {
         stats.frames_replaced += cx
             .mailbox_replaced
             .load(std::sync::atomic::Ordering::Relaxed);
+        stats.capture_skipped = cx
+            .capture_skipped
+            .load(std::sync::atomic::Ordering::Relaxed);
         let phase = if self.closed.is_some() {
             StreamPhase::Closed
         } else if self.closing {
@@ -501,6 +529,21 @@ impl StreamState {
         if let Err(error) = validate(&self.spec, &self.plan) {
             return self.reply(cx, op, Self::rejected(error.wire_code(codes::CONFIG)));
         }
+        self.crop_region = false;
+        if matches!(self.spec.target, CaptureTarget::Region { .. })
+            && let Some(backends) = &self.backends
+        {
+            let capture = backends.capture.clone();
+            debug_assert!(is_current(cx.id));
+            if !capture.caps().region_in_surface {
+                if self.plan.convert == ConvertPath::Identity {
+                    // Nothing could crop the whole-display capture.
+                    let error = MediaError::Unsupported;
+                    return self.reply(cx, op, Self::rejected(error.wire_code(codes::CAPTURE)));
+                }
+                self.crop_region = true;
+            }
+        }
         self.epoch += 1;
         self.command = Some(op);
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
@@ -568,6 +611,12 @@ impl StreamState {
         let Some(id) = self.capture else {
             return self.reply(cx, op, Self::rejected(codes::MISSING));
         };
+        if let (Some(region), CaptureTarget::Region { rect, .. }) =
+            (update.capture.region, &mut self.spec.target)
+        {
+            // A live move: later converts crop the new rect.
+            *rect = region;
+        }
         self.command = Some(op);
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
         if let Some(rate) = update.rate {
@@ -1137,7 +1186,7 @@ impl StreamState {
         let encoder = slot.encoder.clone();
         let generation = slot.generation;
         let force_keyframe = self.force_keyframe || slot.first_submit;
-        let surface_lease = latest.lease.clone();
+        let mut surface_lease = Some(latest.lease.clone());
         let mut surface = latest.info.id;
         let mut converted = None;
         if self.plan.convert == ConvertPath::Convert {
@@ -1145,16 +1194,26 @@ impl StreamState {
                 permit.release();
                 return;
             };
+            let source = match &self.spec.target {
+                CaptureTarget::Region { rect, .. } if self.crop_region => {
+                    Some(crop_rect(rect, latest.info.width, latest.info.height))
+                }
+                _ => None,
+            };
             let job = ConvertJob {
                 format: self.plan.encoder_input,
                 width: self.plan.encode_width,
                 height: self.plan.encode_height,
                 color: latest.mapped,
+                source,
             };
             debug_assert!(is_current(cx.id));
             match converter.convert(latest.info.id, job) {
                 Ok(output) => {
                     surface = output.id;
+                    // The encoder reads the output: the capture surface is no
+                    // longer pinned by this frame (the converter's contract).
+                    surface_lease = None;
                     converted = Some(SurfaceLease::new(
                         output.id,
                         Releaser::Converter(Arc::downgrade(&converter)),
@@ -1183,13 +1242,12 @@ impl StreamState {
             base
         };
         let seq = self.submitted_seq + 1;
+        let source_present_ns = latest.info.source_present_ns;
+        let image_capture_ns = latest.info.capture_ns;
         let opts = SubmitOpts {
             submit_seq: seq,
             pts_ns,
-            capture_ns: latest
-                .info
-                .source_present_ns
-                .unwrap_or(latest.info.capture_ns),
+            capture_ns: source_present_ns.unwrap_or(image_capture_ns),
             force_keyframe,
         };
         debug_assert!(is_current(cx.id));
@@ -1212,6 +1270,8 @@ impl StreamState {
                         permit,
                         _surface: surface_lease,
                         _converted: converted,
+                        source_present_ns,
+                        capture_ns: image_capture_ns,
                     },
                 );
             }
@@ -1241,6 +1301,11 @@ impl StreamState {
 
     fn on_encoded(&mut self, cx: &Arc<Shared>, generation: u64, frame: EncodedFrame) {
         let entry = self.in_flight.remove(&(generation, frame.submit_seq));
+        let timing = FrameTiming {
+            source_present_ns: entry.as_ref().and_then(|e| e.source_present_ns),
+            capture_ns: entry.as_ref().map_or(0, |e| e.capture_ns),
+            encode: frame.timings,
+        };
         if !self.is_current_encoder(generation) || self.closing || cx.revoked() {
             // Stale: discarded after its permit is released. Its sink was closed.
             self.stats.stale_events += 1;
@@ -1357,6 +1422,7 @@ impl StreamState {
                 droppable: !is_config && !frame.keyframe,
                 keyframe: frame.keyframe && !is_config,
                 config: is_config,
+                timing,
             };
             debug_assert!(is_current(cx.id));
             out.send(meta, bytes, receipt);

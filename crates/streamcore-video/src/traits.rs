@@ -24,8 +24,16 @@ pub trait SerialQueue: Send + Sync {
     fn wake_after(&self, delay_ns: u64, timer: TimerToken);
 }
 
+/// Thread guarantee: `caps`, `open`, `start`, `update` and `stop` are called
+/// only by the executor during a drain that the stream's queue started
+/// (`StreamPort::run` or `run_timer`), so on the queue's own thread, and never
+/// inside an inline frame drain (which runs on the thread that called
+/// `CaptureEvents::frame`). A backend that must create thread-affine objects on
+/// the queue (a WGC frame pool bound to the queue's `DispatcherQueue`) can do so
+/// in `open` or `start`. `release` alone may run on any thread.
 #[uniffi::export(rust, foreign)]
 pub trait CaptureBackend: Send + Sync {
+    /// Read by the executor when a stream starts.
     fn caps(&self) -> CaptureCaps;
     fn enumerate(&self) -> Result<SourceCatalog, MediaError>;
     fn observe_layout(&self, display: u32) -> Option<DisplayLayout>;
@@ -63,11 +71,23 @@ pub trait CaptureEvents: Send + Sync {
     /// The source's size, scale or origin changed (display mode, DPI, rotation,
     /// window resize). Posts `ObserverJob::LayoutChanged`; the consumer re-plans.
     fn layout_changed(&self, id: CaptureId, layout: DisplayLayout);
+    /// The backend dropped `count` frames unseen (skip cause (a), 6.7): a pool
+    /// backlog where it kept only the newest. A leaf call: it counts into
+    /// `StatsSnapshot::capture_skipped` and posts nothing.
+    fn skipped(&self, id: CaptureId, member: Option<u8>, count: u32);
 }
 
 /// Records GPU work and returns at once.
 #[uniffi::export(rust, foreign)]
 pub trait Converter: Send + Sync {
+    /// Rust's hold on `input` for this frame ends when `convert` returns: the
+    /// encoder reads only the output, so the capture surface is not pinned
+    /// until the encoder's output (the latest slot may still hold it). A
+    /// converter whose recorded GPU work still reads `input` keeps it valid
+    /// until that work completes (its fence): it holds its own reference to
+    /// the native surface (a retained `CVPixelBuffer`), or defers the
+    /// producer's reuse to the fence through a slot table it shares with the
+    /// capture backend (a WGC frame's `Close`).
     fn convert(&self, input: SurfaceId, job: ConvertJob) -> Result<SurfaceInfo, MediaError>;
     /// Thread-safe, non-blocking leaf call.
     fn release(&self, surface: SurfaceId);

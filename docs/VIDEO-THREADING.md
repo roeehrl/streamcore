@@ -50,6 +50,16 @@ drain flag keeps drains exclusive, but its convert and submit then run on those 
 must be multithread-protected, and thread-affine objects (a `DispatcherQueueTimer`) cannot be made
 there.
 
+**Capture calls run on the queue's thread.** `CaptureBackend` `caps`, `open`, `start`, `update` and
+`stop` run only in drains the queue started (`StreamPort::run`, `run_timer`), never in an inline
+frame drain, so always on the queue's own thread. A backend that must create thread-affine objects
+there (a WGC frame pool bound to the calling thread's `DispatcherQueue`) does so in `open` or
+`start`. Tested in `trait_fit.rs`.
+
+**Capture-side skips.** A backend that drops frames unseen (it kept only the newest of a pool
+backlog) reports them with `CaptureEvents::skipped(id, member, count)`, a leaf call that counts
+skip cause (a) into `StatsSnapshot::capture_skipped` and posts nothing.
+
 **Stale events.** Every event carries its identity: encoder generation, capture id, op token or
 timer token. A stale event is discarded after its permit and lease are released.
 
@@ -140,7 +150,24 @@ calls (above).
   a pure function, allowed by rule 4); an Annex-B output fails the stream with `stream.encode`.
 - `SurfaceInfo.fence` is informational when one native backend owns capture, convert and encode
   on one device: ordering is implicit on that device, and the backend keeps fences in its own slot
-  table. Rust never forwards a fence to `submit`.
+  table. Rust never forwards a fence to `submit`. A fence handle of `0`
+  (`D3d11Fence { shared_handle: 0, .. }`, `MtlSharedEvent { handle: 0, .. }`) names the
+  producer's own in-process fence on the stream's device: no shared handle exists and nobody closes
+  one. A non-zero handle belongs to the producer and stays valid while the surface is leased.
+- **Leases on the convert path.** The executor's hold on a capture surface for a submitted frame
+  ends when `convert` returns: the encoder reads the converted surface, so a capture pool buffer is
+  pinned only by the latest slot, not until the encoder's output. A converter whose GPU work still
+  reads the input keeps it valid until its fence completes (a retained `CVPixelBuffer`, or a slot
+  table shared with the capture backend that defers a WGC frame's `Close` to the fence). On the
+  identity path the encoder reads the capture surface, which stays leased until the output.
+- **Region crops.** For a `Region` target whose capture holds the whole display
+  (`CaptureCaps::region_in_surface` false), each `ConvertJob::source` is the region in the input's
+  pixels (even origin and size), following live region moves. Such a region needs
+  `ConvertPath::Convert`; with `Identity` the start is refused (`stream.capture`). A backend that
+  captures only the region (macOS `sourceRect`) reports true and gets `source: None`.
+- **Stage times.** `VideoOutMeta::timing` carries the frame's H0 and H1 (from its `SurfaceInfo`)
+  and H3 and H4 (from `EncodedFrame::timings`), so a consumer's send hop can trace a frame without
+  a table of its own; a recovery re-encode keeps the image's H0 and H1.
 - `CaptureEvents::layout_changed` (a display mode, DPI, rotation or window size change) posts
   `ObserverJob::LayoutChanged { epoch, layout }`; the consumer re-plans, for example with a size
   update. The executor does not resize by itself.

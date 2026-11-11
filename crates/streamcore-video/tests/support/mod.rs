@@ -280,6 +280,10 @@ pub struct FakeCapture {
     /// Emit one frame from inside `start` (a reentrant backend).
     pub frame_on_start: AtomicBool,
     pub opened: Mutex<Option<CaptureSpec>>,
+    /// `CaptureCaps::region_in_surface`.
+    pub region_in_surface: AtomicBool,
+    /// The thread of every `caps`, `open`, `start`, `update` and `stop` call.
+    pub op_threads: Mutex<Vec<std::thread::ThreadId>>,
 }
 
 impl FakeCapture {
@@ -296,6 +300,8 @@ impl FakeCapture {
             opens: AtomicUsize::new(0),
             frame_on_start: AtomicBool::new(false),
             opened: Mutex::new(None),
+            region_in_surface: AtomicBool::new(true),
+            op_threads: Mutex::new(Vec::new()),
         })
     }
 
@@ -365,8 +371,24 @@ impl FakeCapture {
         lock(&self.live).len()
     }
 
+    /// Deliver a prepared surface, as the capture callback does.
+    pub fn emit_info(&self, surface: SurfaceInfo) {
+        let id = surface.id;
+        let events = lock(&self.events).clone();
+        if let Some(events) = events {
+            events.frame(CAPTURE, None, surface, FrameStatus::Complete);
+        } else {
+            self.release(id);
+        }
+    }
+
+    fn note_thread(&self) {
+        lock(&self.op_threads).push(std::thread::current().id());
+    }
+
     fn record(&self, op: Op, token: OpToken) {
         let _call = self.log.outbound();
+        self.note_thread();
         lock(&self.ops).push((op, token));
         if self.auto_answer.load(Ordering::SeqCst) {
             let events = lock(&self.events).clone();
@@ -379,6 +401,7 @@ impl FakeCapture {
 
 impl CaptureBackend for FakeCapture {
     fn caps(&self) -> CaptureCaps {
+        self.note_thread();
         CaptureCaps {
             target_kinds: vec![CaptureTargetKind::Display],
             window_fit: false,
@@ -387,6 +410,7 @@ impl CaptureBackend for FakeCapture {
             surface_kinds: vec![SurfaceKind::IoSurface],
             pool_depth: 5,
             virtual_displays: false,
+            region_in_surface: self.region_in_surface.load(Ordering::SeqCst),
         }
     }
     fn enumerate(&self) -> Result<SourceCatalog, MediaError> {
@@ -405,6 +429,7 @@ impl CaptureBackend for FakeCapture {
         events: Arc<dyn CaptureEvents>,
     ) -> Result<CaptureId, MediaError> {
         let _call = self.log.outbound();
+        self.note_thread();
         self.opens.fetch_add(1, Ordering::SeqCst);
         *lock(&self.opened) = Some(spec);
         *lock(&self.events) = Some(events);
@@ -524,7 +549,10 @@ impl FakeEncoder {
             discardable: false,
             temporal_id: None,
             ltr: None,
-            timings: EncodeTimings::default(),
+            timings: EncodeTimings {
+                input_ns: Some(pending.opts.capture_ns + 10),
+                output_ns: Some(pending.opts.capture_ns + 20),
+            },
         });
         self.drop_permit(pending);
         true
