@@ -371,3 +371,26 @@ async fn clock_v1_is_a_hard_capability_break() {
     .await;
     assert!(old.is_err());
 }
+
+#[tokio::test]
+async fn receive_timing_and_write_time_follow_the_monotonic_clock() {
+    let (_listener, server, client) = channels(ChannelTransport::TlsTcp).await;
+    let before = monotonic_now_us();
+    // Three fragments, so the first and last arrivals can differ.
+    let video = Frame {
+        kind: 0x10,
+        payload: &vec![7; 40 * 1024],
+    }
+    .encode()
+    .unwrap();
+    let pending = client.enqueue_application_frame(video.clone()).unwrap();
+    assert!(pending.written_at_us().is_none());
+    pending.written().await.unwrap();
+    let written = pending.written_at_us().unwrap();
+    assert!(written >= before);
+    let message = server.receive_timed().await.unwrap();
+    assert_eq!(message.payload, video);
+    assert!(message.first_byte_us >= before);
+    assert!(message.complete_us >= message.first_byte_us);
+    assert!(monotonic_now_us() >= message.complete_us);
+}

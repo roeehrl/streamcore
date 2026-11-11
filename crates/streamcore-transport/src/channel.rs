@@ -72,6 +72,16 @@ async fn on_runtime<T: Send + 'static>(
         .map_err(|_| ChannelError::Runtime)?
 }
 
+/// A received message with its arrival times (`clock::monotonic_now_us`).
+#[derive(Clone, uniffi::Record)]
+pub struct TimedMessage {
+    pub payload: Vec<u8>,
+    /// When its first fragment arrived.
+    pub first_byte_us: u64,
+    /// When its last fragment arrived and it became complete.
+    pub complete_us: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct SecureChannel {
     io: Arc<Multiplexer>,
@@ -202,6 +212,26 @@ impl SecureChannel {
                 .await?;
             guard.completed = true;
             Ok(())
+        })
+        .await
+    }
+
+    /// [`Self::receive`] plus when the message's first and last fragments
+    /// arrived, for receive-side stage timing.
+    pub async fn receive_timed(&self) -> Result<TimedMessage, ChannelError> {
+        let io = self.io.clone();
+        on_runtime(async move {
+            let mut guard = CloseOnInterruptedFrame {
+                io: io.clone(),
+                completed: false,
+            };
+            let received = io.receive_timed().await?;
+            guard.completed = true;
+            Ok(TimedMessage {
+                payload: received.data,
+                first_byte_us: received.first_us,
+                complete_us: received.complete_us,
+            })
         })
         .await
     }

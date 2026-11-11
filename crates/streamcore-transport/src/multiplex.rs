@@ -6,7 +6,10 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use streamcore_media::binary::{ClockPing, ClockPong, Frame};
 use tokio::{
@@ -75,7 +78,8 @@ pub fn application_lane(bytes: &[u8], policy: LanePolicy) -> Result<ChannelLane,
 #[derive(uniffi::Object)]
 pub struct PendingSend {
     consumed: AsyncMutex<Option<oneshot::Receiver<Result<(), ChannelError>>>>,
-    result: AsyncMutex<Option<oneshot::Receiver<Result<(), ChannelError>>>>,
+    result: AsyncMutex<Option<oneshot::Receiver<Result<u64, ChannelError>>>>,
+    written_us: AtomicU64,
     closed: watch::Sender<bool>,
 }
 #[uniffi::export]
@@ -95,8 +99,17 @@ impl PendingSend {
         tokio::select! {
             biased;
             _ = closed.changed() => Err(ChannelError::Closed),
-            result = result => result.unwrap_or(Err(ChannelError::Closed)),
+            result = result => {
+                let at = result.unwrap_or(Err(ChannelError::Closed))?;
+                self.written_us.store(at, Ordering::Relaxed);
+                Ok(())
+            }
         }
+    }
+    /// When the last fragment was handed to the transport (`clock::monotonic_now_us`),
+    /// once [`Self::written`] has completed successfully.
+    pub fn written_at_us(&self) -> Option<u64> {
+        Some(self.written_us.load(Ordering::Relaxed)).filter(|at| *at != 0)
     }
     /// The peer's message consumer took this complete message. This is not an
     /// acknowledgement that a command was executed or a file was committed.
@@ -136,7 +149,7 @@ struct Outgoing {
     sequence: u64,
     data: Arc<Vec<u8>>,
     offset: usize,
-    done: oneshot::Sender<Result<(), ChannelError>>,
+    done: oneshot::Sender<Result<u64, ChannelError>>,
 }
 struct Outstanding {
     sequence: u64,
@@ -173,10 +186,24 @@ struct Assembly {
     sequence: u64,
     total: usize,
     data: Vec<u8>,
+    first_us: u64,
+}
+struct Ready {
+    sequence: u64,
+    data: Vec<u8>,
+    first_us: u64,
+    complete_us: u64,
+}
+/// One received message and when its first and last fragments arrived
+/// (`clock::monotonic_now_us`).
+pub(crate) struct Received {
+    pub(crate) data: Vec<u8>,
+    pub(crate) first_us: u64,
+    pub(crate) complete_us: u64,
 }
 struct Receiver {
     partial: [Option<Assembly>; LANES],
-    ready: [VecDeque<(u64, Vec<u8>)>; LANES],
+    ready: [VecDeque<Ready>; LANES],
     bytes: [usize; LANES],
     count: [usize; LANES],
     sequences: [u64; LANES],
@@ -348,6 +375,7 @@ impl Multiplexer {
         Ok(Arc::new(PendingSend {
             consumed: AsyncMutex::new(Some(consumed_rx)),
             result: AsyncMutex::new(Some(rx)),
+            written_us: AtomicU64::new(0),
             closed: self.closed.clone(),
         }))
     }
@@ -508,7 +536,7 @@ impl Multiplexer {
             .ok_or(ChannelError::Closed)?;
         s.count -= 1;
         s.bytes -= packet.data.len();
-        let _ = packet.done.send(Ok(()));
+        let _ = packet.done.send(Ok(monotonic_now_us().max(1)));
         Ok(())
     }
     fn ingest(&self, record: &[u8], only: Option<usize>) -> Result<(), ChannelError> {
@@ -579,6 +607,7 @@ impl Multiplexer {
                 sequence,
                 total,
                 data: Vec::with_capacity(total),
+                first_us: monotonic_now_us(),
             });
         }
         let assembly = r.partial[lane].as_mut().ok_or(ChannelError::Io)?;
@@ -597,7 +626,12 @@ impl Multiplexer {
             } else {
                 None
             };
-            r.ready[lane].push_back((complete.sequence, complete.data));
+            r.ready[lane].push_back(Ready {
+                sequence: complete.sequence,
+                data: complete.data,
+                first_us: complete.first_us,
+                complete_us: received_us,
+            });
             self.ready.notify_one();
             drop(r);
             if let Some(message) = clock {
@@ -607,6 +641,9 @@ impl Multiplexer {
         Ok(())
     }
     pub(crate) async fn receive(&self) -> Result<Vec<u8>, ChannelError> {
+        self.receive_timed().await.map(|received| received.data)
+    }
+    pub(crate) async fn receive_timed(&self) -> Result<Received, ChannelError> {
         let mut closed = self.closed.subscribe();
         let _reader = self.receive_lock.lock().await;
         loop {
@@ -616,21 +653,27 @@ impl Multiplexer {
                 for _ in 0..ORDER.len() {
                     let lane = ORDER[r.cursor];
                     r.cursor = (r.cursor + 1) % ORDER.len();
-                    if let Some((sequence, data)) = r.ready[lane].pop_front() {
-                        packet = Some((lane, sequence, data));
+                    if let Some(ready) = r.ready[lane].pop_front() {
+                        packet = Some((lane, ready));
                         break;
                     }
                 }
                 packet
             };
-            if let Some((lane, sequence, data)) = packet {
+            if let Some((lane, ready)) = packet {
                 let mut sender = self.sender.lock().map_err(|_| ChannelError::Closed)?;
                 if !*self.closed.borrow() {
-                    sender.grants.push_back((lane, sequence, data.len()));
+                    sender
+                        .grants
+                        .push_back((lane, ready.sequence, ready.data.len()));
                 }
                 drop(sender);
                 self.notify(0);
-                return Ok(data);
+                return Ok(Received {
+                    data: ready.data,
+                    first_us: ready.first_us,
+                    complete_us: ready.complete_us,
+                });
             }
             if *closed.borrow_and_update() {
                 return Err(ChannelError::Closed);
