@@ -3,7 +3,7 @@
 use crate::media::VideoMetadata;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -18,17 +18,37 @@ pub fn valid_video_settings(max_dimension: i64, max_fps: i64, quality: f64) -> b
         && (0.0..=1.0).contains(&quality)
 }
 
-#[derive(Default)]
+/// The most permits a stream may hold at once.
+pub const MAX_IN_FLIGHT: u32 = 3;
+const CLOSED: u32 = 1 << 31;
+
+/// Called after every permit release, on the releasing thread. It must be a
+/// leaf: non-blocking, no lock held across a native call.
+pub type ReleaseHook = Arc<dyn Fn() + Send + Sync>;
+
 struct WorkState {
-    pending: u32,
-    closed: bool,
+    // Low bits: permits in flight. `CLOSED`: no further admission. One atomic, so
+    // a close racing an acquire can never admit after the close returned.
+    count: AtomicU32,
+    hook: Option<ReleaseHook>,
+}
+
+impl Default for WorkState {
+    fn default() -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            hook: None,
+        }
+    }
 }
 
 /// Bounds native pixel-buffer submission AND deferred encoded-output handling.
 /// Only permits cross FFI; native buffers remain with the platform backend.
+/// Lock-free: acquire, release and close are atomics only, so a release is a
+/// leaf call on any thread.
 #[derive(Default, uniffi::Object)]
 pub struct VideoWorkQueue {
-    state: Arc<Mutex<WorkState>>,
+    state: Arc<WorkState>,
 }
 
 #[uniffi::export]
@@ -41,20 +61,43 @@ impl VideoWorkQueue {
     /// A saturated encoder drops a new capture before compression, so it does
     /// not create an encoded dependency that a later frame could reference.
     pub fn acquire(&self) -> Option<Arc<VideoWorkPermit>> {
-        let mut state = self.state.lock().ok()?;
-        if state.closed || state.pending >= 3 {
-            return None;
-        }
-        state.pending += 1;
+        self.state
+            .count
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count & CLOSED == 0 && count < MAX_IN_FLIGHT).then_some(count + 1)
+            })
+            .ok()?;
         Some(Arc::new(VideoWorkPermit {
-            state: Mutex::new(Some(self.state.clone())),
+            released: AtomicBool::new(false),
+            state: self.state.clone(),
         }))
     }
 
     pub fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.closed = true;
+        self.state.count.fetch_or(CLOSED, Ordering::AcqRel);
+    }
+}
+
+impl VideoWorkQueue {
+    /// A queue whose every permit release, explicit or by Drop, also calls
+    /// `hook` (after the count is decremented). Rust-only: a stream executor
+    /// uses it to post `PermitReleased` to itself.
+    pub fn with_release_hook(hook: ReleaseHook) -> Self {
+        Self {
+            state: Arc::new(WorkState {
+                count: AtomicU32::new(0),
+                hook: Some(hook),
+            }),
         }
+    }
+
+    /// Permits currently in flight (not yet released).
+    pub fn in_flight(&self) -> u32 {
+        self.state.count.load(Ordering::Acquire) & !CLOSED
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state.count.load(Ordering::Acquire) & CLOSED != 0
     }
 }
 
@@ -63,16 +106,18 @@ impl VideoWorkQueue {
 /// encoder replacements so deferred old callbacks still count against the bound.
 #[derive(uniffi::Object)]
 pub struct VideoWorkPermit {
-    state: Mutex<Option<Arc<Mutex<WorkState>>>>,
+    released: AtomicBool,
+    state: Arc<WorkState>,
 }
 #[uniffi::export]
 impl VideoWorkPermit {
     pub fn release(&self) {
-        if let Ok(mut owner) = self.state.lock()
-            && let Some(state) = owner.take()
-            && let Ok(mut state) = state.lock()
-        {
-            state.pending -= 1;
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.state.count.fetch_sub(1, Ordering::AcqRel);
+        if let Some(hook) = &self.state.hook {
+            hook();
         }
     }
 }

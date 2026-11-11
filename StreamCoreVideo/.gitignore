@@ -1,0 +1,4 @@
+# Built by scripts/build-streamcore-video-apple.sh
+/Artifacts/
+/Sources/StreamCoreVideo/Generated/
+/.build/

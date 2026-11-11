@@ -56,6 +56,12 @@
       "run": "bash scripts/build-streamcore-input-android.sh"
     },
     {
+      "context": "local/streamcore-video-apple",
+      "lane": "mac",
+      "timeout": 2400,
+      "run": "bash scripts/build-streamcore-video-apple.sh"
+    },
+    {
       "context": "local/linux",
       "lane": "linux",
       "timeout": 3600,

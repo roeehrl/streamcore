@@ -1,0 +1,20 @@
+# This crate's own binding files. A product that links several crates into one
+# library chooses the shared Swift and C module names in its global bindgen
+# config (uniffi-bindgen --config); the header keeps this
+# crate's name so the crates' headers can sit side by side in that C module.
+[bindings.swift]
+ffi_module_filename = "streamcore_videoFFI"
+
+[bindings.kotlin]
+package_name = "uniffi.streamcore_video"
+
+# `open` is a Swift keyword, and UniFFI 0.32.2 copies its escaped Swift spelling
+# into the C header's vtable, which no C compiler accepts: in Swift the method is
+# `openCapture`.
+[bindings.swift.rename]
+"CaptureBackend.open" = "openCapture"
+
+# UniFFI Kotlin objects are AutoCloseable: `close()` frees the Rust object. The
+# async stream close is `closeStream()` in Kotlin.
+[bindings.kotlin.rename]
+"StreamController.close" = "closeStream"

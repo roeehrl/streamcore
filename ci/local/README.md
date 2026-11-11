@@ -14,6 +14,7 @@ root and reports it to GitHub as a commit status named `local/…`.
 | `local/input-changes` | mac | [`scripts/check-input-changes.py`](../../scripts/check-input-changes.py): an input model change must add an entry to [`CHANGES.md`](../../crates/streamcore-input/CHANGES.md) |
 | `local/streamcore-input-apple` | mac | [`scripts/build-streamcore-input-apple.sh`](../../scripts/build-streamcore-input-apple.sh) |
 | `local/streamcore-input-android` | mac | [`scripts/build-streamcore-input-android.sh`](../../scripts/build-streamcore-input-android.sh) |
+| `local/streamcore-video-apple` | mac | [`scripts/build-streamcore-video-apple.sh`](../../scripts/build-streamcore-video-apple.sh): the video crate's Swift binding smoke test |
 | `local/linux` | linux | [`linux.sh`](linux.sh): [`scripts/ci.sh`](../../scripts/ci.sh) in a linux container ([`linux.Dockerfile`](linux.Dockerfile)) |
 
 Every job is an ordinary command; run it by hand the same way. The Windows input

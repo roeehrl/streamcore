@@ -212,8 +212,9 @@ pub struct SurfaceInfo { id: SurfaceId, kind: SurfaceKind, format: PixelFormat /
     capture_ns: u64 /* H1 */, source_present_ns: Option<u64> /* H0 */, dirty: Option<Vec<Rect>>, rotation: Rotation, fence: GpuFence }
 ```
 
-Every `*_ns` value is host-monotonic nanoseconds, converted natively (mach ticks × timebase, QPC ×
-100, `CLOCK_MONOTONIC`). Ownership rules:
+Every `*_ns` value is host-monotonic nanoseconds, converted natively (mach ticks × timebase; QPC
+ticks × 10⁹ / frequency, so WGC's 100 ns `SystemRelativeTime` × 100; `CLOCK_MONOTONIC`; see
+[VIDEO-THREADING.md](VIDEO-THREADING.md#clocks)). Ownership rules:
 
 - The producer owns a surface. Dropping Rust's `SurfaceLease` calls `release(id)` exactly once: on
   the stream executor while it exists, else on the posting thread (after `Closed`, 3.5). Every
