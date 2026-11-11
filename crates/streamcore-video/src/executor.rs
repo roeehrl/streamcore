@@ -427,6 +427,11 @@ impl Shared {
         true
     }
 
+    /// A per-frame C call panicked: fail the stream (`stream.output`).
+    pub(crate) fn fail_from_native(&self) {
+        self.post(Event::Internal(Internal::Fail(crate::error::codes::OUTPUT)));
+    }
+
     pub(crate) fn set_capture_port(&self, port: &Arc<CapturePort>) {
         *lock(&self.capture_port) = Arc::downgrade(port);
     }
@@ -437,6 +442,12 @@ impl Shared {
 
     fn end_drain(&self) {
         self.draining.store(false, Ordering::Release);
+        // A permit released after the drain's last check (in `after_drain` or
+        // `finalize`, or an inline frame drain's refused submit) is posted, so a
+        // retained frame still gets submitted.
+        if self.permit_released.swap(false, Ordering::AcqRel) {
+            self.post(Event::PermitReleased);
+        }
         let pending = {
             let mailbox = lock(&self.mailbox);
             !mailbox.closed && !mailbox.events.is_empty()
@@ -516,11 +527,6 @@ impl Shared {
                 state.publish(self);
                 *lock(&self.state) = Some(state);
                 drop(marker);
-                // An inline drain handles only its frame: a release during it
-                // (a refused submit) is handled on the next wake, as before.
-                if self.permit_released.swap(false, Ordering::AcqRel) {
-                    self.post(Event::PermitReleased);
-                }
             }
             None => self.post(event),
         }
@@ -539,8 +545,10 @@ impl Shared {
             *lock(&self.native) = NativeStream::default();
             queue.take()
         };
-        // The C ABI's frames are refused from now on (the caller releases).
+        // The C ABI's frames are refused from now on (the caller releases), and
+        // the receipts of lent packets go.
         *lock(&self.capture_port) = Weak::new();
+        native::close_stream(self.id);
         let out = lock(&self.out).take();
         let mut state = state;
         let keepalive = state.keepalive.take();
@@ -675,25 +683,19 @@ impl CapturePort {
     }
 
     /// The C ABI's frame (`streamcore_video_frame`): a `Complete` image shaped
-    /// like the last `Complete` `frame` of capture `id`. Before any, the image
-    /// gets a zero size, which the executor counts as invalid and releases.
+    /// like the last `Complete` `frame` of capture `id`. False, without taking
+    /// the surface, when this capture has no shape yet.
     pub(crate) fn frame_compact(
         &self,
         id: CaptureId,
         surface: SurfaceId,
         capture_ns: u64,
         source_present_ns: u64,
-    ) {
+    ) -> bool {
         let shape = match *lock(&self.shape) {
             Some((capture, shape)) if capture == id => shape,
-            _ => SurfaceShape {
-                kind: SurfaceKind::IoSurface,
-                format: PixelFormat::Nv12,
-                width: 0,
-                height: 0,
-                color: ColorTags::BT709,
-                rotation: Rotation::None,
-            },
+            // No full frame of this capture yet: not taken.
+            _ => return false,
         };
         let info = SurfaceInfo {
             id: surface,
@@ -709,6 +711,7 @@ impl CapturePort {
             fence: GpuFence::None,
         };
         self.deliver(id, None, info, FrameStatus::Complete);
+        true
     }
 }
 
@@ -892,6 +895,10 @@ impl VideoSinkHandle {
             std::mem::take(&mut payloads.bytes)
         };
         drop(dropped);
+    }
+
+    pub(crate) fn executor(&self) -> Option<Arc<Shared>> {
+        self.executor.upgrade()
     }
 
     pub(crate) fn attach(&self, submit: NativeSubmit) {

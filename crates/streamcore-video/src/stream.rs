@@ -1459,7 +1459,7 @@ impl StreamState {
             debug_assert!(is_current(cx.id));
             // `out` (the C send's context) is held for the call.
             match cx.native().send {
-                Some(send) => crate::native::send(send, &meta, bytes, receipt),
+                Some(send) => crate::native::send(send, cx.id, &meta, bytes, receipt),
                 None => out.send(meta, bytes, Arc::new(receipt)),
             }
             self.stats.packets_sent += 1;

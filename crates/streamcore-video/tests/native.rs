@@ -240,12 +240,13 @@ fn compact_frames_repeat_the_last_shape() {
     let s = Manual::native();
     s.start_running();
     let port = s.queue.port.native_key();
-    // Before any full frame there is no shape: released, counted, not submitted.
+    // Before any full frame there is no shape: not taken, the caller keeps it.
     let early = s.capture.surface(srgb(), 500).id;
-    assert!(streamcore_video_frame(port, CAPTURE, early, 500, 0));
+    assert!(!streamcore_video_frame(port, CAPTURE, early, 500, 0));
     s.pump();
-    assert!(!lock(&s.capture.live).contains(&early));
-    assert_eq!(s.controller.stats().frames_received, 1);
+    assert!(lock(&s.capture.live).contains(&early));
+    assert_eq!(s.controller.stats().frames_received, 0);
+    CaptureBackend::release(&*s.capture, early);
 
     s.frame(1_000);
     let encoder = s.encoder();
@@ -262,11 +263,11 @@ fn compact_frames_repeat_the_last_shape() {
     encoder.complete(2);
     s.pump();
 
-    // Another capture id has no shape.
+    // Another capture id has no shape: not taken.
     let other = s.capture.surface(srgb(), 3_000).id;
-    assert!(streamcore_video_frame(port, CAPTURE + 1, other, 3_000, 0));
+    assert!(!streamcore_video_frame(port, CAPTURE + 1, other, 3_000, 0));
     s.pump();
-    assert!(!lock(&s.capture.live).contains(&other));
+    CaptureBackend::release(&*s.capture, other);
     assert_eq!(lock(&encoder.submits).len(), 2);
 
     // A full frame with a new colour changes the shape compact frames repeat:
@@ -328,8 +329,10 @@ fn a_delivered_frame_costs_one_wake() {
     one_wake_per_delivered_frame(&Manual::native(), true);
 }
 
+/// The consumer's connection copies the bytes at once and completes later: the
+/// release comes first and must not count as a refusal.
 #[test]
-fn a_lent_packet_released_without_completion_counts_as_refused() {
+fn a_packet_released_before_its_completion_is_accepted() {
     let s = Manual::native();
     s.start_running();
     s.frame(1_000);
@@ -346,9 +349,75 @@ fn a_lent_packet_released_without_completion_counts_as_refused() {
     };
     streamcore_video_packet_release(key);
     s.pump();
+    assert_eq!(s.queue.wakes.load(Ordering::SeqCst), 0);
+    streamcore_video_packet_complete(key, true);
+    s.pump();
+    // A second completion and release are no-ops.
+    streamcore_video_packet_complete(key, false);
+    streamcore_video_packet_release(key);
+    s.pump();
+    let stats = s.controller.stats();
+    assert_eq!(stats.packets_refused, 0);
+    assert_eq!(stats.recoveries, 0);
+    // Steady state continues without a recovery keyframe.
+    s.frame_native(2_000);
+    assert!(!lock(&encoder.submits)[1].force_keyframe);
+    encoder.complete(2);
+    s.pump();
+    finish_all(&s);
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_released_packet_refused_later_is_a_loss() {
+    let s = Manual::native();
+    s.start_running();
+    s.frame(1_000);
+    let encoder = s.encoder();
+    encoder.complete(1);
+    s.pump();
+    let key = match lock(&s.out.state).receipts.pop().expect("receipt").1 {
+        Receipt::Native(key) => key,
+        Receipt::Uniffi(_) => panic!("sent through UniFFI"),
+    };
+    streamcore_video_packet_release(key);
+    streamcore_video_packet_complete(key, false);
+    s.pump();
     assert_eq!(s.controller.stats().packets_refused, 1);
     s.advance_ms(600);
     encoder.complete_all();
+    s.pump();
+    finish_all(&s);
+    s.close();
+    s.assert_clean();
+}
+
+/// A restart opens a new capture: the C frame is not taken until a full frame
+/// gives the new capture its shape.
+#[test]
+fn a_restarted_capture_needs_a_full_frame_first() {
+    let s = Manual::native();
+    s.start_running();
+    s.frame(1_000);
+    s.frame_native(2_000);
+    let encoder = s.encoder();
+    encoder.complete_all();
+    s.pump();
+    finish_all(&s);
+    let stop = s.controller.stop();
+    s.pump();
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    assert_eq!(s.observer.results(stop), vec![OpOutcome::Completed]);
+    s.start_running();
+    let port = s.queue.port.native_key();
+    let early = s.capture.surface(srgb(), 3_000).id;
+    assert!(!streamcore_video_frame(port, CAPTURE, early, 3_000, 0));
+    CaptureBackend::release(&*s.capture, early);
+    s.frame(4_000);
+    s.frame_native(5_000);
+    s.factory.last().complete_all();
     s.pump();
     finish_all(&s);
     s.close();

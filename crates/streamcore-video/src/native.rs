@@ -33,7 +33,7 @@
 //! other exports need `allow(unsafe_code)` only for `no_mangle`.
 
 use crate::error::MediaError;
-use crate::executor::{SinkReceipt, StreamPort, VideoSinkHandle, lock};
+use crate::executor::{Shared, SinkReceipt, StreamPort, VideoSinkHandle, lock};
 use crate::types::{BitstreamForm, EncodeTimings, EncodedFrame, LtrInfo, VideoOutMeta};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -53,6 +53,34 @@ fn next_key() -> u64 {
 static SINKS: Mutex<BTreeMap<u64, Weak<VideoSinkHandle>>> = Mutex::new(BTreeMap::new());
 static PORTS: Mutex<BTreeMap<u64, Weak<StreamPort>>> = Mutex::new(BTreeMap::new());
 static PACKETS: Mutex<BTreeMap<u64, Arc<NativePacket>>> = Mutex::new(BTreeMap::new());
+/// Receipts of lent packets, by packet key, with their stream's executor id:
+/// kept until completed or the stream closes, independently of the bytes.
+static RECEIPTS: Mutex<BTreeMap<u64, (u64, SinkReceipt)>> = Mutex::new(BTreeMap::new());
+
+/// Runs an export's body; a panic must not unwind into native code. The
+/// stream concerned, if any, is failed (`stream.output`) and `fallback`
+/// returned.
+fn guarded<T>(
+    fallback: T,
+    stream: impl FnOnce() -> Option<Arc<Shared>>,
+    body: impl FnOnce() -> T,
+) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(value) => value,
+        Err(_) => {
+            if let Ok(Some(executor)) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(stream))
+            {
+                executor.fail_from_native();
+            }
+            fallback
+        }
+    }
+}
+
+fn port_stream(port_key: u64) -> Option<Arc<Shared>> {
+    port(port_key).and_then(|port| port.executor())
+}
 
 pub(crate) fn register_sink(sink: Weak<VideoSinkHandle>) -> u64 {
     let key = next_key();
@@ -228,7 +256,10 @@ impl NativeSubmit {
         ) {
             SUBMITTED => Submitted::Ok,
             SUBMIT_BUSY => Submitted::Busy,
-            code => Submitted::Failed(media_error(code - SUBMIT_FAILED)),
+            code => Submitted::Failed(
+                code.checked_sub(SUBMIT_FAILED)
+                    .map_or(MediaError::Internal, media_error),
+            ),
         }
     }
 }
@@ -244,10 +275,14 @@ pub extern "C" fn streamcore_video_attach_stream(
     port_key: u64,
     callbacks: StreamCallbacks,
 ) -> bool {
-    match port(port_key).and_then(|port| port.executor()) {
-        Some(executor) => executor.attach(NativeStream::from_c(callbacks)),
-        None => false,
-    }
+    guarded(
+        false,
+        || None,
+        || match port_stream(port_key) {
+            Some(executor) => executor.attach(NativeStream::from_c(callbacks)),
+            None => false,
+        },
+    )
 }
 
 /// Attaches `submit` for the encoder whose `EncoderSpec::sink` has key `sink`;
@@ -262,13 +297,17 @@ pub extern "C" fn streamcore_video_attach_encoder(
     encoder: *mut c_void,
     submit: Option<SubmitFn>,
 ) -> bool {
-    match (sink(sink_key), submit) {
-        (Some(sink), Some(submit)) => {
-            sink.attach(NativeSubmit(Context::new(encoder), submit));
-            true
-        }
-        _ => false,
-    }
+    guarded(
+        false,
+        || None,
+        || match (sink(sink_key), submit) {
+            (Some(sink), Some(submit)) => {
+                sink.attach(NativeSubmit(Context::new(encoder), submit));
+                true
+            }
+            _ => false,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -279,9 +318,10 @@ pub extern "C" fn streamcore_video_attach_encoder(
 /// capture except for `surface`, `capture_ns` and `source_present_ns` (`0`:
 /// not reported), with no dirty rects and `GpuFence::None`. A backend uses
 /// `frame` whenever kind, format, size, colour or rotation change. Returns false
-/// when the port has no stream or no open capture: the surface was not taken
-/// and the caller releases it. Otherwise the surface is leased to Rust (an
-/// image that arrives before any `frame` is counted as invalid and released).
+/// when the surface was not taken: the port has no stream or no open capture,
+/// or the open capture has no shape yet (a new capture after a restart); the
+/// caller then delivers the image with the full `frame` (which releases it if
+/// the stream is gone). Otherwise the surface is leased to Rust.
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_frame(
@@ -291,14 +331,17 @@ pub extern "C" fn streamcore_video_frame(
     capture_ns: u64,
     source_present_ns: u64,
 ) -> bool {
-    let Some(events) = port(port_key)
-        .and_then(|port| port.executor())
-        .and_then(|executor| executor.capture_port())
-    else {
-        return false;
-    };
-    events.frame_compact(capture, surface, capture_ns, source_present_ns);
-    true
+    guarded(
+        false,
+        || port_stream(port_key),
+        || {
+            port_stream(port_key)
+                .and_then(|executor| executor.capture_port())
+                .is_some_and(|events| {
+                    events.frame_compact(capture, surface, capture_ns, source_present_ns)
+                })
+        },
+    )
 }
 
 /// `StreamPort::run`: drain the stream's mailbox. Call only on the stream's
@@ -306,9 +349,15 @@ pub extern "C" fn streamcore_video_frame(
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_run(port_key: u64) {
-    if let Some(port) = port(port_key) {
-        port.run();
-    }
+    guarded(
+        (),
+        || port_stream(port_key),
+        || {
+            if let Some(port) = port(port_key) {
+                port.run();
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -372,47 +421,53 @@ pub unsafe extern "C" fn streamcore_video_encoded(
     }
     // SAFETY: non-NULL, aligned and valid for the call by the caller's contract.
     let output = unsafe { *output };
-    let Some(sink) = sink(sink_key) else {
-        return false;
-    };
-    let limit = MAX_FRAME_LENGTH - VIDEO_HEADER_LENGTH;
-    // An empty copy is refused by the sink (and posted as a drop).
-    let copy = |bytes: *const u8, len: usize| -> Vec<u8> {
-        if bytes.is_null() || len == 0 || len > limit {
-            return Vec::new();
-        }
-        // SAFETY: non-NULL and `len` bytes readable for the call by the
-        // caller's contract; `len` is at most the frame limit; copied before the
-        // call returns.
-        unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
-    };
-    let payload = copy(output.payload, output.payload_len);
-    let config = (!output.config.is_null()).then(|| copy(output.config, output.config_len));
-    let known = |ns: u64| (ns != 0).then_some(ns);
-    let frame = EncodedFrame {
-        submit_seq: output.submit_seq,
-        pts_ns: output.pts_ns,
-        keyframe: output.flags & ENCODED_KEYFRAME != 0,
-        // Tokens are assigned by the sink.
-        config_token: config.as_ref().map(|_| 0),
-        payload_token: 0,
-        form: if output.flags & ENCODED_ANNEX_B != 0 {
-            BitstreamForm::AnnexB
-        } else {
-            BitstreamForm::Avcc4
+    guarded(
+        false,
+        || sink(sink_key).and_then(|sink| sink.executor()),
+        || {
+            let Some(sink) = sink(sink_key) else {
+                return false;
+            };
+            let limit = MAX_FRAME_LENGTH - VIDEO_HEADER_LENGTH;
+            // An empty copy is refused by the sink (and posted as a drop).
+            let copy = |bytes: *const u8, len: usize| -> Vec<u8> {
+                if bytes.is_null() || len == 0 || len > limit {
+                    return Vec::new();
+                }
+                // SAFETY: non-NULL and `len` bytes readable for the call by the
+                // caller's contract; `len` is at most the frame limit; copied before the
+                // call returns.
+                unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec()
+            };
+            let payload = copy(output.payload, output.payload_len);
+            let config = (!output.config.is_null()).then(|| copy(output.config, output.config_len));
+            let known = |ns: u64| (ns != 0).then_some(ns);
+            let frame = EncodedFrame {
+                submit_seq: output.submit_seq,
+                pts_ns: output.pts_ns,
+                keyframe: output.flags & ENCODED_KEYFRAME != 0,
+                // Tokens are assigned by the sink.
+                config_token: config.as_ref().map(|_| 0),
+                payload_token: 0,
+                form: if output.flags & ENCODED_ANNEX_B != 0 {
+                    BitstreamForm::AnnexB
+                } else {
+                    BitstreamForm::Avcc4
+                },
+                discardable: output.flags & ENCODED_DISCARDABLE != 0,
+                temporal_id: u8::try_from(output.temporal_id).ok(),
+                ltr: (output.flags & ENCODED_LTR != 0).then_some(LtrInfo {
+                    token: output.ltr_token,
+                    flags: output.ltr_flags,
+                }),
+                timings: EncodeTimings {
+                    input_ns: known(output.input_ns),
+                    output_ns: known(output.output_ns),
+                },
+            };
+            sink.encoded_native(frame, payload, config)
         },
-        discardable: output.flags & ENCODED_DISCARDABLE != 0,
-        temporal_id: u8::try_from(output.temporal_id).ok(),
-        ltr: (output.flags & ENCODED_LTR != 0).then_some(LtrInfo {
-            token: output.ltr_token,
-            flags: output.ltr_flags,
-        }),
-        timings: EncodeTimings {
-            input_ns: known(output.input_ns),
-            output_ns: known(output.output_ns),
-        },
-    };
-    sink.encoded_native(frame, payload, config)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -448,22 +503,28 @@ pub struct Packet {
     pub config: u8,
 }
 
-/// A packet lent to native code: its descriptor, its bytes and its receipt.
+/// A packet lent to native code: its descriptor and its bytes (the receipt is
+/// kept apart, in `RECEIPTS`).
 struct NativePacket {
     descriptor: Packet,
     _bytes: Vec<u8>,
-    receipt: SinkReceipt,
 }
 
-/// Lends one packet to the attached `send`: it stays registered (its bytes
-/// alive) until native code releases it.
+/// Lends one packet to the attached `send`: its bytes stay alive until native
+/// code releases it, its receipt until native code completes it or the stream
+/// closes, in either order.
 pub(crate) fn send(
     callback: (Context, SendFn),
+    stream: u64,
     meta: &VideoOutMeta,
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
     receipt: SinkReceipt,
 ) {
     let key = next_key();
+    // Derived from a unique borrow: the lent bytes are the consumer's to read
+    // (and, through `Data(bytesNoCopy:)`, write) until it releases them; Rust
+    // only drops them.
+    let address = bytes.as_mut_ptr().addr();
     let timing = meta.timing;
     let descriptor = Packet {
         key,
@@ -474,7 +535,7 @@ pub(crate) fn send(
         source_present_ns: timing.source_present_ns.unwrap_or(0),
         encode_input_ns: timing.encode.input_ns.unwrap_or(0),
         encode_output_ns: timing.encode.output_ns.unwrap_or(0),
-        bytes: bytes.as_ptr().addr(),
+        bytes: address,
         len: bytes.len(),
         stream_id: meta.header.stream_id,
         flags: meta.header.flags,
@@ -485,9 +546,9 @@ pub(crate) fn send(
     let packet = Arc::new(NativePacket {
         descriptor,
         _bytes: bytes,
-        receipt,
     });
     let address = std::ptr::from_ref(&packet.descriptor);
+    lock(&RECEIPTS).insert(key, (stream, receipt));
     lock(&PACKETS).insert(key, packet);
     // No lock held: native code may complete and release the packet inside.
     (callback.1)(callback.0.get(), address);
@@ -495,21 +556,39 @@ pub(crate) fn send(
 
 /// The send's result (`SinkReceipt::complete`): true once the consumer's send
 /// path took the packet, false when it refused or failed it. Only the first
-/// call counts; any thread.
+/// call counts; before or after the release; any thread. A packet never
+/// completed counts as refused when its stream closes.
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_packet_complete(packet: u64, accepted: bool) {
-    let packet = lock(&PACKETS).get(&packet).cloned();
-    if let Some(packet) = packet {
-        packet.receipt.complete(accepted);
+    let receipt = lock(&RECEIPTS).remove(&packet);
+    if let Some((_, receipt)) = receipt {
+        guarded((), || None, || receipt.complete(accepted));
     }
 }
 
-/// Ends the packet's loan: its descriptor and bytes are freed. A packet
-/// released without completing counts as refused. Any thread.
+/// Ends the loan of the packet's bytes: its descriptor and bytes are freed.
+/// It does not complete the send. Any thread.
 #[allow(unsafe_code)] // `no_mangle`: an exported C symbol, prefixed `streamcore_video_`.
 #[unsafe(no_mangle)]
 pub extern "C" fn streamcore_video_packet_release(packet: u64) {
     let packet = lock(&PACKETS).remove(&packet);
     drop(packet);
+}
+
+/// The stream `stream` closed: its packets never completed count as refused
+/// (posted to nobody, since the executor is closed) and their receipts go.
+pub(crate) fn close_stream(stream: u64) {
+    let receipts: Vec<_> = {
+        let mut receipts = lock(&RECEIPTS);
+        let keys: Vec<u64> = receipts
+            .iter()
+            .filter(|(_, (owner, _))| *owner == stream)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| receipts.remove(&key))
+            .collect()
+    };
+    drop(receipts);
 }

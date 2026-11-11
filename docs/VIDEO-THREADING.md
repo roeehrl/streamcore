@@ -262,13 +262,13 @@ everything else. Rust backends call the traits directly.
 
 | Per frame | C ABI | UniFFI form |
 | --- | --- | --- |
-| capture callback | `streamcore_video_frame(port, capture, surface, capture_ns, source_present_ns)`: the shape (kind, format, size, colour, rotation) repeats the last `Complete` `frame`, which a backend sends whenever the shape changes | `CaptureEvents::frame` |
+| capture callback | `streamcore_video_frame(port, capture, surface, capture_ns, source_present_ns)`: the shape (kind, format, size, colour, rotation) repeats the last `Complete` `frame` of that capture, which a backend sends whenever the shape changes; not taken (false) before one, as after a restart | `CaptureEvents::frame` |
 | submit | the attached `submit(encoder, surface, submit_seq, pts_ns, capture_ns, force_keyframe)`, returning submitted, busy or failed with an error code; the stream keeps the frame's permit until its output or drop is posted (by either ABI) | `StreamEncoder::submit` |
 | surface release | the attached `release(capture, surface)` | `CaptureBackend::release` |
 | encoder output | `streamcore_video_encoded(sink, &output)`: payload and configuration copied once, straight from the encoder's buffer, plus metadata; posts `dropped` itself when the bytes are refused | `submit_encoded` + `EncoderEvents::encoded` |
 | wake, drain | the attached `wake(queue)`; `streamcore_video_run(port)` | `SerialQueue::wake`, `StreamPort::run` |
 | send | the attached `send(out, &packet)`: metadata and the bytes' address and length, lent until `streamcore_video_packet_release(key)`, so the bytes are not copied out | `VideoOut::send` |
-| send completion | `streamcore_video_packet_complete(key, accepted)` | `SinkReceipt::complete` |
+| send completion | `streamcore_video_packet_complete(key, accepted)`, before or after the release (a consumer may copy the bytes at once and complete later); the receipt is kept until completed or the stream closes | `SinkReceipt::complete` |
 
 Native code names Rust objects by key (`StreamPort::native_key`, `VideoSinkHandle::native_key`, the
 packet's `key`), never by pointer, and a key whose object is gone names nothing. The attached
@@ -279,7 +279,9 @@ through UniFFI (the queue, capture backend and `VideoOut` of `StreamParts`, atta
 as it may call it: the queue and `VideoOut` until `Closed` (the wake holds a clone of the queue for
 the call), the encoder while its session is current, the capture backend while a lease's weak
 reference to it upgrades. A NULL function keeps the UniFFI call. Every rule above applies to the C
-forms unchanged. `streamcore_video_encoded` is the crate's only `unsafe` code: it reads the
+forms unchanged. A panic inside a C call does not unwind into native code: it is caught, the
+stream fails with `stream.output`, and the call returns its "not taken" value. A permit released
+after a drain's last check is posted when the drain ends. `streamcore_video_encoded` is the crate's only `unsafe` code: it reads the
 caller's output struct and byte ranges for the duration of the call; the other exports need
 `allow(unsafe_code)` only for `no_mangle`. Swift helpers are in
 `StreamCoreVideo/Sources/StreamCoreVideo/NativeFastPath.swift`; a product that builds the bindings

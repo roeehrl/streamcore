@@ -23,8 +23,8 @@ extern "C" {
 // ---------------------------------------------------------------------------------------
 // Out: Rust calls these instead of the UniFFI trait methods once attached.
 
-// A packet handed to `send`: its metadata and bytes, valid and unchanged until
-// streamcore_video_packet_release(key). The 0/1 fields are flags; times are host-monotonic
+// A packet handed to `send`: its metadata and bytes, valid until
+// streamcore_video_packet_release(key); the bytes are the consumer's to read (or write) until then. The 0/1 fields are flags; times are host-monotonic
 // nanoseconds, 0 when unknown.
 typedef struct streamcore_video_packet {
     uint64_t key;
@@ -46,8 +46,8 @@ typedef struct streamcore_video_packet {
 
 // The per-frame calls of a stream's SerialQueue (wake), CaptureBackend (release) and
 // VideoOut (send). Each context is that object as given in StreamParts; a NULL function
-// keeps the UniFFI call. `send` must complete and release the packet exactly once each
-// (streamcore_video_packet_complete / _release), possibly inside the call.
+// keeps the UniFFI call. `send` must complete and release the packet once each
+// (streamcore_video_packet_complete / _release), in either order, possibly inside the call.
 typedef struct streamcore_video_stream_callbacks {
     void *queue;
     void (*wake)(void *queue);
@@ -91,8 +91,9 @@ bool streamcore_video_attach_encoder(uint64_t sink, void *encoder, streamcore_vi
 // CaptureEvents.frame for a Complete single-source image shaped exactly like the last
 // Complete frame CaptureEvents.frame delivered for `capture` (kind, format, size, colour,
 // rotation), with no dirty rects and no fence; source_present_ns 0 when not reported. A
-// backend calls CaptureEvents.frame whenever the shape changes. False when the port has no
-// stream or no open capture: the surface was not taken and the caller releases it.
+// backend calls CaptureEvents.frame whenever the shape changes. False when the surface was not
+// taken: no stream, no open capture, or no full frame of this capture yet (after a restart);
+// the caller then delivers the image with CaptureEvents.frame.
 bool streamcore_video_frame(uint64_t port, uint64_t capture, uint64_t surface, uint64_t capture_ns,
                             uint64_t source_present_ns);
 
@@ -134,11 +135,12 @@ typedef struct streamcore_video_encoded_output {
 bool streamcore_video_encoded(uint64_t sink, const streamcore_video_encoded_output *output);
 
 // SinkReceipt.complete for a packet given to `send`: true once the consumer's send path
-// took it, false when it refused or failed it. Only the first call counts; any thread.
+// took it, false when it refused or failed it. Before or after the release; only the first
+// call counts; any thread. A packet never completed counts as refused when its stream closes.
 void streamcore_video_packet_complete(uint64_t packet, bool accepted);
 
-// Ends a packet's loan: its descriptor and bytes are freed. A packet released without
-// completing counts as refused. Exactly once; any thread.
+// Ends the loan of a packet's bytes: its descriptor and bytes are freed; the send is not
+// completed by it. Once; any thread.
 void streamcore_video_packet_release(uint64_t packet);
 
 #ifdef __cplusplus

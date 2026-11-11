@@ -63,8 +63,9 @@ public enum StreamCoreNative {
     }
 
     /// `CaptureEvents.frame` for a complete image shaped like the last full `frame` of
-    /// `capture` (`sourcePresentNs` 0 when unknown). False when the stream is gone or has no
-    /// open capture: the surface was not taken, and the caller releases it.
+    /// `capture` (`sourcePresentNs` 0 when unknown). False when the surface was not taken (no
+    /// stream, no open capture, or no full frame of this capture yet, as after a restart):
+    /// deliver it with the full `frame` then.
     public static func frame(port: UInt64, capture: UInt64, surface: UInt64, captureNs: UInt64,
                              sourcePresentNs: UInt64) -> Bool {
         streamcore_video_frame(port, capture, surface, captureNs, sourcePresentNs)
@@ -120,9 +121,9 @@ public struct NativeEncodedOutput {
 }
 
 /// A packet handed to the attached `send`: its metadata and its bytes, lent until
-/// `release()`. Complete it once (`complete(accepted:)`) and release it once: directly, or
-/// by the `Data` from `adoptData()` when it is freed. Times are host-monotonic nanoseconds,
-/// nil when unknown.
+/// `release()`. Complete it once (`complete(accepted:)`) and release it once, in either
+/// order: release directly, or by the `Data` from `adoptData()` when it is freed. Times are
+/// host-monotonic nanoseconds, nil when unknown.
 public struct NativeVideoPacket: @unchecked Sendable {
     public let key: UInt64
     public let streamId: UInt32
@@ -156,11 +157,11 @@ public struct NativeVideoPacket: @unchecked Sendable {
     /// The send's result (`SinkReceipt.complete`); only the first call counts.
     public func complete(accepted: Bool) { streamcore_video_packet_complete(key, accepted) }
 
-    /// Ends the loan of the bytes; a packet released uncompleted counts as refused.
+    /// Ends the loan of the bytes (it does not complete the send).
     public func release() { streamcore_video_packet_release(key) }
 
     /// The bytes as `Data` without a copy; freeing the `Data` releases the packet, so do
-    /// not also call `release()`. Never mutate it: the bytes are Rust's.
+    /// not also call `release()`. The bytes are the `Data`'s until then.
     public func adoptData() -> Data {
         let key = self.key
         guard let base = bytes.baseAddress, bytes.count > 0 else { release(); return Data() }
