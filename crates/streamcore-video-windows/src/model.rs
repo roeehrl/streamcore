@@ -114,6 +114,8 @@ pub struct TimerReport {
     pub requested: bool,
     pub period_1ms: bool,
     pub throttling_opt_out: bool,
+    /// The throttling state was unreadable, so the opt-out was skipped.
+    pub throttling_unreadable: bool,
 }
 
 /// One bench run (`bench --mode synthetic|desktop`).

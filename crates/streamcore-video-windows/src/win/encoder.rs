@@ -12,8 +12,9 @@
 //!
 //! Failures. A failed event, a failed `ProcessOutput`, a `GetEvent` that keeps failing or a lost
 //! device ends the session: the event thread drops every frame still in the encoder (the oldest
-//! with `DeviceLost` or `EncoderFailed { recoverable: false }`, so the stream reacts once), later
-//! submits fail with the same error, and the thread exits. A `ProcessInput` that fails otherwise
+//! with `DeviceLost`, or `EncoderFailed { recoverable: true }` so a transient driver error rebuilds
+//! the encoder; the stream reacts once), later submits fail with the same error (refused under the
+//! book's lock, so no submit can slip in between), and the thread exits. A `ProcessInput` that fails otherwise
 //! loses its frame but not its `NeedInput` credit.
 //!
 //! Teardown. Dropping the encoder hands `END_STREAMING`, `IMFShutdown` and `ShutdownObject` to an
@@ -340,7 +341,12 @@ impl Inner {
                 false
             }
             Err(e) if mf::is_device_lost(e.code()) => {
-                self.fail(mf::Failure::new(e.code(), format!("ProcessInput: {e}")));
+                // Take this frame out first, so it is reported even if the session already failed.
+                let meta = lock(&self.book).input_failed(time, false);
+                self.fail_with(
+                    mf::Failure::new(e.code(), format!("ProcessInput: {e}")),
+                    meta,
+                );
                 false
             }
             Err(e) => {
@@ -470,25 +476,29 @@ impl Inner {
         }
     }
 
-    /// A fatal MFT error. Later submits fail with it; every frame in the encoder is dropped, the
-    /// oldest with the error (`DeviceLost` rebuilds the encoder, `EncoderFailed { recoverable:
-    /// false }` fails the stream) and the rest as no-output; with nothing in flight,
+    /// A session-ending MFT error. Later submits fail with it; every frame in the encoder is
+    /// dropped, the oldest with the error (`DeviceLost` or `EncoderFailed { recoverable: true }`:
+    /// either rebuilds the encoder) and the rest as no-output; with nothing in flight,
     /// `input_ready` makes the stream submit again and meet the error.
     fn fail(&self, failure: mf::Failure) {
+        self.fail_with(failure, None);
+    }
+
+    /// `fail`, with `first` (a frame already taken out of the book) reported first.
+    fn fail_with(&self, failure: mf::Failure, first: Option<Meta>) {
         self.record_error(failure.message);
         let error = if failure.device_lost {
             MediaError::DeviceLost
         } else {
-            MediaError::EncoderFailed { recoverable: false }
+            MediaError::EncoderFailed { recoverable: true }
         };
-        {
-            let mut slot = lock(&self.failure);
-            if slot.is_some() {
-                return;
-            }
-            *slot = Some(error.clone());
+        // The error is stored before the book refuses submits, so a refused submit can read it.
+        lock(&self.failure).get_or_insert_with(|| error.clone());
+        let taken = lock(&self.book).fail();
+        if taken.is_none() && first.is_none() {
+            return;
         }
-        let metas = lock(&self.book).take_all();
+        let metas: Vec<Meta> = first.into_iter().chain(taken.unwrap_or_default()).collect();
         lock(&self.accepted).clear();
         let reported = !metas.is_empty();
         let mut reason = Some(DropReason::Error { error });
@@ -572,7 +582,12 @@ impl Drop for MfEncoder {
                 }
             });
         match spawned {
-            Ok(handle) => lock(&self.closers).push(handle),
+            Ok(handle) => {
+                // A long-lived host creates many encoders: keep only the closers still running.
+                let mut closers = lock(&self.closers);
+                closers.retain(|h| !h.is_finished());
+                closers.push(handle);
+            }
             Err(_) => {
                 // No thread to be had: shutting down here is the only way not to leak the session.
                 let close = lock(&job).take();
@@ -653,6 +668,13 @@ impl StreamEncoder for MfEncoder {
             Accept::Held => {
                 lock(&inner.stats).held += 1;
                 SubmitResult::Submitted
+            }
+            Accept::Failed(_) => {
+                drop(refused);
+                let error = lock(&inner.failure)
+                    .clone()
+                    .unwrap_or(MediaError::EncoderFailed { recoverable: true });
+                SubmitResult::Failed { error }
             }
             Accept::Busy(_) => {
                 drop(refused);

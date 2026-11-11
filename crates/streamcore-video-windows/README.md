@@ -52,7 +52,8 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   bit changes, so EcoQoS or anything else the host set stays), so it also holds for a tray or
   service host with no visible window. The last release ends the period and puts the timer bits
   back as the first hold found them; nothing is held while idle, and `TimerPeriod::status`
-  reports nothing applied then. A host that embeds the
+  reports nothing applied then. If the current state cannot be read, the opt-out is skipped
+  (`throttling_unreadable`) rather than overwrite the host's policy. A host that embeds the
   backend doesn't need to do anything; a host with its own encoder path should do the same.
   It costs power while streaming, which these measurements justify (720p, an Intel integrated
   GPU, a remote-desktop session at 32 Hz, 11 Nov 2026):

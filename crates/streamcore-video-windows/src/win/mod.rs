@@ -125,5 +125,6 @@ pub(crate) fn timer_report(requested: bool) -> crate::model::TimerReport {
         requested,
         period_1ms: requested && status.period_1ms,
         throttling_opt_out: requested && status.throttling_opt_out,
+        throttling_unreadable: requested && status.throttling_unreadable,
     }
 }

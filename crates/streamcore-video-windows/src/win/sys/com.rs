@@ -272,6 +272,7 @@ static TIMER_HOLDERS: std::sync::Mutex<Holders> = std::sync::Mutex::new(Holders 
     applied: TimerPeriodStatus {
         period_1ms: false,
         throttling_opt_out: false,
+        throttling_unreadable: false,
     },
     saved: None,
 });
@@ -331,6 +332,9 @@ pub struct TimerPeriod(());
 pub struct TimerPeriodStatus {
     pub period_1ms: bool,
     pub throttling_opt_out: bool,
+    /// The process's power-throttling state could not be read, so the opt-out was skipped
+    /// rather than risk overwriting a policy the host set.
+    pub throttling_unreadable: bool,
 }
 
 const TIMER_BIT: u32 = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
@@ -339,16 +343,19 @@ impl TimerPeriod {
     pub fn acquire() -> Self {
         let mut holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
         if holders.count == 0 {
-            // Unreadable (an OS without the query): treat it as the default, system-managed state.
-            let saved = throttling_state().unwrap_or((0, 0));
-            let throttling_opt_out = set_throttling_state(throttling_with(saved, TIMER_BIT, None));
+            // Unreadable (an OS without the query): skip the opt-out rather than overwrite a
+            // policy the host may have set; the period itself still applies.
+            let saved = throttling_state();
+            let throttling_opt_out =
+                saved.is_some_and(|s| set_throttling_state(throttling_with(s, TIMER_BIT, None)));
             // SAFETY: no pointers; paired with timeEndPeriod on the last release.
             let period_1ms = unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0;
             holders.applied = TimerPeriodStatus {
                 period_1ms,
                 throttling_opt_out,
+                throttling_unreadable: saved.is_none(),
             };
-            holders.saved = throttling_opt_out.then_some(saved);
+            holders.saved = saved.filter(|_| throttling_opt_out);
         }
         holders.count += 1;
         Self(())

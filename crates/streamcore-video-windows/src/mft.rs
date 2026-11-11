@@ -17,6 +17,8 @@ pub enum Accept<S> {
     Now(S),
     /// No credit: held until the next `NeedInput`.
     Held,
+    /// The session failed (`fail`): refused, the input and metadata come back.
+    Failed(S),
     /// No credit and an input is already held: refuse (`SubmitResult::Busy`).
     Busy(S),
 }
@@ -31,6 +33,8 @@ pub struct MftBook<S, M> {
     outputs: u64,
     inputs_before_first_output: Option<u64>,
     max_in_encoder: usize,
+    /// Set by `fail`: every later `submit` is refused, under the same lock that takes the frames.
+    failed: bool,
 }
 
 impl<S, M> Default for MftBook<S, M> {
@@ -43,6 +47,7 @@ impl<S, M> Default for MftBook<S, M> {
             outputs: 0,
             inputs_before_first_output: None,
             max_in_encoder: 0,
+            failed: false,
         }
     }
 }
@@ -50,6 +55,9 @@ impl<S, M> Default for MftBook<S, M> {
 impl<S, M> MftBook<S, M> {
     /// A new input with sample time `time` (100 ns units, strictly increasing).
     pub fn submit(&mut self, time: i64, input: S, meta: M) -> (Accept<S>, Option<M>) {
+        if self.failed {
+            return (Accept::Failed(input), Some(meta));
+        }
         if self.held.is_some() {
             return (Accept::Busy(input), Some(meta));
         }
@@ -102,6 +110,20 @@ impl<S, M> MftBook<S, M> {
             self.inputs_before_first_output = Some(self.inputs);
         }
         (meta, skipped)
+    }
+
+    /// The session failed: refuses every later `submit` and returns every frame still held or in
+    /// the encoder, oldest first. `None` if it had already failed (the frames went then).
+    pub fn fail(&mut self) -> Option<Vec<M>> {
+        if self.failed {
+            return None;
+        }
+        self.failed = true;
+        Some(self.take_all())
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.failed
     }
 
     /// Flush, drain end or shutdown: every frame still held or in the encoder, oldest first.
@@ -230,5 +252,27 @@ mod tests {
         assert_eq!(permit_target(Some(0)), 1);
         assert_eq!(permit_target(Some(2)), 2);
         assert_eq!(permit_target(Some(9)), 3);
+    }
+
+    #[test]
+    fn fail_refuses_later_submits_and_takes_frames_once() {
+        let mut b: MftBook<&str, u32> = MftBook::default();
+        b.need_input();
+        assert_eq!(b.submit(10, "s1", 1), (Accept::Now("s1"), None));
+        assert_eq!(b.submit(20, "s2", 2), (Accept::Held, None));
+        assert_eq!(b.fail(), Some(vec![1, 2]));
+        assert!(b.is_failed());
+        assert_eq!(b.fail(), None);
+        assert_eq!(b.submit(30, "s3", 3), (Accept::Failed("s3"), Some(3)));
+        assert_eq!(b.need_input(), None);
+    }
+
+    #[test]
+    fn input_failed_before_fail_keeps_the_frame_out_of_take_all() {
+        let mut b: MftBook<&str, u32> = MftBook::default();
+        b.need_input();
+        assert_eq!(b.submit(10, "s1", 1), (Accept::Now("s1"), None));
+        assert_eq!(b.input_failed(10, false), Some(1));
+        assert_eq!(b.fail(), Some(vec![]));
     }
 }
