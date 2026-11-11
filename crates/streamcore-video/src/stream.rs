@@ -60,6 +60,9 @@ enum TimerKind {
 struct EncoderSlot {
     generation: u64,
     encoder: Arc<dyn StreamEncoder>,
+    /// The encoder's C submit (`streamcore_video_attach_encoder`), called
+    /// instead of `submit` while `encoder` is held.
+    native_submit: Option<crate::native::NativeSubmit>,
     info: EncoderInfo,
     /// The mapped output tags and source format this session was created for.
     color: ColorTags,
@@ -558,10 +561,13 @@ impl StreamState {
         let Some(queue) = cx.queue() else {
             return;
         };
-        let events: Arc<dyn CaptureEvents> = Arc::new(CapturePort {
+        let port = Arc::new(CapturePort {
             executor: self.executor.clone(),
             backend: Arc::downgrade(&capture),
+            shape: std::sync::Mutex::new(None),
         });
+        cx.set_capture_port(&port);
+        let events: Arc<dyn CaptureEvents> = port;
         debug_assert!(is_current(cx.id));
         let mut spec = self.spec.clone();
         spec.adapter_luid = self.plan.adapter_luid;
@@ -835,6 +841,13 @@ impl StreamState {
         self.request_stop(cx);
     }
 
+    /// A drain panicked: report `stream.output` and close, as for a failure the
+    /// consumer cannot recover from.
+    pub(crate) fn fail_after_panic(&mut self, cx: &Arc<Shared>) {
+        self.fail(cx, codes::OUTPUT);
+        self.on_close(cx);
+    }
+
     fn on_close(&mut self, cx: &Arc<Shared>) {
         if self.closing {
             return;
@@ -928,7 +941,7 @@ impl StreamState {
         loop {
             self.encoder_generation += 1;
             let generation = self.encoder_generation;
-            let sink = Arc::new(VideoSinkHandle::new());
+            let sink = VideoSinkHandle::new(self.executor.clone(), generation);
             let spec = EncoderSpec {
                 codec,
                 width: self.plan.encode_width,
@@ -979,6 +992,7 @@ impl StreamState {
                     self.stats.encoders_created += 1;
                     self.encoder = Some(EncoderSlot {
                         generation,
+                        native_submit: sink.native_submit(),
                         encoder,
                         info,
                         color,
@@ -1184,6 +1198,8 @@ impl StreamState {
             return;
         };
         let encoder = slot.encoder.clone();
+        let native_submit = slot.native_submit;
+        let sink = slot.sink.clone();
         let generation = slot.generation;
         let force_keyframe = self.force_keyframe || slot.first_submit;
         let mut surface_lease = Some(latest.lease.clone());
@@ -1251,7 +1267,25 @@ impl StreamState {
             force_keyframe,
         };
         debug_assert!(is_current(cx.id));
-        match encoder.submit(surface, opts, permit.clone()) {
+        let result = match native_submit {
+            // The sink keeps the encoder's permit until the frame is posted;
+            // held before the call, since the output may be posted inside it.
+            Some(native) => {
+                sink.hold(seq, permit.clone());
+                let result =
+                    match native.call(surface, seq, pts_ns, opts.capture_ns, force_keyframe) {
+                        crate::native::Submitted::Ok => SubmitResult::Submitted,
+                        crate::native::Submitted::Busy => SubmitResult::Busy,
+                        crate::native::Submitted::Failed(error) => SubmitResult::Failed { error },
+                    };
+                if result != SubmitResult::Submitted {
+                    sink.unhold(seq);
+                }
+                result
+            }
+            None => encoder.submit(surface, opts, permit.clone()),
+        };
+        match result {
             SubmitResult::Submitted => {
                 self.submitted_seq = seq;
                 self.last_pts_ns = pts_ns;
@@ -1330,10 +1364,9 @@ impl StreamState {
         };
         let sink = slot.sink.clone();
         let payload = sink.take(frame.payload_token);
-        let config = frame
-            .config_token
-            .and_then(|token| sink.take(token))
-            .or_else(|| self.last_config.clone());
+        // This frame's own configuration; without one it is sent with the last one
+        // (not cloned per frame).
+        let new_config = frame.config_token.and_then(|token| sink.take(token));
         let needs_config = slot.needs_config;
         let Some(payload) = payload else {
             // The bytes never arrived: a loss.
@@ -1345,8 +1378,12 @@ impl StreamState {
             self.submit_due(cx);
             return;
         };
-        let config_changed = needs_config || config != self.last_config;
-        if config.is_none() || (config_changed && !frame.keyframe) {
+        let config_changed = needs_config
+            || new_config
+                .as_ref()
+                .is_some_and(|config| self.last_config.as_ref() != Some(config));
+        let no_config = new_config.is_none() && self.last_config.is_none();
+        if no_config || (config_changed && !frame.keyframe) {
             // Nothing to configure a decoder with, or a delta that would open a
             // generation: this session's IDR was lost or overtaken. Count the
             // frame as lost and re-send the retained image as an IDR now.
@@ -1389,7 +1426,9 @@ impl StreamState {
         if let Some(slot) = &mut self.encoder {
             slot.needs_config = false;
         }
-        self.last_config = config.clone();
+        if let Some(config) = new_config {
+            self.last_config = Some(config);
+        }
         self.stats.encoded += 1;
         let Some(out) = self.backends.as_ref().map(|b| b.out.clone()) else {
             return;
@@ -1403,20 +1442,20 @@ impl StreamState {
             }
             let is_config = header.flags == 2;
             let bytes = if is_config {
-                config.clone()
+                self.last_config.clone()
             } else {
                 payload.take()
             };
             let Some(bytes) = bytes else {
                 continue;
             };
-            let receipt = Arc::new(SinkReceipt::new(
+            let receipt = SinkReceipt::new(
                 self.executor.clone(),
                 generation,
                 header.sequence,
                 frame.keyframe,
                 is_config,
-            ));
+            );
             let meta = VideoOutMeta {
                 header,
                 droppable: !is_config && !frame.keyframe,
@@ -1425,7 +1464,11 @@ impl StreamState {
                 timing,
             };
             debug_assert!(is_current(cx.id));
-            out.send(meta, bytes, receipt);
+            // `out` (the C send's context) is held for the call.
+            match cx.native().send {
+                Some(send) => crate::native::send(send, cx.id, &meta, bytes, receipt),
+                None => out.send(meta, bytes, Arc::new(receipt)),
+            }
             self.stats.packets_sent += 1;
         }
         // The sink accepted the frame: release admission, then admit the frame

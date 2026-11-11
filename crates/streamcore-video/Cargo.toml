@@ -31,5 +31,13 @@ name = "streamcore-video-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 required-features = ["bindgen"]
 
-[lints]
-workspace = true
+# The per-frame C ABI (src/native.rs) must read caller memory, so this crate does
+# not inherit the workspace's `unsafe_code = "forbid"`: unsafe stays denied and is
+# allowed only on `streamcore_video_encoded`, each block with a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+undocumented_unsafe_blocks = "deny"

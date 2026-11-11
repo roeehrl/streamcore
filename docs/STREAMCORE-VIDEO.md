@@ -188,8 +188,9 @@ pipeline](CAPTURE-PIPELINE.md) and [sessions](SESSIONS.md). The port moves their
 
 New crates (every dependency AGPL-3.0 compatible):
 
-- `crates/streamcore-video`: safe Rust (`unsafe_code = "forbid"`, `Cargo.toml:37`): the executor,
-  policy, traits and UniFFI exports, on `streamcore-media` and `streamcore-transport`. It names no
+- `crates/streamcore-video`: safe Rust (`unsafe_code = "deny"`): the executor, policy, traits and
+  UniFFI exports, on `streamcore-media` and `streamcore-transport`. The one exception is the
+  per-frame C ABI's `streamcore_video_encoded`, which reads the caller's bytes (3.5 "Overhead"). It names no
   product type: product differences are behavioural fields of `StreamConfig` (3.3).
 - `crates/streamcore-usb`: host-side USB pipe providers (adb, usbmux, AOA over `nusb` on Linux) and
   the AOA link layer shared with the macOS and Android adapters (8.4).
@@ -416,9 +417,9 @@ outbound call. No authority lock wraps a call into Rust.
 **P1 send hop (`VideoOut`).** P1 keeps the consumer's existing send path. Right after `Encoded`,
 the executor calls the foreign trait `VideoOut::send(meta, bytes, receipt)` with no lock held; the
 adapter takes its sink lock (which its `revoke()` also takes), checks the token and calls the
-consumer's send. Every completion, a synchronous refusal included, is posted back as a
-`SinkReceipt`. A send path holding its own lock across its enqueue into `streamcore-transport` is an
-allowed leaf. From P2, `VideoSink` replaces `VideoOut` (D2).
+consumer's send. Every completion, a synchronous refusal included, goes to the `SinkReceipt`;
+refusals and accepted keyframes are posted back (an accepted delta changes nothing). A send path
+holding its own lock across its enqueue into `streamcore-transport` is an allowed leaf. From P2, `VideoSink` replaces `VideoOut` (D2).
 
 **Reentrancy rule.**
 
@@ -469,7 +470,8 @@ deadlines; the packetizer runs only on the executor, in event order.
 
 - **macOS host:** a per-stream serial `DispatchQueue` (`.userInteractive`), the `sampleHandlerQueue`
   of every `SCStream` of the stream, canvas members included; `wake` is `queue.async`. The VT output
-  handler calls `submit_encoded` and posts `Encoded`. Window fit, the settled-size poll,
+  handler hands each output over (`submit_encoded` and `Encoded` as one C call that copies the
+  bytes once, from the sample's block buffer). Window fit, the settled-size poll,
   Accessibility, Metal completions and pool releases post.
 - **Windows host:** one Rust thread per stream (MMCSS "Capture") waiting on the mailbox and a
   high-resolution timer and pumping a `DispatcherQueue` (4.2). **Linux host:** the PipeWire
@@ -479,7 +481,15 @@ deadlines; the packetizer runs only on the executor, in event order.
 
 **Overhead.** Per frame on Apple: `frame`, `submit`, `submit_encoded`, `encoded`, plus `convert`
 when scaling. Gate: added overhead p99 ≤ 50 µs per frame at 120 fps (P1), else a C-ABI fast path;
-the H4 → H5 gap includes the hop and is gated (9.6).
+the H4 → H5 gap includes the hop and is gated (9.6). Through UniFFI the gate failed: every call
+clones a handle, every record, enum, option and byte string is serialized into a buffer that the
+other side parses and frees with further calls, and foreign callbacks look their object up in a
+locked map; between frames the caches are cold, so one frame's calls cost a Swift backend about
+90 µs at p50 and over 200 µs at p99 in the reference VM. A foreign backend therefore makes the
+per-frame calls (frame, submit, surface release, encoder output, wake, drain, send and its
+completion) through a small C ABI with primitives only and keeps UniFFI for control
+(`include/streamcore_video_native.h`, [threading](VIDEO-THREADING.md#the-per-frame-fast-path)).
+Rust backends call the traits directly and are unaffected.
 
 **Tests (P1 gate):** the reference host's single-queue pipeline tests on mock traits, plus
 seeded-shuffle, reentrancy, close (a stuck `invalidate` returns within its bound), a stop or

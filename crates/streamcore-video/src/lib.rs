@@ -4,7 +4,8 @@
 //! admission, latest-frame retention, recovery and the send hop. Native code runs
 //! the data plane on GPU surfaces behind the [backend traits](traits). Pixels
 //! never cross into Rust: it holds opaque surface leases and metadata, and
-//! encoded bytes enter it once, through [`VideoSinkHandle::submit_encoded`].
+//! encoded bytes enter it once, through [`VideoSinkHandle::submit_encoded`] or
+//! the per-frame C ABI ([`native`]).
 //!
 //! Each stream has exactly one serial executor ([`StreamController`] over a
 //! [`SerialQueue`]); the threading and reentrancy rules are in [`threading`].
@@ -14,6 +15,7 @@ pub mod bounded;
 pub mod controller;
 pub mod error;
 pub(crate) mod executor;
+pub mod native;
 #[cfg(feature = "ffi-probe")]
 pub mod probe;
 pub(crate) mod stream;

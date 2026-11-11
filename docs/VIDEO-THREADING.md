@@ -31,12 +31,13 @@ implemented in P1 and says how each rule is enforced and tested.
 
 ## Inbound calls only post
 
-`CaptureEvents::*`, `EncoderEvents::*`, `SinkReceipt::complete`, permit releases and every
-`StreamController` method except `close_and_wait` enqueue an event and return in O(1). They touch
+`CaptureEvents::*`, `EncoderEvents::*`, `SinkReceipt::complete`, their C ABI forms (the
+per-frame fast path below), permit releases and every `StreamController` method except
+`close_and_wait` enqueue an event and return in O(1). They touch
 no stream state and call no native code except `SerialQueue::wake`, which `post` calls after it
 has dropped the mailbox lock.
 
-**Inline drain, frames only.** When `CaptureEvents::frame` arrives while no drain is active and
+**Inline drain, frames only.** When `CaptureEvents::frame` (or its C form) arrives while no drain is active and
 nothing is queued ahead of it, only admission, convert and submit for that frame run inline, so a
 capture callback reaches `submit` with no hop. Everything else that frame causes (an encoder
 re-create, a failure, an observer post) is posted for the next wake, so nothing calls back into
@@ -85,9 +86,11 @@ released before any native call, and none waits on an executor:
 
 - `post` (the mailbox lock, then `SerialQueue::wake` with the lock dropped);
 - `VideoWorkPermit::release` and its Drop (atomics; then the release hook posts
-  `PermitReleased`);
+  `PermitReleased`, or, on the owning executor's own drain, flags it for that drain);
 - `VideoWorkQueue::close` (an atomic);
-- `VideoSinkHandle::submit_encoded` (the handle's lock);
+- `VideoSinkHandle::submit_encoded` (the handle's lock) and the C ABI's
+  `streamcore_video_encoded` (the sink registry's lock, then the handle's, then `post`), and the C
+  ABI's packet completion and release (the packet registry's lock, then `post`);
 - every backend's `release(surface)`: thread-safe, non-blocking; Rust calls it when a lease drops,
   on the executor while it exists, else on the thread that drops it;
 - `VideoOut::revoke` and `VideoOut::backpressured`;
@@ -101,7 +104,9 @@ released before any native call, and none waits on an executor:
 bit: at most 3 permits per stream, counted across encoder replacement, and a close racing an
 acquire never admits after it returns. Every release posts `PermitReleased` to the owning
 executor, which then submits the retained frame if one is waiting: on a still screen nothing else
-would retry it.
+would retry it. A release on the executor's own drain (the executor finishing a sent frame) is
+handled by that drain before it ends instead of being posted, which would cost a wake and a second
+drain per frame; one inside an inline frame drain is still posted.
 
 The executor acquires a permit before `submit` and keeps a reference in its in-flight table. It
 releases it explicitly after `VideoOut::send` returns for that frame's packets, or when the frame
@@ -128,7 +133,8 @@ that session's permits are released (see above).
    method reached from an outbound call. `Encoder::invalidate` waits on an encoder, not an executor;
    it is the one exempt wait.
 4. **Encoder and decoder output threads touch no stream state.** They may copy bytes, do pure
-   conversions (Annex-B to AVCC, avcC/hvcC), call `VideoSinkHandle::submit_encoded` and post.
+   conversions (Annex-B to AVCC, avcC/hvcC), call `VideoSinkHandle::submit_encoded` (or the C
+   ABI's `streamcore_video_encoded`) and post.
 5. **Permits** are acquired on the executor before `submit` and released when the sink accepted the
    frame, or by Drop wherever native code drops them; every release posts `PermitReleased`.
 6. **Debug builds assert** that every outbound call runs inside a drain of its own executor (a
@@ -204,8 +210,10 @@ takes), checks the token and calls the consumer's send, so **once `revoke()` ret
 that authority is enqueued.** `StreamController::revoke` and `begin_close` set the stream's own
 revoked flag and call `VideoOut::revoke`; the executor checks the flag before every submit, send,
 start, update and encoder creation. Cleanup calls (stop, invalidate, release) still run. Every send
-completion, a synchronous refusal included, comes back as a posted receipt; a receipt dropped
-uncompleted counts as refused. From P2, `VideoSink` replaces `VideoOut`.
+completion, a synchronous refusal included, comes back through the receipt; a receipt dropped
+uncompleted counts as refused. Only completions the executor acts on are posted: a refusal (a loss)
+and an accepted keyframe (the end of a recovery); an accepted delta or configuration changes
+nothing and posts nothing. From P2, `VideoSink` replaces `VideoOut`.
 
 ## Close
 
@@ -236,8 +244,52 @@ executor, so an observer may call anything, including `close_and_wait`.
 `crates/streamcore-video/tests/`: `single_queue.rs` ports the reference host's single-queue
 pipeline tests onto mock traits; `executor_rules.rs` covers the inline drain, the deferred
 re-create, the bounded invalidate, close, late callbacks and reentrancy; `lifecycle.rs` the
-operation state machine; `stress.rs` seeded shuffles and many-thread runs. `StreamCoreVideo/`
-runs the Swift binding smoke test.
+operation state machine; `stress.rs` seeded shuffles and many-thread runs; `native.rs` the
+per-frame C ABI (layouts, a stream whose backends make every per-frame call through it mixed with
+UniFFI calls, admission, busy and failed submits, refused bytes, dead keys, compact frames, one
+wake per delivered frame). `StreamCoreVideo/` runs the Swift binding smoke test through the
+UniFFI calls and through the C ABI.
+
+## The per-frame fast path
+
+Through UniFFI every call clones a handle, every record, enum, `Option` and byte string is
+serialized into a buffer that the other side parses and frees with further calls, and a foreign
+callback looks its object up in a locked map. Between frames at 120 fps the caches are cold, and a
+frame's calls then cost a Swift backend tens of microseconds (design 3.5 "Overhead"). A foreign
+backend therefore makes the per-frame calls through a small C ABI with primitives only
+(`crates/streamcore-video/include/streamcore_video_native.h`, `src/native.rs`) and keeps UniFFI for
+everything else. Rust backends call the traits directly.
+
+| Per frame | C ABI | UniFFI form |
+| --- | --- | --- |
+| capture callback | `streamcore_video_frame(port, capture, surface, capture_ns, source_present_ns)`: the shape (kind, format, size, colour, rotation) repeats the last `Complete` `frame` of that capture, which a backend sends whenever the shape changes; not taken (false) before one, as after a restart | `CaptureEvents::frame` |
+| submit | the attached `submit(encoder, surface, submit_seq, pts_ns, capture_ns, force_keyframe)`, returning submitted, busy or failed with an error code; the stream keeps the frame's permit until its output or drop is posted (by either ABI) | `StreamEncoder::submit` |
+| surface release | the attached `release(capture, surface)` | `CaptureBackend::release` |
+| encoder output | `streamcore_video_encoded(sink, &output)`: payload and configuration copied once, straight from the encoder's buffer, plus metadata; posts `dropped` itself when the bytes are refused | `submit_encoded` + `EncoderEvents::encoded` |
+| wake, drain | the attached `wake(queue)`; `streamcore_video_run(port)` | `SerialQueue::wake`, `StreamPort::run` |
+| send | the attached `send(out, &packet)`: metadata and the bytes' address and length, lent until `streamcore_video_packet_release(key)`, so the bytes are not copied out | `VideoOut::send` |
+| send completion | `streamcore_video_packet_complete(key, accepted)`, before or after the release (a consumer may copy the bytes at once and complete later); the receipt is kept until completed or the stream closes; a released packet not completed within 5 s, or beyond 64 waiting per stream, counts as refused | `SinkReceipt::complete` |
+
+Native code names Rust objects by key (`StreamPort::native_key`, `VideoSinkHandle::native_key`, the
+packet's `key`), never by pointer, and a key whose object is gone names nothing. The attached
+functions get their context back unretained: it must be the backend object the stream was given
+through UniFFI (the queue, capture backend and `VideoOut` of `StreamParts`, attached with
+`streamcore_video_attach_stream` before `start`; the encoder, attached with
+`streamcore_video_attach_encoder` in `EncoderFactory::create`), which the stream holds for as long
+as it may call it: the queue and `VideoOut` until `Closed` (the wake holds a clone of the queue for
+the call), the encoder while its session is current, the capture backend while a lease's weak
+reference to it upgrades. A NULL function keeps the UniFFI call. Every rule above applies to the C
+forms unchanged. A panic inside a C call does not unwind into native code: it is caught, the
+stream fails with `stream.output`, and the call returns its "not taken" value. A panic inside a
+drain (UniFFI or C, a backend callback or Rust) fails and closes the stream (`stream.output`, the
+capture is stopped and the close completes); if that panics too, the stream is abandoned: posts
+are refused, native references dropped and the close completes with `StopUnknown`. A permit released
+after a drain's last check is posted when the drain ends. `streamcore_video_encoded` is the crate's only `unsafe` code: it reads the
+caller's output struct and byte ranges for the duration of the call; the other exports need
+`allow(unsafe_code)` only for `no_mangle`. Swift helpers are in
+`StreamCoreVideo/Sources/StreamCoreVideo/NativeFastPath.swift`; a product that builds the bindings
+into its own C module copies that file with its module import renamed and adds the header to its
+module map.
 
 ## Binding names
 

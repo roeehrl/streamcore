@@ -37,11 +37,15 @@ for TARGET in "${APPLE_TARGETS[@]}"; do
 done
 STAGE="$(mktemp -d "$CORE_ROOT/target/streamcore-video-apple.XXXXXX")"
 mkdir -p "$STAGE/macos" "$STAGE/simulator" "$STAGE/headers"
-cp "$BINDINGS/streamcore_videoFFI.h" "$BINDINGS/streamcore_mediaFFI.h" "$STAGE/headers/"
-# One module map declaring both C modules the generated Swift files import.
+cp "$BINDINGS/streamcore_videoFFI.h" "$BINDINGS/streamcore_mediaFFI.h" \
+    crates/streamcore-video/include/streamcore_video_native.h "$STAGE/headers/"
+# One module map declaring both C modules the generated Swift files import; the video
+# module also declares the per-frame C ABI (streamcore_video_native.h).
 cat "$BINDINGS/streamcore_mediaFFI.modulemap" > "$STAGE/headers/module.modulemap"
 printf '\n' >> "$STAGE/headers/module.modulemap"
-cat "$BINDINGS/streamcore_videoFFI.modulemap" >> "$STAGE/headers/module.modulemap"
+sed 's|^\( *\)header "streamcore_videoFFI.h"|&\
+\1header "streamcore_video_native.h"|' "$BINDINGS/streamcore_videoFFI.modulemap" >> "$STAGE/headers/module.modulemap"
+grep -q 'header "streamcore_video_native.h"' "$STAGE/headers/module.modulemap"
 lipo -create "target/aarch64-apple-darwin/release/libstreamcore_video.a" \
     "target/x86_64-apple-darwin/release/libstreamcore_video.a" -output "$STAGE/macos/libstreamcore_video.a"
 lipo -create "target/aarch64-apple-ios-sim/release/libstreamcore_video.a" \
