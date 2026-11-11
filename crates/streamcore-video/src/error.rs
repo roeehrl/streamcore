@@ -2,7 +2,8 @@
 
 /// A backend or validation failure. Reactions (3.7): `Unsupported` at plan time
 /// picks the next encoder or codec; `DeviceLost` rebuilds the encoder with a new
-/// generation and IDR (more than 3 in 10 s fails the stream); a recoverable
+/// generation and IDR (the rebuild budget: more than 3 failure-driven rebuilds
+/// in 10 s fail the stream, see [`crate::threading`]); a recoverable
 /// encoder failure runs recovery; `OutOfResources` drops the frame and retries
 /// when a permit or surface is released, never on a fixed timer; `Timeout` enters
 /// an `*Unknown` phase with the capture retained.

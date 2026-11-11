@@ -85,13 +85,27 @@ A session can also die with nothing in flight (a lost device, a fatal driver err
 can carry the error, and on a still screen no submit would meet it. The encoder then calls
 `EncoderEvents::session_failed(error, recoverable)`, a post-only leaf call that carries the
 encoder's generation like the other encoder events (a replaced session's call is stale). The
-executor reacts as to a failed submit: `DeviceLost` rebuilds the encoder with a new generation and
-IDR exactly as a frame's `DeviceLost` drop does, whatever `recoverable` says (a GPU reset is often
-survived by re-creating the device; more than 3 rebuilds in 10 s fail the stream). Another
-recoverable error records a loss, posts `ObserverJob::EncoderFailed` and rebuilds under the same
-limit; `recoverable: false` or `EncoderFailed { recoverable: false }` fails the stream. An
-encoder reports a failure once: as the drop reason of the frames it held, or, with none, through
-`session_failed`. It is not part of the per-frame C ABI.
+executor keys on the error type, as it does for a dropped frame:
+
+- `DeviceLost` always rebuilds the encoder, whatever `recoverable` says, exactly as a frame dropped
+  with `DeviceLost` does: a GPU reset or TDR is often survived by re-creating the device. The
+  encoder reports `DeviceLost`; the rebuild budget decides.
+- Another error with `recoverable` (and not `EncoderFailed { recoverable: false }`) posts
+  `ObserverJob::EncoderFailed` and rebuilds the encoder.
+- Anything else (`recoverable: false`) fails the stream.
+
+No loss is recorded for a session that had nothing in flight: no frame was lost, and the rebuild's
+IDR restarts the stream. Frames the session still held are counted lost (their drops would arrive
+stale after the rebuild). An encoder reports a failure once: as the drop reason of the frames it
+held, or, with none, through `session_failed`. It is not part of the per-frame C ABI.
+
+**The rebuild budget.** Every rebuild caused by an encoder failure counts against one budget: a
+frame dropped with `DeviceLost`, and every `session_failed` that does not fail the stream. A
+rebuild is a new session with a new generation and IDR; more than 3 of them within 10 s fail the
+stream with `stream.encoder`. Rebuilds the executor starts itself (a colour or format change, the
+HEVC to H.264 fallback, a resize) do not count. A frame dropped with
+`EncoderFailed { recoverable: true }` is not a rebuild: the session stays, and the frame's loss
+runs recovery (a forced keyframe).
 
 ## Leaf calls
 

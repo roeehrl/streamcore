@@ -142,6 +142,12 @@ fn a_recoverable_session_failure_on_a_still_screen_rebuilds_the_encoder() {
     );
     assert!(s.observer.failures().is_empty());
 
+    // No frame was lost: no recovery re-encodes the last image; the new
+    // session waits for the next capture.
+    s.advance_ms(2_000);
+    assert_eq!(s.controller.stats().recoveries, 0);
+    assert!(lock(&s.encoder().submits).is_empty());
+
     // The next capture opens the new session with an IDR.
     s.frame(2_000);
     let second = s.encoder();
@@ -235,12 +241,16 @@ fn a_session_failure_with_frames_in_flight_drops_them_with_the_rebuild() {
     first.fail_session(MediaError::EncoderFailed { recoverable: true }, true);
     s.pump();
     assert_eq!(s.factory.count(), 2);
-    // The dead session's frame never comes out; the adapter drops it late.
+    // The dead session's frame never comes out; the adapter drops it late,
+    // stale. It was counted lost with the rebuild: recovery re-encodes the
+    // retained image on the new session, with no new capture.
     first.drop_output(1, DropReason::NoOutput);
     s.pump();
-    s.frame(2_000);
+    s.advance_ms(600);
     let second = s.encoder();
+    assert_eq!(s.controller.stats().recoveries, 1);
     assert_eq!(second.pending_seqs().len(), 1);
+    assert!(lock(&second.submits)[0].force_keyframe);
     second.complete_all();
     s.pump();
     assert!(s.observer.failures().is_empty());
@@ -261,6 +271,7 @@ fn a_frameless_device_loss_rebuilds_like_a_frames_until_it_happens_too_often() {
         let encoder = s.encoder();
         encoder.fail_session(MediaError::DeviceLost, false);
         s.pump();
+        // `recoverable: false` does not fail the stream for DeviceLost.
         assert_eq!(s.factory.count(), 2 + n, "rebuilt, no capture needed");
         assert!(encoder.invalidated.load(Ordering::SeqCst) >= 1);
         assert!(s.observer.failures().is_empty());
@@ -325,6 +336,43 @@ fn device_losses_older_than_ten_seconds_do_not_count() {
     s.pump();
     assert_eq!(s.factory.count(), 5);
     assert!(s.observer.failures().is_empty());
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn only_failure_driven_rebuilds_count_against_the_budget() {
+    let s = Manual::new();
+    s.start_running();
+    for _ in 0..3 {
+        s.encoder()
+            .fail_session(MediaError::EncoderFailed { recoverable: true }, true);
+        s.pump();
+    }
+    assert_eq!(s.factory.count(), 4);
+    // A rebuild the executor starts itself (a colour change) does not count.
+    s.capture.emit(p3(), 1_000);
+    s.pump();
+    assert_eq!(s.factory.count(), 5);
+    // A frame dropped with a recoverable error keeps its session: no rebuild,
+    // nothing counted, the loss runs recovery.
+    let encoder = s.encoder();
+    let seq = encoder.pending_seqs()[0];
+    encoder.drop_output(
+        seq,
+        DropReason::Error {
+            error: MediaError::EncoderFailed { recoverable: true },
+        },
+    );
+    s.pump();
+    assert_eq!(s.factory.count(), 5);
+    assert!(s.observer.failures().is_empty());
+    // The 4th failure-driven rebuild within 10 s fails the stream.
+    s.encoder().fail_session(MediaError::DeviceLost, false);
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::ENCODER.to_string()]);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
     s.close();
     s.assert_clean();
 }

@@ -132,7 +132,7 @@ pub(crate) struct StreamState {
     recreate_scheduled: bool,
     /// Busy or out of resources: wait for an output, a drop or a new frame.
     stalled: bool,
-    device_losses: VecDeque<u64>,
+    failure_rebuilds: VecDeque<u64>,
 
     latest: Option<Retained>,
     /// (H1 of the latest frame, executor clock then): maps the executor clock to
@@ -165,8 +165,8 @@ pub(crate) struct StreamState {
     stats: StatsSnapshot,
 }
 
-const DEVICE_LOSS_WINDOW_NS: u64 = 10_000_000_000;
-const MAX_DEVICE_LOSSES: usize = 3;
+const FAILURE_REBUILD_WINDOW_NS: u64 = 10_000_000_000;
+const MAX_FAILURE_REBUILDS: usize = 3;
 const MAX_STOP_WAITERS: usize = 16;
 
 /// Rust is the single validator (2.5.8): nothing reaches native allocation
@@ -267,7 +267,7 @@ impl StreamState {
             announced_codec: None,
             recreate_scheduled: false,
             stalled: false,
-            device_losses: VecDeque::new(),
+            failure_rebuilds: VecDeque::new(),
             latest: None,
             time_anchor: None,
             last_pts_ns: 0,
@@ -1109,19 +1109,23 @@ impl StreamState {
         }
     }
 
-    /// A new session with a new generation and IDR on the next wake; more than
-    /// 3 rebuilds in 10 s fail the stream.
+    /// A rebuild caused by an encoder failure (a `DeviceLost` drop or any
+    /// `session_failed` that does not fail the stream): a new session with a
+    /// new generation and IDR on the next wake. All of them share one budget:
+    /// more than 3 in 10 s fail the stream. Rebuilds the executor starts itself
+    /// (colour change, codec fallback, resize) call `schedule_recreate`
+    /// directly and do not count.
     fn rebuild_encoder(&mut self, cx: &Arc<Shared>) {
         let now = cx.clock.now_ns();
-        self.device_losses.push_back(now);
+        self.failure_rebuilds.push_back(now);
         while self
-            .device_losses
+            .failure_rebuilds
             .front()
-            .is_some_and(|t| now.saturating_sub(*t) > DEVICE_LOSS_WINDOW_NS)
+            .is_some_and(|t| now.saturating_sub(*t) > FAILURE_REBUILD_WINDOW_NS)
         {
-            self.device_losses.pop_front();
+            self.failure_rebuilds.pop_front();
         }
-        if self.device_losses.len() > MAX_DEVICE_LOSSES {
+        if self.failure_rebuilds.len() > MAX_FAILURE_REBUILDS {
             self.fail(cx, codes::ENCODER);
         } else {
             self.schedule_recreate(cx);
@@ -1140,10 +1144,12 @@ impl StreamState {
             self.stats.stale_events += 1;
             return;
         }
+        // Keyed on the error type, as for a dropped frame: `DeviceLost` always
+        // rebuilds (a GPU reset is often survived by re-creating the device),
+        // whatever `recoverable` says; the rebuild budget decides.
         if error == MediaError::DeviceLost {
-            // As a frame's `DeviceLost`: a GPU reset is often survived by a new
-            // device, so the encoder decides nothing here; the rebuild limit does.
             self.stalled = false;
+            self.lose_in_flight(cx, generation);
             self.rebuild_encoder(cx);
             return;
         }
@@ -1155,9 +1161,24 @@ impl StreamState {
         }
         self.stalled = false;
         self.notify(cx, ObserverJob::EncoderFailed { error });
-        // Whatever the dead session still held may never arrive.
-        self.record_loss(cx, self.submitted_seq);
+        self.lose_in_flight(cx, generation);
         self.rebuild_encoder(cx);
+    }
+
+    /// Frames the dead session still holds will never be output, and their
+    /// drops will arrive stale once the rebuild has replaced the session: count
+    /// them lost now. With nothing in flight no frame was lost, and the
+    /// rebuild's IDR restarts the stream, so no loss is recorded.
+    fn lose_in_flight(&mut self, cx: &Shared, generation: u64) {
+        let newest = self
+            .in_flight
+            .keys()
+            .filter(|(g, _)| *g == generation)
+            .map(|(_, seq)| *seq)
+            .max();
+        if let Some(seq) = newest {
+            self.record_loss(cx, seq);
+        }
     }
 
     // -----------------------------------------------------------------------

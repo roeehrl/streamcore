@@ -170,15 +170,18 @@ pub trait EncoderEvents: Send + Sync {
     /// can carry the error: on a still screen the stream would otherwise learn
     /// of it only at the next capture. A leaf call like the others: it posts
     /// and returns, and carries this port's encoder generation (a call from a
-    /// replaced session is stale and ignored). The executor reacts as to a
-    /// failed submit: `DeviceLost` (whatever `recoverable` says) rebuilds the
-    /// encoder with a new generation and IDR exactly as a frame's `DeviceLost`
-    /// drop does, more than 3 rebuilds in 10 s failing the stream; another
-    /// error with `recoverable` (and not `EncoderFailed { recoverable: false }`)
-    /// records a loss, reports `ObserverJob::EncoderFailed` and rebuilds under
-    /// the same limit; anything else fails the stream with `error`'s wire code. Frames still in the session are dropped as usual, by the adapter
-    /// or by the rebuild's `invalidate`; report the error once, either here or
-    /// as a frame's drop reason.
+    /// replaced session is stale and ignored). The executor keys on the error
+    /// type, as for a dropped frame. `DeviceLost` always rebuilds the encoder,
+    /// whatever `recoverable` says, exactly as a frame dropped with `DeviceLost`
+    /// does. Another error with `recoverable` (and not
+    /// `EncoderFailed { recoverable: false }`) reports
+    /// `ObserverJob::EncoderFailed` and rebuilds. Anything else fails the stream
+    /// with `error`'s wire code. Every such rebuild counts against the stream's
+    /// rebuild budget (more than 3 in 10 s fail the stream; see
+    /// [`crate::threading`]). With nothing in flight no loss is recorded (the
+    /// rebuild's IDR restarts the stream); frames the session still held are
+    /// counted lost. Report the error once, either here or as a frame's drop
+    /// reason.
     fn session_failed(&self, error: MediaError, recoverable: bool);
 }
 
