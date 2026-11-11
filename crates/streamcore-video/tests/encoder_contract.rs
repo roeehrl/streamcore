@@ -154,10 +154,10 @@ fn a_recoverable_session_failure_on_a_still_screen_rebuilds_the_encoder() {
 }
 
 #[test]
-fn a_device_lost_or_unrecoverable_session_failure_fails_the_stream() {
+fn an_unrecoverable_session_failure_fails_the_stream() {
     for (error, recoverable) in [
-        (MediaError::DeviceLost, false),
         (MediaError::EncoderFailed { recoverable: false }, false),
+        (MediaError::Internal, false),
         // The error's own flag wins over the call's.
         (MediaError::EncoderFailed { recoverable: false }, true),
     ] {
@@ -243,6 +243,87 @@ fn a_session_failure_with_frames_in_flight_drops_them_with_the_rebuild() {
     assert_eq!(second.pending_seqs().len(), 1);
     second.complete_all();
     s.pump();
+    assert!(s.observer.failures().is_empty());
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_frameless_device_loss_rebuilds_like_a_frames_until_it_happens_too_often() {
+    // Reported as adapters do (`recoverable: false`): the executor applies the
+    // DeviceLost rule, as for a frame dropped with `DeviceLost`.
+    let s = Manual::new();
+    s.start_running();
+    s.frame(1_000);
+    s.encoder().complete_all();
+    s.pump();
+    for n in 0..3 {
+        let encoder = s.encoder();
+        encoder.fail_session(MediaError::DeviceLost, false);
+        s.pump();
+        assert_eq!(s.factory.count(), 2 + n, "rebuilt, no capture needed");
+        assert!(encoder.invalidated.load(Ordering::SeqCst) >= 1);
+        assert!(s.observer.failures().is_empty());
+        s.advance_ms(1_000);
+    }
+    // The new session opens with an IDR.
+    s.frame(5_000);
+    let encoder = s.encoder();
+    assert!(lock(&encoder.submits)[0].force_keyframe);
+    encoder.complete_all();
+    s.pump();
+    // A 4th within 10 s fails the stream.
+    encoder.fail_session(MediaError::DeviceLost, false);
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::ENCODER.to_string()]);
+    assert_eq!(s.factory.count(), 4);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_frameless_device_loss_and_a_frames_share_the_rebuild_limit() {
+    let s = Manual::new();
+    s.start_running();
+    for _ in 0..2 {
+        s.encoder().fail_session(MediaError::DeviceLost, false);
+        s.pump();
+    }
+    s.frame(1_000);
+    let encoder = s.encoder();
+    let seq = encoder.pending_seqs()[0];
+    encoder.drop_output(
+        seq,
+        DropReason::Error {
+            error: MediaError::DeviceLost,
+        },
+    );
+    s.pump();
+    assert_eq!(s.factory.count(), 4);
+    assert!(s.observer.failures().is_empty());
+    s.encoder().fail_session(MediaError::DeviceLost, true);
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::ENCODER.to_string()]);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn device_losses_older_than_ten_seconds_do_not_count() {
+    let s = Manual::new();
+    s.start_running();
+    for _ in 0..3 {
+        s.encoder().fail_session(MediaError::DeviceLost, false);
+        s.pump();
+    }
+    s.advance_ms(10_001);
+    s.encoder().fail_session(MediaError::DeviceLost, false);
+    s.pump();
+    assert_eq!(s.factory.count(), 5);
     assert!(s.observer.failures().is_empty());
     s.close();
     s.assert_clean();

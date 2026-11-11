@@ -171,12 +171,12 @@ pub trait EncoderEvents: Send + Sync {
     /// of it only at the next capture. A leaf call like the others: it posts
     /// and returns, and carries this port's encoder generation (a call from a
     /// replaced session is stale and ignored). The executor reacts as to a
-    /// failed submit: when `recoverable` (and `error` is not
-    /// `EncoderFailed { recoverable: false }`), it records a loss, reports
-    /// `ObserverJob::EncoderFailed` and rebuilds the encoder with a new
-    /// generation and IDR, more than 3 rebuilds in 10 s failing the stream (the
-    /// `DeviceLost` rule); otherwise it fails the stream with `error`'s wire
-    /// code. Frames still in the session are dropped as usual, by the adapter
+    /// failed submit: `DeviceLost` (whatever `recoverable` says) rebuilds the
+    /// encoder with a new generation and IDR exactly as a frame's `DeviceLost`
+    /// drop does, more than 3 rebuilds in 10 s failing the stream; another
+    /// error with `recoverable` (and not `EncoderFailed { recoverable: false }`)
+    /// records a loss, reports `ObserverJob::EncoderFailed` and rebuilds under
+    /// the same limit; anything else fails the stream with `error`'s wire code. Frames still in the session are dropped as usual, by the adapter
     /// or by the rebuild's `invalidate`; report the error once, either here or
     /// as a frame's drop reason.
     fn session_failed(&self, error: MediaError, recoverable: bool);

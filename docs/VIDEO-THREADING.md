@@ -85,10 +85,11 @@ A session can also die with nothing in flight (a lost device, a fatal driver err
 can carry the error, and on a still screen no submit would meet it. The encoder then calls
 `EncoderEvents::session_failed(error, recoverable)`, a post-only leaf call that carries the
 encoder's generation like the other encoder events (a replaced session's call is stale). The
-executor reacts as to a failed submit: a recoverable error records a loss, posts
-`ObserverJob::EncoderFailed` and rebuilds the encoder with a new generation and IDR (more than 3
-rebuilds in 10 s fail the stream, the `DeviceLost` rule); `recoverable: false` (a lost device, as
-the shipped adapters report it) or `EncoderFailed { recoverable: false }` fails the stream. An
+executor reacts as to a failed submit: `DeviceLost` rebuilds the encoder with a new generation and
+IDR exactly as a frame's `DeviceLost` drop does, whatever `recoverable` says (a GPU reset is often
+survived by re-creating the device; more than 3 rebuilds in 10 s fail the stream). Another
+recoverable error records a loss, posts `ObserverJob::EncoderFailed` and rebuilds under the same
+limit; `recoverable: false` or `EncoderFailed { recoverable: false }` fails the stream. An
 encoder reports a failure once: as the drop reason of the frames it held, or, with none, through
 `session_failed`. It is not part of the per-frame C ABI.
 

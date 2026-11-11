@@ -1140,6 +1140,13 @@ impl StreamState {
             self.stats.stale_events += 1;
             return;
         }
+        if error == MediaError::DeviceLost {
+            // As a frame's `DeviceLost`: a GPU reset is often survived by a new
+            // device, so the encoder decides nothing here; the rebuild limit does.
+            self.stalled = false;
+            self.rebuild_encoder(cx);
+            return;
+        }
         let recoverable =
             recoverable && error != (MediaError::EncoderFailed { recoverable: false });
         if !recoverable {
