@@ -15,11 +15,18 @@ implemented in P1 and says how each rule is enforced and tested.
   writes it. Other threads see only the snapshot it publishes (`phase()`, `stats()`).
 - A drain takes the events queued when it starts and handles them in order. Anything posted while
   it runs, including jobs the executor schedules for itself, waits for the next wake.
-- The executor never blocks: no sleeps, no `.await`, no synchronous waits. The one allowed wait is
-  `Encoder::invalidate`, bounded by `StreamTimings::invalidate_bound_ns` (500 ms). An adapter whose
-  platform call has no timeout runs it off the executor and waits with one (`run_bounded`). A call
-  that overruns the bound is counted (`invalidate_timeouts`, reported as `EncoderFailed`); its later
-  outputs carry the old generation and are discarded after their permits are released.
+- The executor never blocks: no sleeps, no `.await`, no synchronous waits, with two bounded
+  exceptions:
+  - `Encoder::invalidate`, bounded by `StreamTimings::invalidate_bound_ns` (500 ms). An adapter
+    whose platform call has no timeout runs it off the executor and waits with one (`run_bounded`).
+    When the call overruns the bound, the executor posts `ObserverJob::EncoderFailed`, counts it
+    (`invalidate_timeouts`) and releases the hung session's permits, so a hung flush cannot stall
+    admission; a re-create continues with the new session. The hung session's later outputs carry
+    the old generation and are discarded.
+  - `EncoderFactory::create` (MFT activation or an NVENC open can take over a second). The executor
+    runs it on a helper thread and waits at most `StreamTimings::create_bound_ns` (3 s). On overrun
+    the start or re-create fails with `stream.encoder` (`create_timeouts`), and the late session is
+    invalidated and dropped on the helper thread.
 - The executor never runs on a `streamcore-network` worker.
 
 ## Inbound calls only post
@@ -36,19 +43,30 @@ re-create, a failure, an observer post) is posted for the next wake, so nothing 
 the capture backend from its own callback. A newer frame for the same capture and member replaces
 an undelivered one in the mailbox (its lease is released).
 
+**Inline drains run on the caller's thread.** Backends deliver capture callbacks on the stream's
+queue, and only then does an inline drain stay on that queue. Nothing checks this. A backend that
+delivers frames on other threads (a free-threaded WGC frame pool) is still correct, because the
+drain flag keeps drains exclusive, but its convert and submit then run on those threads: its device
+must be multithread-protected, and thread-affine objects (a `DispatcherQueueTimer`) cannot be made
+there.
+
 **Stale events.** Every event carries its identity: encoder generation, capture id, op token or
 timer token. A stale event is discarded after its permit and lease are released.
 
 ## Outbound calls run only on the executor, during a drain
 
-`CaptureBackend` open, start, update and stop; `Converter::convert`; `EncoderFactory::create`;
+`CaptureBackend` open, start, update and stop; `Converter::convert`; `EncoderFactory::create`
+(issued by the executor, run on its bounded helper thread);
 `Encoder` submit, `set_rate` and `invalidate`; `VideoOut::send` and `VideoOut::backpressured`;
 `ObserverQueue::post`; `SerialQueue::wake_after`. Results of synchronous calls are values
 (`SubmitResult`, `Result`), never callbacks. Asynchronous results (`op_done`, `encoded`,
 `dropped`, receipts) are always posted, even when known at once.
 
 `convert` and `submit` have exactly one caller, the executor's internal submit job, scheduled by a
-frame, a permit release, an output, a drop or a recovery timer, never by a public call.
+frame, a permit release, an output, a drop, `EncoderEvents::input_ready` or a recovery timer,
+never by a public call. After a `Busy` submit the frame stays retained; the encoder calls
+`input_ready` once it can take input (MF `METransformNeedInput`), so a still screen still gets its
+frame encoded.
 
 ## Leaf calls
 
@@ -80,7 +98,8 @@ releases it explicitly after `VideoOut::send` returns for that frame's packets, 
 is dropped or stale. A native encoder keeps its own reference until it has posted the frame's
 `encoded` or `dropped`, then drops it; on `Busy` or `Failed` it drops it before returning. When a
 session is torn down, the executor drops (but does not release) its references, so a permit that
-native code still holds keeps counting.
+native code still holds keeps counting. The exception is an `invalidate` that overran its bound:
+that session's permits are released (see above).
 
 ## Reentrancy rule
 
@@ -106,6 +125,41 @@ native code still holds keeps counting.
    per-executor thread-local marker set by every drain, inline ones included), and that a blocking
    entry point (`close_and_wait`) runs on no executor and no `streamcore-network` worker (identified
    by thread name). In release builds `close_and_wait` returns `MediaError::Internal` there instead.
+
+## Dropping native objects
+
+The executor drops encoders at teardown, and every backend, lease and receipt at `Closed`, during
+a drain. **Dropping a backend object must not block**: the final release of an MFT, a DXGI device
+manager or a device after a reset can wait, so hand it to a helper thread. Surface releases are leaf
+calls (above).
+
+## Outputs, fences and layout
+
+- Encoder outputs are length-prefixed: `BitstreamForm::Avcc4` samples and avcC/hvcC config. An
+  encoder that emits Annex-B converts on its output thread (`bitstream::annexb_to_length_prefixed`,
+  a pure function, allowed by rule 4); an Annex-B output fails the stream with `stream.encode`.
+- `SurfaceInfo.fence` is informational when one native backend owns capture, convert and encode
+  on one device: ordering is implicit on that device, and the backend keeps fences in its own slot
+  table. Rust never forwards a fence to `submit`.
+- `CaptureEvents::layout_changed` (a display mode, DPI, rotation or window size change) posts
+  `ObserverJob::LayoutChanged { epoch, layout }`; the consumer re-plans, for example with a size
+  update. The executor does not resize by itself.
+
+## Clocks
+
+Every `*_ns` value in a record is host-monotonic nanoseconds on one clock per host, converted
+natively:
+
+- **Windows:** QueryPerformanceCounter ticks × 10⁹ / QueryPerformanceFrequency. WGC's
+  `SystemRelativeTime` is already in 100 ns units of that clock: multiply by 100.
+- **macOS:** `mach_absolute_time` × timebase (the clock of `SCStreamFrameInfo.displayTime` and the
+  host `CMClock`). It stops during sleep; `mach_continuous_time` does not, and would not match
+  ScreenCaptureKit's or VideoToolbox's timestamps.
+- **Linux:** `CLOCK_MONOTONIC`.
+
+The executor's own `Clock` (`MonotonicClock`, measured from the stream's creation) drives timers
+only. Timestamps the executor writes (a recovery frame's submission time) are derived from the last
+frame's host time plus elapsed executor time, so they stay on the host clock.
 
 ## Authority and the P1 send hop
 

@@ -144,11 +144,11 @@ private func waitUntil(_ condition: () -> Bool) async throws {
     let queue = Queue(port: port)
     let capture = Capture(), out = Out(), observer = Observer()
     let spec = CaptureSpec(target: .display(displayId: 1), mode: .control, pixelWidth: 64, pixelHeight: 64,
-                           minIntervalNs: 16_666_667, format: .nv12, color: .source, cursor: .composited, queueDepth: 5)
+                           minIntervalNs: 16_666_667, format: .nv12, color: .source, cursor: .composited, queueDepth: 5, adapterLuid: nil)
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
                           bitrateBps: 2_000_000, convert: .identity, encoderInput: .nv12, encoder: "swift",
                           colorOut: srgb, colorMapping: ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil)
+                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil)
     let controller = try StreamController(parts: StreamParts(
         streamId: 1, spec: spec, plan: plan, port: port, queue: queue, capture: capture, converter: nil,
         encoders: Encoders(), out: out, observer: observer, timings: nil))
@@ -174,11 +174,11 @@ private func waitUntil(_ condition: () -> Bool) async throws {
 @Test(.timeLimit(.minutes(1))) func invalidSettingsThrowBeforeAnythingNativeRuns() throws {
     let port = StreamPort()
     let spec = CaptureSpec(target: .display(displayId: 1), mode: .control, pixelWidth: 1, pixelHeight: 64,
-                           minIntervalNs: 0, format: .nv12, color: .source, cursor: .composited, queueDepth: 5)
+                           minIntervalNs: 0, format: .nv12, color: .source, cursor: .composited, queueDepth: 5, adapterLuid: nil)
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
                           bitrateBps: 2_000_000, convert: .identity, encoderInput: .nv12, encoder: "swift",
                           colorOut: srgb, colorMapping: ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil)
+                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil)
     #expect(throws: MediaError.self) {
         _ = try StreamController(parts: StreamParts(
             streamId: 1, spec: spec, plan: plan, port: port, queue: Queue(port: port), capture: Capture(),
