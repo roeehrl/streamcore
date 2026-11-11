@@ -159,6 +159,13 @@ pub(crate) enum Event {
         capture: CaptureId,
         reason: SourceGone,
     },
+    Layout {
+        capture: CaptureId,
+        layout: DisplayLayout,
+    },
+    InputReady {
+        encoder: u64,
+    },
     Encoded {
         encoder: u64,
         frame: EncodedFrame,
@@ -563,6 +570,15 @@ impl CaptureEvents for CapturePort {
             });
         }
     }
+
+    fn layout_changed(&self, id: CaptureId, layout: DisplayLayout) {
+        if let Some(executor) = self.executor.upgrade() {
+            executor.post(Event::Layout {
+                capture: id,
+                layout,
+            });
+        }
+    }
 }
 
 /// One encoder's event port: outputs carry its generation.
@@ -594,6 +610,14 @@ impl EncoderEvents for EncoderPort {
                 encoder: self.encoder,
                 submit_seq,
                 reason,
+            });
+        }
+    }
+
+    fn input_ready(&self) {
+        if let Some(executor) = self.executor.upgrade() {
+            executor.post(Event::InputReady {
+                encoder: self.encoder,
             });
         }
     }

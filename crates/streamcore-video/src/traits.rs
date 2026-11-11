@@ -29,7 +29,9 @@ pub trait CaptureBackend: Send + Sync {
     fn caps(&self) -> CaptureCaps;
     fn enumerate(&self) -> Result<SourceCatalog, MediaError>;
     fn observe_layout(&self, display: u32) -> Option<DisplayLayout>;
-    /// Callbacks are delivered on `queue`.
+    /// Callbacks are delivered on `queue`: `frame` may drain the executor
+    /// inline on the calling thread, so a backend that delivers frames on
+    /// another thread (a free-threaded pool) runs convert and submit there.
     fn open(
         &self,
         spec: CaptureSpec,
@@ -58,6 +60,9 @@ pub trait CaptureEvents: Send + Sync {
     /// `error` is `None` on success.
     fn op_done(&self, op: OpToken, error: Option<MediaError>);
     fn source_gone(&self, id: CaptureId, reason: SourceGone);
+    /// The source's size, scale or origin changed (display mode, DPI, rotation,
+    /// window resize). Posts `ObserverJob::LayoutChanged`; the consumer re-plans.
+    fn layout_changed(&self, id: CaptureId, layout: DisplayLayout);
 }
 
 /// Records GPU work and returns at once.
@@ -82,7 +87,10 @@ pub trait Compositor: Send + Sync {
 pub trait EncoderFactory: Send + Sync {
     fn probe(&self, adapter: Option<u64>) -> Vec<EncoderCaps>;
     /// `events` is this encoder's port: outputs of an encoder the stream has
-    /// replaced are discarded as stale.
+    /// replaced are discarded as stale. May block (MFT activation, an NVENC
+    /// open): the executor runs it on a helper thread and waits at most
+    /// `StreamTimings::create_bound_ns`; a session that arrives later is
+    /// invalidated and dropped on that thread.
     fn create(
         &self,
         spec: EncoderSpec,
@@ -100,7 +108,10 @@ pub trait StreamEncoder: Send + Sync {
     fn info(&self) -> EncoderInfo;
     /// Never blocks and never replaces the session. Keep `permit` until this
     /// frame's `encoded` or `dropped` has been posted, then drop it; on `Busy` or
-    /// `Failed` drop it before returning.
+    /// `Failed` drop it before returning. After `Busy`, call
+    /// `EncoderEvents::input_ready` once the encoder can take input again (MF's
+    /// `METransformNeedInput`): the retained frame is then submitted even if no
+    /// new capture arrives.
     fn submit(
         &self,
         frame: SurfaceId,
@@ -111,17 +122,24 @@ pub trait StreamEncoder: Send + Sync {
     /// The one allowed wait (3.5): completes or discards pending output and
     /// returns within the stream's invalidate bound (500 ms). An adapter whose
     /// platform call has no timeout runs it off the executor and waits with one
-    /// ([`crate::run_bounded`]).
+    /// ([`crate::run_bounded`]). If it overruns, the executor stops counting this
+    /// session's frames against admission and reports `EncoderFailed`.
     fn invalidate(&self);
 }
 
-/// Implemented by Rust; post-only; callable from any thread.
+/// Implemented by Rust; post-only; callable from any thread. Outputs must be
+/// length-prefixed (`BitstreamForm::Avcc4`, avcC/hvcC config): an adapter whose
+/// encoder emits Annex-B converts on its output thread
+/// ([`crate::bitstream::annexb_to_length_prefixed`]); the executor fails the
+/// stream on an Annex-B output.
 #[uniffi::export]
 pub trait EncoderEvents: Send + Sync {
     /// Metadata and payload tokens; the bytes went to the spec's sink first.
     fn encoded(&self, frame: EncodedFrame);
     /// No output for `submit_seq`, including no-output completions.
     fn dropped(&self, submit_seq: u64, reason: DropReason);
+    /// The encoder can take input again after a `Busy` submit.
+    fn input_ready(&self);
 }
 
 /// P1's send hop (3.5): the consumer's existing send path. From P2, `VideoSink`

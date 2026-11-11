@@ -105,9 +105,19 @@ pub struct ColorMapping {
 }
 
 impl ColorMapping {
-    /// Maps source tags to the tags the encoder and converter output. v1 has no
-    /// HDR: BT.2020 primaries and PQ/HLG/linear transfers map to BT.709.
-    pub fn map(&self, source: ColorTags) -> ColorTags {
+    /// Maps a source's tags to the tags the converter and encoder output, for an
+    /// encoder fed `output` from a `source`-format surface. v1 has no HDR:
+    /// BT.2020 primaries and PQ/HLG/linear transfers map to BT.709.
+    ///
+    /// The matrix and range describe the encoder's YUV, never the source's RGB:
+    /// for a YUV output, an RGB source (BGRA, FP16) or an untagged or identity
+    /// matrix gives BT.709, and an RGB source is encoded at limited range.
+    pub fn map(
+        &self,
+        source: ColorTags,
+        source_format: PixelFormat,
+        output: PixelFormat,
+    ) -> ColorTags {
         let primaries = match source.primaries {
             ColorPrimaries::DisplayP3 if self.allow_p3 => ColorPrimaries::DisplayP3,
             ColorPrimaries::Unspecified => ColorPrimaries::Unspecified,
@@ -118,16 +128,33 @@ impl ColorMapping {
             TransferFunction::Unspecified => TransferFunction::Unspecified,
             _ => TransferFunction::Bt709,
         };
+        if !output.is_yuv() {
+            return ColorTags {
+                primaries,
+                transfer,
+                matrix: YCbCrMatrix::Identity,
+                full_range: true,
+            };
+        }
+        let rgb_source = !source_format.is_yuv();
         let matrix = match source.matrix {
-            YCbCrMatrix::Bt2020 => YCbCrMatrix::Bt709,
-            other => other,
+            YCbCrMatrix::Bt601 if !rgb_source => YCbCrMatrix::Bt601,
+            // BT.2020 primaries map to BT.709 in v1, so does their matrix.
+            _ => YCbCrMatrix::Bt709,
         };
         ColorTags {
             primaries,
             transfer,
             matrix,
-            full_range: source.full_range,
+            full_range: source.full_range && !rgb_source,
         }
+    }
+}
+
+impl PixelFormat {
+    /// NV12 and P010 are YUV; BGRA and FP16 are RGB.
+    pub fn is_yuv(self) -> bool {
+        matches!(self, Self::Nv12 | Self::P010)
     }
 }
 
@@ -241,6 +268,9 @@ pub struct CaptureSpec {
     pub color: ColorRequest,
     pub cursor: CursorMode,
     pub queue_depth: u8,
+    /// The GPU adapter to capture on, from [`StreamPlan::adapter_luid`]; the
+    /// executor sets it when it opens the capture.
+    pub adapter_luid: Option<u64>,
 }
 
 /// A live capture change: frame interval, region origin, cursor. Absent fields
@@ -543,6 +573,10 @@ pub struct StreamPlan {
     pub recovery: Vec<RecoveryStep>,
     pub on_source_gone: OnSourceGone,
     pub medium_cap_bps: Option<u64>,
+    /// The adapter capture, convert and encode run on, where the platform has
+    /// several (Windows: the DXGI LUID packed as `(HighPart << 32) | LowPart`).
+    /// Passed to `CaptureSpec` and `EncoderSpec`. `None`: the platform default.
+    pub adapter_luid: Option<u64>,
 }
 
 /// A command's result, posted to the observer queue.
@@ -594,6 +628,8 @@ pub struct StatsSnapshot {
     pub recoveries: u64,
     pub encoders_created: u64,
     pub invalidate_timeouts: u64,
+    /// `EncoderFactory::create` calls that overran their bound.
+    pub create_timeouts: u64,
     pub stale_events: u64,
     pub wire_generation: u64,
 }
@@ -617,8 +653,16 @@ pub enum ObserverJob {
     SourceGone {
         reason: SourceGone,
     },
+    /// The source's layout (size, scale, origin) changed; `epoch` counts layout
+    /// changes. The consumer re-plans, e.g. with a size update.
     LayoutChanged {
         epoch: u64,
+        layout: DisplayLayout,
+    },
+    /// An encoder session failed and was replaced (or abandoned): an
+    /// `invalidate` that overran its bound. The stream continues.
+    EncoderFailed {
+        error: MediaError,
     },
     Stats {
         snapshot: StatsSnapshot,
@@ -652,6 +696,10 @@ pub struct StreamTimings {
     pub recovery_interval_ns: u64,
     /// `Encoder::invalidate`'s bound (3.5, Q9: 500 ms).
     pub invalidate_bound_ns: u64,
+    /// `EncoderFactory::create`'s bound: the executor waits at most this long
+    /// for a session (MFT activation or an NVENC open can take over a second
+    /// the first time), else the stream reports `stream.encoder`.
+    pub create_bound_ns: u64,
 }
 
 impl Default for StreamTimings {
@@ -662,6 +710,7 @@ impl Default for StreamTimings {
             recovery_delay_ns: 500_000_000,
             recovery_interval_ns: 500_000_000,
             invalidate_bound_ns: 500_000_000,
+            create_bound_ns: 3_000_000_000,
         }
     }
 }

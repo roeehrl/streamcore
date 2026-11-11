@@ -9,6 +9,7 @@
 //! Each stream has exactly one serial executor ([`StreamController`] over a
 //! [`SerialQueue`]); the threading and reentrancy rules are in [`threading`].
 
+pub mod bitstream;
 pub mod bounded;
 pub mod controller;
 pub mod error;
@@ -22,7 +23,7 @@ pub mod types;
 #[doc = include_str!("../../../docs/VIDEO-THREADING.md")]
 pub mod threading {}
 
-pub use bounded::run_bounded;
+pub use bounded::{run_bounded, run_bounded_value};
 pub use controller::{StreamController, StreamParts};
 pub use error::{MediaError, codes};
 pub use executor::{

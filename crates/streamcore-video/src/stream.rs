@@ -9,13 +9,14 @@
 //! delivered; a client request fences the latest submission and recovers at
 //! once.
 
+use crate::bounded::run_bounded_value;
 use crate::error::{MediaError, codes};
 use crate::executor::*;
 use crate::traits::*;
 use crate::types::*;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use streamcore_media::stream::{VideoPacketizer, VideoWorkPermit, valid_video_settings};
 
 pub(crate) enum Command {
@@ -146,6 +147,7 @@ pub(crate) struct StreamState {
     next_timer: TimerToken,
     armed: Option<(u64, TimerToken)>,
 
+    layout_epoch: u64,
     closing: bool,
     closed: Option<CloseOutcome>,
     pub(crate) keepalive: Option<Arc<Shared>>,
@@ -255,6 +257,7 @@ impl StreamState {
             timers: BTreeMap::new(),
             next_timer: 0,
             armed: None,
+            layout_epoch: 0,
             closing: false,
             closed: None,
             keepalive: None,
@@ -288,6 +291,26 @@ impl StreamState {
             } => self.on_frame(cx, capture, member, lease, info, status),
             Event::OpDone { op, error } => self.on_op_done(cx, op, error),
             Event::SourceGone { capture, reason } => self.on_source_gone(cx, capture, reason),
+            Event::Layout { capture, layout } => {
+                if self.capture == Some(capture) && !self.closing {
+                    self.layout_epoch += 1;
+                    self.notify(
+                        cx,
+                        ObserverJob::LayoutChanged {
+                            epoch: self.layout_epoch,
+                            layout,
+                        },
+                    );
+                } else {
+                    self.stats.stale_events += 1;
+                }
+            }
+            Event::InputReady { encoder } => {
+                if self.is_current_encoder(encoder) {
+                    self.stalled = false;
+                    self.submit_due(cx);
+                }
+            }
             Event::Encoded { encoder, frame } => self.on_encoded(cx, encoder, frame),
             Event::Dropped {
                 encoder,
@@ -497,7 +520,9 @@ impl StreamState {
             backend: Arc::downgrade(&capture),
         });
         debug_assert!(is_current(cx.id));
-        match capture.open(self.spec.clone(), queue, events) {
+        let mut spec = self.spec.clone();
+        spec.adapter_luid = self.plan.adapter_luid;
+        match capture.open(spec, queue, events) {
             Ok(id) => {
                 self.capture = Some(id);
                 self.phase = StreamPhase::Starting;
@@ -506,7 +531,7 @@ impl StreamState {
                 capture.start(id, token);
             }
             Err(error) => {
-                self.teardown_encoder();
+                self.teardown_encoder(cx);
                 self.finish_command(cx, Self::rejected(error.wire_code(codes::CAPTURE)));
             }
         }
@@ -608,7 +633,7 @@ impl StreamState {
         };
         self.latest = None;
         self.clear_recovery();
-        self.teardown_encoder();
+        self.teardown_encoder(cx);
         let Some(backends) = &self.backends else {
             return;
         };
@@ -757,7 +782,7 @@ impl StreamState {
         self.finish_command(cx, Self::rejected(code));
         self.latest = None;
         self.clear_recovery();
-        self.teardown_encoder();
+        self.teardown_encoder(cx);
         self.request_stop(cx);
     }
 
@@ -770,7 +795,7 @@ impl StreamState {
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
         self.latest = None;
         self.clear_recovery();
-        self.teardown_encoder();
+        self.teardown_encoder(cx);
         match self.phase {
             StreamPhase::Idle if self.capture.is_none() => {
                 self.finish_close(cx, CloseOutcome::Closed);
@@ -796,7 +821,7 @@ impl StreamState {
         self.resolve_stops(cx, OpOutcome::OutcomeUnknown);
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
         self.notify(cx, ObserverJob::Closed { outcome });
-        self.teardown_encoder();
+        self.teardown_encoder(cx);
         self.latest = None;
         self.in_flight.clear();
         self.timers.clear();
@@ -863,7 +888,7 @@ impl StreamState {
                 bitrate_bps: self.plan.bitrate_bps,
                 input_format,
                 color,
-                adapter: None,
+                adapter: self.plan.adapter_luid,
                 sink: sink.clone(),
             };
             let events: Arc<dyn EncoderEvents> = Arc::new(EncoderPort {
@@ -872,7 +897,24 @@ impl StreamState {
                 sink: sink.clone(),
             });
             debug_assert!(is_current(cx.id));
-            match factory.create(spec, events) {
+            // `create` may block (3.5): it runs on a helper thread and the
+            // executor waits at most the create bound. A late session is
+            // invalidated on that thread.
+            let creating = factory.clone();
+            let created = run_bounded_value(
+                Duration::from_nanos(self.timings.create_bound_ns),
+                move || creating.create(spec, events),
+                |late| {
+                    if let Ok(encoder) = late {
+                        encoder.invalidate();
+                    }
+                },
+            );
+            let Some(created) = created else {
+                self.stats.create_timeouts += 1;
+                return Err(MediaError::EncoderFailed { recoverable: false });
+            };
+            match created {
                 Ok(encoder) => {
                     let info = encoder.info();
                     // The announced codec is the one created; a replacement keeps it.
@@ -910,22 +952,42 @@ impl StreamState {
 
     /// `invalidate` (the one allowed wait), then forget the session. In-flight
     /// entries of this session drop Rust's permit references without releasing
-    /// them: a permit native code still holds keeps counting (2.5.1).
-    fn teardown_encoder(&mut self) {
+    /// them: a permit native code still holds keeps counting (2.5.1). An
+    /// invalidate that overran its bound reports `EncoderFailed` and releases
+    /// the hung session's permits, so a hung flush cannot stall admission.
+    fn teardown_encoder(&mut self, cx: &Shared) {
         let Some(slot) = self.encoder.take() else {
             return;
         };
         slot.sink.close();
         let started = Instant::now();
+        debug_assert!(is_current(cx.id));
         slot.encoder.invalidate();
-        let bound = std::time::Duration::from_nanos(self.timings.invalidate_bound_ns);
-        if started.elapsed() >= bound {
-            // A timed-out invalidate reports EncoderFailed (3.5); late outputs
-            // carry the old generation and are discarded.
-            self.stats.invalidate_timeouts += 1;
+        let bound = Duration::from_nanos(self.timings.invalidate_bound_ns);
+        let hung = started.elapsed() >= bound;
+        let entries: Vec<_> = self
+            .in_flight
+            .keys()
+            .filter(|(generation, _)| *generation == slot.generation)
+            .copied()
+            .collect();
+        for key in entries {
+            if let Some(entry) = self.in_flight.remove(&key)
+                && hung
+            {
+                entry.finish();
+            }
         }
-        self.in_flight
-            .retain(|(generation, _), _| *generation != slot.generation);
+        if hung {
+            // Late outputs carry the old generation and are discarded.
+            self.stats.invalidate_timeouts += 1;
+            self.notify(
+                cx,
+                ObserverJob::EncoderFailed {
+                    error: MediaError::EncoderFailed { recoverable: true },
+                },
+            );
+        }
         self.stalled = false;
     }
 
@@ -950,7 +1012,7 @@ impl StreamState {
                 {
                     return;
                 }
-                self.teardown_encoder();
+                self.teardown_encoder(cx);
                 match self.create_encoder(cx, false) {
                     Ok(()) => self.submit_due(cx),
                     Err(error) => self.fail(cx, error.wire_code(codes::ENCODER)),
@@ -1026,7 +1088,11 @@ impl StreamState {
             // The lease drops here and releases the surface.
             return;
         }
-        let mapped = self.plan.color_mapping.map(info.color);
+        let output = match self.plan.convert {
+            ConvertPath::Identity => info.format,
+            ConvertPath::Convert => self.plan.encoder_input,
+        };
+        let mapped = self.plan.color_mapping.map(info.color, info.format, output);
         if self.latest.as_ref().is_some_and(|latest| latest.pending) {
             self.stats.frames_replaced += 1;
         }
@@ -1185,6 +1251,15 @@ impl StreamState {
             return;
         }
         self.stalled = false;
+        if frame.form != BitstreamForm::Avcc4 {
+            // Outputs are length-prefixed by contract; an Annex-B adapter
+            // converts on its output thread (bitstream::annexb_to_length_prefixed).
+            if let Some(entry) = entry {
+                entry.finish();
+            }
+            self.fail(cx, codes::ENCODE);
+            return;
+        }
         let Some(slot) = &self.encoder else {
             return;
         };

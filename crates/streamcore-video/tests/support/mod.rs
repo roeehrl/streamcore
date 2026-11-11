@@ -279,6 +279,7 @@ pub struct FakeCapture {
     pub opens: AtomicUsize,
     /// Emit one frame from inside `start` (a reentrant backend).
     pub frame_on_start: AtomicBool,
+    pub opened: Mutex<Option<CaptureSpec>>,
 }
 
 impl FakeCapture {
@@ -294,16 +295,26 @@ impl FakeCapture {
             next_surface: AtomicU64::new(1),
             opens: AtomicUsize::new(0),
             frame_on_start: AtomicBool::new(false),
+            opened: Mutex::new(None),
         })
     }
 
     pub fn surface(&self, color: ColorTags, capture_ns: u64) -> SurfaceInfo {
+        self.surface_as(PixelFormat::Nv12, color, capture_ns)
+    }
+
+    pub fn surface_as(
+        &self,
+        format: PixelFormat,
+        color: ColorTags,
+        capture_ns: u64,
+    ) -> SurfaceInfo {
         let id = self.next_surface.fetch_add(1, Ordering::SeqCst);
         lock(&self.live).insert(id);
         SurfaceInfo {
             id,
             kind: SurfaceKind::IoSurface,
-            format: PixelFormat::Nv12,
+            format,
             width: 64,
             height: 64,
             color,
@@ -317,7 +328,11 @@ impl FakeCapture {
 
     /// Deliver a frame, as the capture callback does.
     pub fn emit(&self, color: ColorTags, capture_ns: u64) -> SurfaceId {
-        let surface = self.surface(color, capture_ns);
+        self.emit_as(PixelFormat::Nv12, color, capture_ns)
+    }
+
+    pub fn emit_as(&self, format: PixelFormat, color: ColorTags, capture_ns: u64) -> SurfaceId {
+        let surface = self.surface_as(format, color, capture_ns);
         let id = surface.id;
         let events = lock(&self.events).clone();
         if let Some(events) = events {
@@ -385,12 +400,13 @@ impl CaptureBackend for FakeCapture {
     }
     fn open(
         &self,
-        _spec: CaptureSpec,
+        spec: CaptureSpec,
         _queue: Arc<dyn SerialQueue>,
         events: Arc<dyn CaptureEvents>,
     ) -> Result<CaptureId, MediaError> {
         let _call = self.log.outbound();
         self.opens.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.opened) = Some(spec);
         *lock(&self.events) = Some(events);
         Ok(CAPTURE)
     }
@@ -472,6 +488,15 @@ impl FakeEncoder {
     /// Produce the output for `seq` from an "output thread": bytes first, then
     /// the event, then drop the permit.
     pub fn complete(&self, seq: u64) -> bool {
+        self.complete_as(seq, BitstreamForm::Avcc4)
+    }
+
+    /// The encoder can take input again (after `Busy`).
+    pub fn ready(&self) {
+        self.events.input_ready();
+    }
+
+    pub fn complete_as(&self, seq: u64, form: BitstreamForm) -> bool {
         let Some(pending) = self.take(seq) else {
             return false;
         };
@@ -495,7 +520,7 @@ impl FakeEncoder {
             keyframe,
             config_token,
             payload_token,
-            form: BitstreamForm::Avcc4,
+            form,
             discardable: false,
             temporal_id: None,
             ltr: None,
@@ -595,6 +620,10 @@ pub struct FakeFactory {
     pub unsupported: Mutex<Vec<Codec>>,
     pub sync_output: AtomicBool,
     pub invalidate_mode: Mutex<InvalidateMode>,
+    /// `create` blocks this long (a slow MFT activation).
+    pub create_delay: Mutex<Duration>,
+    /// `create` runs on the executor's helper thread, not on the executor.
+    pub create_on_executor: AtomicUsize,
 }
 
 impl FakeFactory {
@@ -606,6 +635,8 @@ impl FakeFactory {
             unsupported: Mutex::new(Vec::new()),
             sync_output: AtomicBool::new(false),
             invalidate_mode: Mutex::new(InvalidateMode::Quick),
+            create_delay: Mutex::new(Duration::ZERO),
+            create_on_executor: AtomicUsize::new(0),
         })
     }
     pub fn encoder(&self, index: usize) -> Arc<FakeEncoder> {
@@ -628,7 +659,16 @@ impl EncoderFactory for FakeFactory {
         spec: EncoderSpec,
         events: Arc<dyn EncoderEvents>,
     ) -> Result<Arc<dyn Encoder>, MediaError> {
-        let _call = self.log.outbound();
+        if self.log.closed.load(Ordering::SeqCst) {
+            self.log.after_close.fetch_add(1, Ordering::SeqCst);
+        }
+        if on_executor() {
+            self.create_on_executor.fetch_add(1, Ordering::SeqCst);
+        }
+        let delay = *lock(&self.create_delay);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         self.creates.fetch_add(1, Ordering::SeqCst);
         if lock(&self.unsupported).contains(&spec.codec) {
             return Err(MediaError::Unsupported);
@@ -654,6 +694,57 @@ impl EncoderFactory for FakeFactory {
         });
         encoders.push(encoder.clone());
         Ok(encoder)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Converter.
+
+/// A GPU converter: records each job and leases its output surfaces.
+pub struct FakeConverter {
+    pub log: Arc<Log>,
+    pub jobs: Mutex<Vec<(SurfaceId, ConvertJob)>>,
+    pub live: Mutex<HashSet<SurfaceId>>,
+    pub double_release: AtomicUsize,
+    next: AtomicU64,
+}
+
+impl FakeConverter {
+    pub fn new(log: Arc<Log>) -> Arc<Self> {
+        Arc::new(Self {
+            log,
+            jobs: Mutex::new(Vec::new()),
+            live: Mutex::new(HashSet::new()),
+            double_release: AtomicUsize::new(0),
+            next: AtomicU64::new(1_000_000),
+        })
+    }
+}
+
+impl Converter for FakeConverter {
+    fn convert(&self, input: SurfaceId, job: ConvertJob) -> Result<SurfaceInfo, MediaError> {
+        let _call = self.log.outbound();
+        lock(&self.jobs).push((input, job));
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        lock(&self.live).insert(id);
+        Ok(SurfaceInfo {
+            id,
+            kind: SurfaceKind::IoSurface,
+            format: job.format,
+            width: job.width,
+            height: job.height,
+            color: job.color,
+            capture_ns: 0,
+            source_present_ns: None,
+            dirty: None,
+            rotation: Rotation::None,
+            fence: GpuFence::None,
+        })
+    }
+    fn release(&self, surface: SurfaceId) {
+        if !lock(&self.live).remove(&surface) {
+            self.double_release.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -855,6 +946,7 @@ pub fn spec() -> CaptureSpec {
         color: ColorRequest::Source,
         cursor: CursorMode::Composited,
         queue_depth: 5,
+        adapter_luid: None,
     }
 }
 
@@ -879,11 +971,13 @@ pub fn plan() -> StreamPlan {
         recovery: vec![RecoveryStep::Idr],
         on_source_gone: OnSourceGone::Fail,
         medium_cap_bps: None,
+        adapter_luid: None,
     }
 }
 
 pub struct Fakes {
     pub log: Arc<Log>,
+    pub converter: Arc<FakeConverter>,
     pub capture: Arc<FakeCapture>,
     pub factory: Arc<FakeFactory>,
     pub out: Arc<FakeOut>,
@@ -895,6 +989,7 @@ impl Fakes {
         let log = Arc::new(Log::default());
         Self {
             capture: FakeCapture::new(log.clone()),
+            converter: FakeConverter::new(log.clone()),
             factory: FakeFactory::new(log.clone()),
             out: FakeOut::new(log.clone()),
             observer: FakeObserver::new(log.clone()),
@@ -934,6 +1029,16 @@ impl Fakes {
             self.capture.leases_outstanding(),
             0,
             "a surface never released"
+        );
+        assert!(
+            lock(&self.converter.live).is_empty(),
+            "a converted surface never released"
+        );
+        assert_eq!(self.converter.double_release.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            self.factory.create_on_executor.load(Ordering::SeqCst),
+            0,
+            "create ran on the executor"
         );
         assert_eq!(
             self.log.after_close.load(Ordering::SeqCst),
