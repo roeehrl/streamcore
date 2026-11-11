@@ -1,0 +1,23 @@
+# streamcore-video-windows
+
+The Windows backend for `streamcore-video`: Windows.Graphics.Capture on the chosen adapter,
+an `ID3D11VideoProcessor` for BGRA→NV12 scaling and conversion, and a Media Foundation
+hardware H.264 encoder. It compiles only on Windows (`cfg(windows)`). The `bench` feature adds
+the measurement binary driven by `scripts/run-video-windows-bench.sh`.
+
+## Backend rules
+
+- **Threading.** Each stream's serial executor is a `DispatcherQueue` thread in a
+  single-threaded apartment (STA), registered with MMCSS. Helper threads (the encoder event
+  pump, bounded create and flush) run in the multithreaded apartment (MTA).
+- **Encoders must be asynchronous, free-threaded MFTs.** Only MFTs that set
+  `MF_TRANSFORM_ASYNC` are used. Hardware encoder MFTs meet this by contract, which is why
+  the encoder can be fed from the STA executor while its events are drained from an MTA
+  helper thread. Opening a synchronous-only MFT fails with "not an asynchronous MFT", and
+  `bench probe` reports `async` for every encoder it lists.
+- **Unsafe code** is denied crate-wide and allowed only in `src/win/sys/`, where the
+  D3D11, DXGI and Media Foundation calls live. Every `unsafe` block there carries a
+  `SAFETY:` comment.
+- **Hardware paths are measured on a real Windows PC**, from an interactive desktop session.
+  Capture and adapter enumeration fail without a logged-on user. Hosted CI runs clippy only
+  (`.github/workflows/windows-clippy.yml`).
