@@ -13,9 +13,9 @@
 //! Failures. A failed event, a failed `ProcessOutput`, a `GetEvent` that keeps failing or a lost
 //! device ends the session: the event thread drops every frame still in the encoder (the oldest
 //! with `DeviceLost`, or `EncoderFailed { recoverable: true }` so a transient driver error rebuilds
-//! the encoder; the stream reacts once) or, with nothing in flight, reports it with
-//! `session_failed` (`DeviceLost` non-recoverable), later submits fail with the same error (refused
-//! under the book's lock, so no submit can slip in between), and the thread exits. A `ProcessInput` that fails otherwise
+//! the encoder), then reports the session once with `session_failed` (`DeviceLost`
+//! non-recoverable; the stream rebuilds), later submits fail with the same error (refused under the
+//! book's lock, so no submit can slip in between), and the thread exits. A `ProcessInput` that fails otherwise
 //! loses its frame but not its `NeedInput` credit.
 //!
 //! Teardown. Dropping the encoder hands `END_STREAMING`, `IMFShutdown` and `ShutdownObject` to an
@@ -34,7 +34,7 @@ use super::sys::mf::{self, Encoder, MfEvent, Params, Sample};
 use crate::clock::ns_to_hundred_ns;
 use crate::h264::annexb::{avcc_config, split_access_unit};
 use crate::h264::sps::{self, Colour, Sps};
-use crate::mft::{Accept, MftBook, permit_target};
+use crate::mft::{Accept, MftBook, failure_report, permit_target};
 use crate::model::EncoderSetup;
 use crate::trace::Recorder;
 use std::collections::HashMap;
@@ -479,8 +479,8 @@ impl Inner {
 
     /// A session-ending MFT error. Later submits fail with it; every frame in the encoder is
     /// dropped, the oldest with the error (`DeviceLost` or `EncoderFailed { recoverable: true }`)
-    /// and the rest as no-output; with nothing in flight, `session_failed` reports it
-    /// (`DeviceLost` as non-recoverable), so a still screen learns of it without a submit.
+    /// and the rest as no-output; then `session_failed` reports the session once, frames or not
+    /// (`DeviceLost` as non-recoverable), so the stream rebuilds even on a still screen.
     fn fail(&self, failure: mf::Failure) {
         self.fail_with(failure, None);
     }
@@ -496,22 +496,20 @@ impl Inner {
         };
         // The error is stored before the book refuses submits, so a refused submit can read it.
         lock(&self.failure).get_or_insert_with(|| error.clone());
-        let taken = lock(&self.book).fail();
-        if taken.is_none() && first.is_none() {
-            return;
-        }
-        let metas: Vec<Meta> = first.into_iter().chain(taken.unwrap_or_default()).collect();
-        lock(&self.accepted).clear();
         // Decided from what `book.fail()` took under the book's lock: a submit racing this either
         // got in first (and is dropped here with the error) or is refused with `Failed`.
-        let reported = !metas.is_empty();
+        let (metas, first_failure) = failure_report(first, lock(&self.book).fail());
+        lock(&self.accepted).clear();
         let mut reason = Some(DropReason::Error {
             error: error.clone(),
         });
         for m in metas {
             self.drop_frame(m, reason.take().unwrap_or(DropReason::NoOutput));
         }
-        if !reported && !self.invalidated.load(Ordering::Acquire) {
+        // Once per failed session, after its drops, with or without frames: the drops record the
+        // loss, and this makes the stream rebuild (counted once; a DeviceLost drop's rebuild of the
+        // same session makes it a no-op).
+        if first_failure && !self.invalidated.load(Ordering::Acquire) {
             self.events.session_failed(error, !device_lost);
         }
     }

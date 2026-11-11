@@ -96,8 +96,12 @@ executor keys on the error type, as it does for a dropped frame:
 
 No loss is recorded for a session that had nothing in flight: no frame was lost, and the rebuild's
 IDR restarts the stream. Frames the session still held are counted lost (their drops would arrive
-stale after the rebuild). An encoder reports a failure once: as the drop reason of the frames it
-held, or, with none, through `session_failed`. It is not part of the per-frame C ABI.
+stale after the rebuild). A failed session is best reported as the Windows adapter does: drop its
+frames first (the oldest with the error; those drops record the loss), then call `session_failed`
+once, with or without frames, so the stream rebuilds even when no drop would. A session's failure
+rebuilds and counts once: after a frame's `DeviceLost` drop has scheduled the rebuild, a
+`session_failed` from the same session is a no-op (it is still current until the rebuild runs, so
+this is tracked per generation). `session_failed` is not part of the per-frame C ABI.
 
 **The rebuild budget.** Every rebuild caused by an encoder failure counts against one budget: a
 frame dropped with `DeviceLost`, and every `session_failed` that does not fail the stream. A

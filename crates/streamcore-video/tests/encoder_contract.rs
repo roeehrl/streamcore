@@ -376,3 +376,85 @@ fn only_failure_driven_rebuilds_count_against_the_budget() {
     s.close();
     s.assert_clean();
 }
+
+/// A failed session as the Windows adapter reports it: its frames dropped
+/// (the oldest with the error), then `session_failed` once, all posted before
+/// the executor runs.
+fn fail_like_windows(s: &Manual, error: MediaError) {
+    let encoder = s.encoder();
+    let mut reason = Some(DropReason::Error {
+        error: error.clone(),
+    });
+    for seq in encoder.pending_seqs() {
+        encoder.drop_output(seq, reason.take().unwrap_or(DropReason::NoOutput));
+    }
+    let recoverable = error != MediaError::DeviceLost;
+    encoder.fail_session(error, recoverable);
+}
+
+#[test]
+fn a_device_lost_drop_then_session_failed_rebuilds_once_and_counts_once() {
+    let s = Manual::new();
+    s.start_running();
+    for n in 0..3 {
+        s.frame(1_000 + n as u64);
+        let before = s.controller.stats().stale_events;
+        fail_like_windows(&s, MediaError::DeviceLost);
+        s.pump();
+        assert_eq!(s.factory.count(), 2 + n, "one rebuild per failed session");
+        assert_eq!(
+            s.controller.stats().stale_events,
+            before + 1,
+            "the second report is a no-op"
+        );
+        // Counted once: three failed sessions stay within the budget.
+        assert!(s.observer.failures().is_empty(), "session {n}");
+    }
+    s.frame(2_000);
+    fail_like_windows(&s, MediaError::DeviceLost);
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::ENCODER.to_string()]);
+    assert_eq!(s.factory.count(), 4);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn recoverable_drops_then_session_failed_rebuild_once_with_one_loss() {
+    let s = Manual::new();
+    s.start_running();
+    s.frame(1_000);
+    assert_eq!(s.encoder().pending_seqs(), vec![1]);
+    fail_like_windows(&s, MediaError::EncoderFailed { recoverable: true });
+    s.pump();
+    assert_eq!(s.factory.count(), 2, "one rebuild");
+    assert_eq!(
+        encoder_failures(&s),
+        vec![MediaError::EncoderFailed { recoverable: true }]
+    );
+    // The drop's loss runs one recovery: the retained image is re-encoded on
+    // the new session as a keyframe, without a new capture.
+    s.advance_ms(600);
+    let second = s.encoder();
+    assert_eq!(s.controller.stats().recoveries, 1);
+    assert_eq!(second.pending_seqs().len(), 1);
+    assert!(lock(&second.submits)[0].force_keyframe);
+    second.complete_all();
+    s.pump();
+    // A frameless failure of every later session on a still screen still
+    // fits the budget only three times.
+    for _ in 0..2 {
+        fail_like_windows(&s, MediaError::EncoderFailed { recoverable: true });
+        s.pump();
+    }
+    assert!(s.observer.failures().is_empty());
+    fail_like_windows(&s, MediaError::EncoderFailed { recoverable: true });
+    s.pump();
+    assert_eq!(s.observer.failures(), vec![codes::ENCODER.to_string()]);
+    s.capture.answer(Op::Stop, None);
+    s.pump();
+    s.close();
+    s.assert_clean();
+}

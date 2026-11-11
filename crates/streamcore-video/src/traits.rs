@@ -180,8 +180,9 @@ pub trait EncoderEvents: Send + Sync {
     /// rebuild budget (more than 3 in 10 s fail the stream; see
     /// [`crate::threading`]). With nothing in flight no loss is recorded (the
     /// rebuild's IDR restarts the stream); frames the session still held are
-    /// counted lost. Report the error once, either here or as a frame's drop
-    /// reason.
+    /// counted lost. Drop the session's frames first (their drops record the
+    /// loss), then call this once: a session's failure rebuilds and counts once,
+    /// so a call after a `DeviceLost` drop of the same session is a no-op.
     fn session_failed(&self, error: MediaError, recoverable: bool);
 }
 

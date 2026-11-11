@@ -133,6 +133,10 @@ pub(crate) struct StreamState {
     /// Busy or out of resources: wait for an output, a drop or a new frame.
     stalled: bool,
     failure_rebuilds: VecDeque<u64>,
+    /// The session whose failure already scheduled its rebuild: a second
+    /// report of the same failure (a `DeviceLost` drop, then `session_failed`)
+    /// neither rebuilds again nor counts again.
+    failed_generation: Option<u64>,
 
     latest: Option<Retained>,
     /// (H1 of the latest frame, executor clock then): maps the executor clock to
@@ -268,6 +272,7 @@ impl StreamState {
             recreate_scheduled: false,
             stalled: false,
             failure_rebuilds: VecDeque::new(),
+            failed_generation: None,
             latest: None,
             time_anchor: None,
             last_pts_ns: 0,
@@ -1116,6 +1121,11 @@ impl StreamState {
     /// (colour change, codec fallback, resize) call `schedule_recreate`
     /// directly and do not count.
     fn rebuild_encoder(&mut self, cx: &Arc<Shared>) {
+        let generation = self.encoder.as_ref().map(|slot| slot.generation);
+        if generation.is_some() && generation == self.failed_generation {
+            return;
+        }
+        self.failed_generation = generation;
         let now = cx.clock.now_ns();
         self.failure_rebuilds.push_back(now);
         while self
@@ -1141,6 +1151,13 @@ impl StreamState {
         recoverable: bool,
     ) {
         if !self.is_current_encoder(generation) || self.closing {
+            self.stats.stale_events += 1;
+            return;
+        }
+        if self.failed_generation == Some(generation) {
+            // Already reported (a frame's `DeviceLost` drop): its rebuild is
+            // scheduled and counted. Until it runs the session is still
+            // current, so the generation check alone cannot catch this.
             self.stats.stale_events += 1;
             return;
         }
