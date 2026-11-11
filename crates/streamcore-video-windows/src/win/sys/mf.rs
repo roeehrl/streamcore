@@ -8,8 +8,11 @@ use crate::model::{CodecSetting, EncoderInfo, EncoderSetup};
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use windows::Win32::Foundation::{E_FAIL, VARIANT_BOOL, VARIANT_TRUE};
+use windows::Win32::Foundation::{E_FAIL, E_UNEXPECTED, VARIANT_BOOL, VARIANT_TRUE};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL, VT_UI4, VariantClear};
@@ -25,6 +28,48 @@ fn attr_string(attrs: &IMFAttributes, key: &GUID) -> Option<String> {
         let s = p.to_string().ok();
         CoTaskMemFree(Some(p.0 as *const _));
         s
+    }
+}
+
+/// `D3DDDIERR_DEVICEREMOVED`, which some drivers' MFTs return as is.
+const D3DDDIERR_DEVICEREMOVED: HRESULT = HRESULT(0x8876_0870_u32 as i32);
+
+/// Whether an MFT call failed because the GPU device was removed, reset or hung: the session is
+/// gone and the stream rebuilds the encoder (`MediaError::DeviceLost`).
+pub fn is_device_lost(code: HRESULT) -> bool {
+    [
+        DXGI_ERROR_DEVICE_REMOVED,
+        DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DEVICE_HUNG,
+        D3DDDIERR_DEVICEREMOVED,
+    ]
+    .contains(&code)
+}
+
+/// `ProcessInput` refused the input because the MFT is not accepting one (no `NeedInput`
+/// credit, as the MFT sees it): the credit the caller took was not real.
+pub fn is_not_accepting(e: &Error) -> bool {
+    e.code() == MF_E_NOTACCEPTING
+}
+
+/// Shuts an activated MFT down when dropped, unless disarmed: every early return between
+/// `ActivateObject` and a configured encoder would otherwise leak the session, and hardware
+/// encoders limit sessions per process.
+struct ActivationGuard(Option<IMFActivate>);
+
+impl ActivationGuard {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ActivationGuard {
+    fn drop(&mut self) {
+        if let Some(activate) = self.0.take() {
+            // SAFETY: valid activation object whose MFT was created; releases the MFT and its
+            // hardware session.
+            let _ = unsafe { activate.ShutdownObject() };
+        }
     }
 }
 
@@ -206,14 +251,13 @@ impl Encoder {
         let activate = candidate.activate.clone();
         // SAFETY: valid activation object; creates the MFT.
         let transform: IMFTransform = unsafe { activate.ActivateObject()? };
+        let guard = ActivationGuard(Some(activate.clone()));
         // SAFETY: valid MFT; attribute calls take valid GUID pointers.
         let attrs = unsafe { transform.GetAttributes()? };
         // SAFETY: as above.
         setup.asynchronous = unsafe { attrs.GetUINT32(&MF_TRANSFORM_ASYNC) }.unwrap_or(0) == 1;
         let events: Option<IMFMediaEventGenerator> = transform.cast().ok();
         let Some(events) = events.filter(|_| setup.asynchronous) else {
-            // SAFETY: valid activation object; releases the MFT just created.
-            let _ = unsafe { activate.ShutdownObject() };
             return Err(Error::new(E_FAIL, "not an asynchronous MFT"));
         };
         // SAFETY: as above; unlocking is required before using an async MFT.
@@ -378,6 +422,7 @@ impl Encoder {
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
             transform.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
         }
+        guard.disarm();
         Ok(Self {
             activate,
             transform,
@@ -418,6 +463,28 @@ impl Encoder {
             s
         };
         Ok(Sample(sample))
+    }
+
+    /// The SPS and PPS the current output type carries (`MF_MT_MPEG_SEQUENCE_HEADER`, Annex-B),
+    /// for an encoder that does not repeat them in its keyframes.
+    pub fn sequence_header(&self) -> Option<Vec<u8>> {
+        // SAFETY: valid MFT; the blob is copied into a buffer of the size MF reports, and only the
+        // bytes it wrote are kept.
+        unsafe {
+            let t = self.transform.GetOutputCurrentType(self.output_id).ok()?;
+            let size = t.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER).ok()?;
+            let mut buf = vec![0u8; size as usize];
+            let mut written = 0u32;
+            t.GetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, &mut buf, Some(&mut written))
+                .ok()?;
+            buf.truncate(written as usize);
+            (!buf.is_empty()).then_some(buf)
+        }
+    }
+
+    /// Whether `shutdown` has begun: MFT calls that fail now fail because of it.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
     }
 
     /// Asks for an IDR on the next input.
@@ -470,7 +537,8 @@ impl Encoder {
     }
 
     /// Shuts the MFT down: a blocked `GetEvent` on the event thread returns `MF_E_SHUTDOWN`.
-    /// Idempotent.
+    /// Idempotent. It can block (the driver releases its session): never call it on a stream
+    /// executor.
     pub fn shutdown(&self) {
         self.closing.store(true, Ordering::Release);
         // SAFETY: valid MFT; the message carries no pointer. Errors are irrelevant at shutdown.
@@ -496,10 +564,34 @@ pub enum MfEvent {
     DrainComplete,
     /// `ProcessOutput` produced nothing (a format change was adopted, or no sample).
     NoOutput,
-    Error(String),
+    /// A failed event status, a failed `ProcessOutput`, or a `GetEvent` that kept failing: the
+    /// session cannot go on.
+    Failed(Failure),
     Other(u32),
     Shutdown,
 }
+
+/// Why a session failed.
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    /// The GPU device was removed, reset or hung.
+    pub device_lost: bool,
+}
+
+impl Failure {
+    pub fn new(code: HRESULT, message: String) -> Self {
+        Self {
+            message,
+            device_lost: is_device_lost(code),
+        }
+    }
+}
+
+/// Consecutive `GetEvent` failures before the pump gives up, and the pause between them, so a
+/// failing generator cannot spin the event thread.
+const GET_EVENT_ATTEMPTS: u32 = 5;
+const GET_EVENT_RETRY: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// One access unit, Annex-B as the MFT wrote it.
 #[derive(Debug)]
@@ -529,21 +621,37 @@ unsafe impl Send for EventPump {}
 impl EventPump {
     /// Blocks until the next event (never call on the executor).
     pub fn next(&self) -> MfEvent {
-        // SAFETY: valid generator; flags 0 = blocking.
-        let event = match unsafe {
-            self.events
-                .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
-        } {
-            Ok(e) => e,
-            Err(e) if e.code() == MF_E_SHUTDOWN => return MfEvent::Shutdown,
-            Err(e) => return MfEvent::Error(format!("GetEvent: {e}")),
+        let closing = || self.closing.load(Ordering::Acquire);
+        let mut attempts = 0;
+        let event = loop {
+            // SAFETY: valid generator; flags 0 = blocking.
+            match unsafe {
+                self.events
+                    .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))
+            } {
+                Ok(e) => break e,
+                Err(e) if e.code() == MF_E_SHUTDOWN || closing() => return MfEvent::Shutdown,
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= GET_EVENT_ATTEMPTS {
+                        return MfEvent::Failed(Failure::new(
+                            e.code(),
+                            format!("GetEvent failed {attempts} times: {e}"),
+                        ));
+                    }
+                    std::thread::sleep(GET_EVENT_RETRY);
+                }
+            }
         };
         // SAFETY: valid event.
         let ty = unsafe { event.GetType() }.unwrap_or(0);
         // SAFETY: valid event.
         let status: HRESULT = unsafe { event.GetStatus() }.unwrap_or(HRESULT(0));
         if status.is_err() {
-            return MfEvent::Error(format!("event {ty} status {status}"));
+            if closing() {
+                return MfEvent::Shutdown;
+            }
+            return MfEvent::Failed(Failure::new(status, format!("event {ty} status {status}")));
         }
         let ty = MF_EVENT_TYPE(ty as i32);
         if ty == METransformNeedInput {
@@ -554,8 +662,8 @@ impl EventPump {
                 Ok(None) => MfEvent::NoOutput,
                 // A HaveOutput queued before END_STREAMING fails once the MFT is shut down
                 // (E_UNEXPECTED): the stream is closing, so it is not reported as an error.
-                Err(_) if self.closing.load(Ordering::Acquire) => MfEvent::Shutdown,
-                Err(e) => MfEvent::Error(format!("ProcessOutput: {e}")),
+                Err(_) if closing() => MfEvent::Shutdown,
+                Err(e) => MfEvent::Failed(Failure::new(e.code(), format!("ProcessOutput: {e}"))),
             }
         } else if ty == METransformDrainComplete {
             MfEvent::DrainComplete
@@ -564,7 +672,24 @@ impl EventPump {
         }
     }
 
+    /// `ProcessOutput` for a `METransformHaveOutput`. On `MF_E_TRANSFORM_STREAM_CHANGE` the new
+    /// output type is adopted and `ProcessOutput` called again, as MF's contract asks. Quick Sync
+    /// answers that retry with E_UNEXPECTED (or "need more input") and sends the pending frame
+    /// with its next `METransformHaveOutput`: both mean "wait for the event", not an error.
     fn process_output(&self) -> Result<Option<Output>> {
+        match self.process_output_once()? {
+            Step::Output(o) => Ok(Some(o)),
+            Step::Nothing => Ok(None),
+            Step::StreamChange => match self.process_output_once() {
+                Ok(Step::Output(o)) => Ok(Some(o)),
+                Ok(Step::Nothing | Step::StreamChange) => Ok(None),
+                Err(e) if e.code() == E_UNEXPECTED => Ok(None),
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    fn process_output_once(&self) -> Result<Step> {
         let sample = if self.provides_samples {
             None
         } else {
@@ -592,16 +717,14 @@ impl EventPump {
         match r {
             Ok(()) => {}
             Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                // SAFETY: valid MFT; adopt the encoder's new output type. An asynchronous MFT
-                // sends a new METransformHaveOutput for the pending frame: calling
-                // ProcessOutput again now fails with E_UNEXPECTED (Intel QSV).
+                // SAFETY: valid MFT; adopt the encoder's new output type.
                 unsafe {
                     let t = self.transform.GetOutputAvailableType(self.output_id, 0)?;
                     self.transform.SetOutputType(self.output_id, &t, 0)?;
                 }
-                return Ok(None);
+                return Ok(Step::StreamChange);
             }
-            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(Step::Nothing),
             Err(e) => {
                 return Err(Error::new(
                     e.code(),
@@ -614,7 +737,7 @@ impl EventPump {
             }
         }
         let Some(sample) = sample else {
-            return Ok(None);
+            return Ok(Step::Nothing);
         };
         // SAFETY: valid sample; the contiguous buffer is locked only while copied.
         let (bytes, time_100ns, keyframe) = unsafe {
@@ -628,11 +751,18 @@ impl EventPump {
             let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
             (bytes, time, key)
         };
-        Ok(Some(Output {
+        Ok(Step::Output(Output {
             bytes,
             time_100ns,
             keyframe,
             h4_ns,
         }))
     }
+}
+
+/// What one `ProcessOutput` call gave.
+enum Step {
+    Output(Output),
+    Nothing,
+    StreamChange,
 }

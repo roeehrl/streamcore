@@ -132,6 +132,14 @@ impl WgcCapture {
             .push(note);
     }
 
+    /// A note, unless the same one was already made (a failure retried every frame).
+    fn note_once(&self, note: String) {
+        let mut notes = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+        if !notes.contains(&note) {
+            notes.push(note);
+        }
+    }
+
     pub fn notes(&self) -> Vec<String> {
         self.notes.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -173,9 +181,13 @@ impl WgcCapture {
                 }
                 Ok(())
             });
-        let frame_token = pool
-            .FrameArrived(&handler)
-            .map_err(|_| MediaError::Internal)?;
+        let frame_token = match pool.FrameArrived(&handler) {
+            Ok(t) => t,
+            Err(_) => {
+                let _ = pool.Close();
+                return Err(MediaError::Internal);
+            }
+        };
         let me = self.me.clone();
         let closed = TypedEventHandler::<GraphicsCaptureItem, IInspectable>::new(move |_, _| {
             if let Some(me) = me.upgrade() {
@@ -184,9 +196,24 @@ impl WgcCapture {
             Ok(())
         });
         let closed_token = item.Closed(&closed).ok();
-        let session = pool
-            .CreateCaptureSession(&item)
-            .map_err(|_| MediaError::Internal)?;
+        // A start that fails past this point unregisters and closes what it made.
+        let undo = |session: Option<&GraphicsCaptureSession>| {
+            let _ = pool.RemoveFrameArrived(frame_token);
+            if let Some(t) = closed_token {
+                let _ = item.RemoveClosed(t);
+            }
+            if let Some(s) = session {
+                let _ = s.Close();
+            }
+            let _ = pool.Close();
+        };
+        let session = match pool.CreateCaptureSession(&item) {
+            Ok(s) => s,
+            Err(_) => {
+                undo(None);
+                return Err(MediaError::Internal);
+            }
+        };
         if let Err(e) = session.SetIsBorderRequired(false) {
             self.note(format!("IsBorderRequired=false refused: {e}"));
         }
@@ -200,17 +227,25 @@ impl WgcCapture {
         {
             self.note(format!("MinUpdateInterval refused: {e}"));
         }
+        if session.StartCapture().is_err() {
+            undo(Some(&session));
+            return Err(MediaError::Internal);
+        }
         let timer = self.timer_period.then(TimerPeriod::acquire);
-        session.StartCapture().map_err(|_| MediaError::Internal)?;
+        let running = Running {
+            pool,
+            session,
+            frame_token,
+            closed_token,
+            _timer: timer,
+        };
         let mut state = self.lock();
-        if let Some(cap) = state.captures.get_mut(&id) {
-            cap.running = Some(Running {
-                pool,
-                session,
-                frame_token,
-                closed_token,
-                _timer: timer,
-            });
+        match state.captures.get_mut(&id) {
+            Some(cap) => cap.running = Some(running),
+            None => {
+                drop(state);
+                stop_running(running, &item);
+            }
         }
         Ok(())
     }
@@ -236,25 +271,34 @@ impl WgcCapture {
             let _ = frame.Close();
             return;
         };
-        let (width, height) = texture_size(&texture);
+        let texture_px = texture_size(&texture);
+        // The image's size: the frame that reveals a resize still comes in a buffer of the
+        // pool's old size, with the image in its top-left part (clipped when it grew).
+        let (width, height) =
+            content
+                .filter(|c| c.Width > 0 && c.Height > 0)
+                .map_or(texture_px, |c| {
+                    (
+                        (c.Width as u32).min(texture_px.0),
+                        (c.Height as u32).min(texture_px.1),
+                    )
+                });
         let (events, resized) = {
-            let mut state = self.lock();
-            let Some(cap) = state.captures.get_mut(&id) else {
+            let state = self.lock();
+            let Some(cap) = state.captures.get(&id) else {
                 let _ = frame.Close();
                 return;
             };
             let resized = content
                 .filter(|c| c.Width != cap.size.Width || c.Height != cap.size.Height)
-                .map(|c| {
-                    cap.size = c;
-                    (c, cap.display, i32::from(cap.spec.queue_depth))
-                });
+                .map(|c| (c, cap.display, i32::from(cap.spec.queue_depth)));
             (cap.events.clone(), resized)
         };
         let surface = self.surfaces.insert(Entry::Capture {
             texture,
             frame,
             read_until: 0,
+            content: (width, height),
         });
         if let Some(r) = &self.recorder {
             r.captured(surface, h0, h1, backlog);
@@ -281,14 +325,26 @@ impl WgcCapture {
         // No lock held: this may drain the executor inline (convert and submit run now).
         events.frame(id, None, info, FrameStatus::Complete);
         if let Some((size, display, buffers)) = resized {
-            // The source changed size: new buffers at the new size, and tell the stream.
-            if let Ok(device) = self.gpu.winrt_device() {
-                let _ = pool.Recreate(
+            // The source changed size: new buffers at the new size, and tell the stream. The
+            // capture's size moves only once the pool has them, so a failed `Recreate` is
+            // retried with the next frame.
+            let recreated = self.gpu.winrt_device().and_then(|device| {
+                pool.Recreate(
                     &device,
                     DirectXPixelFormat::B8G8R8A8UIntNormalized,
                     buffers,
                     size,
-                );
+                )
+            });
+            if let Err(e) = recreated {
+                self.note_once(format!(
+                    "frame pool Recreate at {}x{} failed: {e}",
+                    size.Width, size.Height
+                ));
+                return;
+            }
+            if let Some(cap) = self.lock().captures.get_mut(&id) {
+                cap.size = size;
             }
             if let Some(o) = self.outputs.get(display as usize) {
                 events.layout_changed(id, layout_of(display, o, Some(size)));
@@ -303,25 +359,30 @@ impl WgcCapture {
         }
     }
 
+    /// Stops and forgets the capture: a stopped capture is not started again (the stream opens
+    /// a new one).
     fn stop_capture(&self, id: CaptureId) -> Result<(), MediaError> {
-        let (running, item) = {
-            let mut state = self.lock();
-            let cap = state
-                .captures
-                .get_mut(&id)
-                .ok_or(MediaError::InvalidSettings)?;
-            (cap.running.take(), cap.item.clone())
-        };
-        if let Some(r) = running {
-            let _ = r.pool.RemoveFrameArrived(r.frame_token);
-            if let Some(t) = r.closed_token {
-                let _ = item.RemoveClosed(t);
-            }
-            let _ = r.session.Close();
-            let _ = r.pool.Close();
+        let cap = self
+            .lock()
+            .captures
+            .remove(&id)
+            .ok_or(MediaError::InvalidSettings)?;
+        if let Some(r) = cap.running {
+            stop_running(r, &cap.item);
         }
         Ok(())
     }
+}
+
+/// Unregisters a running capture's handlers and closes its session and pool (its timer hold
+/// ends with it).
+fn stop_running(r: Running, item: &GraphicsCaptureItem) {
+    let _ = r.pool.RemoveFrameArrived(r.frame_token);
+    if let Some(t) = r.closed_token {
+        let _ = item.RemoveClosed(t);
+    }
+    let _ = r.session.Close();
+    let _ = r.pool.Close();
 }
 
 impl CaptureBackend for WgcCapture {
@@ -450,8 +511,8 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn stop(&self, id: CaptureId, op: OpToken) {
-        let result = self.stop_capture(id);
         let events = self.lock().captures.get(&id).map(|c| c.events.clone());
+        let result = self.stop_capture(id);
         if let Some(events) = events {
             events.op_done(op, result.err());
         }

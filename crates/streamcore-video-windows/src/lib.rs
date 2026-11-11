@@ -18,12 +18,13 @@
 //! - the bench binary `streamcore-video-windows-bench` (`report`, `probe`, `bench`).
 //!
 //! The portable modules (statistics, the trace recorder, slot ids, the MFT bookkeeping, H.264
-//! helpers, the frame-counter barcode, the adapter policy and the report model) build and are
-//! tested on every platform.
+//! helpers, the converter's crop maths, the power-throttling masks, the frame-counter barcode, the
+//! adapter policy and the report model) build and are tested on every platform.
 
 pub mod barcode;
 pub mod cli;
 pub mod clock;
+pub mod geometry;
 pub mod h264;
 pub mod mft;
 pub mod model;

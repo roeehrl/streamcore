@@ -52,7 +52,7 @@ impl Feeder<'_> {
         while self.credits == 0 {
             match next(rx, deadline.saturating_duration_since(Instant::now()))? {
                 MfEvent::NeedInput => self.credits += 1,
-                MfEvent::Error(e) => report.errors.push(e),
+                MfEvent::Failed(f) => report.errors.push(f.message),
                 _ => {}
             }
         }
@@ -82,7 +82,7 @@ impl Feeder<'_> {
             match next(rx, deadline.saturating_duration_since(Instant::now()))? {
                 MfEvent::NeedInput => self.credits += 1,
                 MfEvent::Output(o) => return Some((o.h4_ns, o.bytes)),
-                MfEvent::Error(e) => report.errors.push(e),
+                MfEvent::Failed(f) => report.errors.push(f.message),
                 _ => {}
             }
         }
@@ -123,7 +123,7 @@ pub fn run(
             let _apartment = Apartment::mta();
             loop {
                 let ev = pump.next();
-                let end = matches!(ev, MfEvent::Shutdown);
+                let end = matches!(ev, MfEvent::Shutdown | MfEvent::Failed(_));
                 if tx.send(ev).is_err() || end {
                     break;
                 }

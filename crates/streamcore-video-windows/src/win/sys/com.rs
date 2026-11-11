@@ -1,7 +1,7 @@
 //! COM and Media Foundation start-up, QPC, events, the high-resolution timer, the message-aware
 //! wait, the DispatcherQueue and MMCSS.
 
-use crate::clock::qpc_to_ns;
+use crate::clock::{qpc_to_ns, throttling_with};
 use std::marker::PhantomData;
 use std::sync::OnceLock;
 use windows::System::DispatcherQueueController;
@@ -17,7 +17,7 @@ use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerforma
 use windows::Win32::System::Threading::{
     AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW,
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CancelWaitableTimer, CreateEventW,
-    CreateWaitableTimerExW, GetCurrentProcess, GetSystemTimes,
+    CreateWaitableTimerExW, GetCurrentProcess, GetProcessInformation, GetSystemTimes,
     PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
     PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetEvent, SetProcessInformation,
     SetWaitableTimer, TIMER_ALL_ACCESS,
@@ -259,27 +259,49 @@ pub fn system_times() -> Option<(u64, u64, u64)> {
     Some((ft(idle), ft(kernel), ft(user)))
 }
 
-/// How many streams hold the 1 ms timer period, and what the first hold applied.
-static TIMER_HOLDERS: std::sync::Mutex<(u32, TimerPeriodStatus)> = std::sync::Mutex::new((
-    0,
-    TimerPeriodStatus {
+/// The streams holding the 1 ms timer period, what the first hold applied, and the
+/// power-throttling state it found (restored, for its timer bit only, by the last release).
+struct Holders {
+    count: u32,
+    applied: TimerPeriodStatus,
+    saved: Option<(u32, u32)>,
+}
+
+static TIMER_HOLDERS: std::sync::Mutex<Holders> = std::sync::Mutex::new(Holders {
+    count: 0,
+    applied: TimerPeriodStatus {
         period_1ms: false,
         throttling_opt_out: false,
     },
-));
+    saved: None,
+});
 
-/// The power-throttling state for timer resolution: `opt_out` asks Windows to honour this
-/// process's timer resolution even when its windows are minimized, occluded or absent (a tray
-/// or service host); otherwise the system decides again.
-fn honour_timer_resolution(opt_out: bool) -> bool {
+/// This process's power-throttling state, `(ControlMask, StateMask)`.
+fn throttling_state() -> Option<(u32, u32)> {
+    let mut state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: 0,
+        StateMask: 0,
+    };
+    // SAFETY: the pseudo-handle of this process and a valid, correctly sized, versioned state
+    // that the call fills.
+    unsafe {
+        GetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            (&raw mut state).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        )
+    }
+    .ok()?;
+    Some((state.ControlMask, state.StateMask))
+}
+
+fn set_throttling_state((control, state): (u32, u32)) -> bool {
     let state = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: if opt_out {
-            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
-        } else {
-            0
-        },
-        StateMask: 0,
+        ControlMask: control,
+        StateMask: state,
     };
     // SAFETY: the pseudo-handle of this process and a valid, correctly sized state.
     unsafe {
@@ -298,49 +320,65 @@ fn honour_timer_resolution(opt_out: bool) -> bool {
 /// first hold calls `timeBeginPeriod(1)` and opts the process out of timer-resolution
 /// throttling, the last release undoes both. Quick Sync's encoder MFT waits on this timer: at the
 /// default 15.6 ms tick an encode takes about 15 ms, at 1 ms about 6 ms.
+///
+/// Only the `IGNORE_TIMER_RESOLUTION` bits of the process's power-throttling state are changed
+/// (read with `GetProcessInformation`): EcoQoS or any other policy the host set stays as it is,
+/// and the last release puts the timer bits back as the first hold found them.
 pub struct TimerPeriod(());
 
-/// What the first hold managed to apply.
+/// What the holds currently apply (nothing while none is held).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimerPeriodStatus {
     pub period_1ms: bool,
     pub throttling_opt_out: bool,
 }
 
+const TIMER_BIT: u32 = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
 impl TimerPeriod {
     pub fn acquire() -> Self {
         let mut holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
-        if holders.0 == 0 {
-            let throttling_opt_out = honour_timer_resolution(true);
+        if holders.count == 0 {
+            // Unreadable (an OS without the query): treat it as the default, system-managed state.
+            let saved = throttling_state().unwrap_or((0, 0));
+            let throttling_opt_out = set_throttling_state(throttling_with(saved, TIMER_BIT, None));
             // SAFETY: no pointers; paired with timeEndPeriod on the last release.
             let period_1ms = unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0;
-            holders.1 = TimerPeriodStatus {
+            holders.applied = TimerPeriodStatus {
                 period_1ms,
                 throttling_opt_out,
             };
+            holders.saved = throttling_opt_out.then_some(saved);
         }
-        holders.0 += 1;
+        holders.count += 1;
         Self(())
     }
 
-    /// What the current (or last) first hold applied.
+    /// What is applied now: the first hold's result while any hold exists, else nothing.
     pub fn status() -> TimerPeriodStatus {
-        TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner()).1
+        let holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
+        if holders.count == 0 {
+            TimerPeriodStatus::default()
+        } else {
+            holders.applied
+        }
     }
 }
 
 impl Drop for TimerPeriod {
     fn drop(&mut self) {
         let mut holders = TIMER_HOLDERS.lock().unwrap_or_else(|p| p.into_inner());
-        holders.0 = holders.0.saturating_sub(1);
-        if holders.0 == 0 {
-            if holders.1.period_1ms {
+        holders.count = holders.count.saturating_sub(1);
+        if holders.count == 0 {
+            if holders.applied.period_1ms {
                 // SAFETY: ends the period begun by the first hold.
                 unsafe { windows::Win32::Media::timeEndPeriod(1) };
             }
-            if holders.1.throttling_opt_out {
-                honour_timer_resolution(false);
+            if let Some(saved) = holders.saved.take() {
+                let current = throttling_state().unwrap_or(throttling_with(saved, TIMER_BIT, None));
+                set_throttling_state(throttling_with(current, TIMER_BIT, Some(saved)));
             }
+            holders.applied = TimerPeriodStatus::default();
         }
     }
 }

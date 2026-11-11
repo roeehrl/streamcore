@@ -11,11 +11,14 @@ use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 pub enum Entry {
     /// A WGC frame, held (so WGC cannot reuse its buffer) until `release` and until the
-    /// converter's fence reaches `read_until` (0: no convert has read it).
+    /// converter's fence reaches `read_until` (0: no convert has read it). `content` is the
+    /// image's size within the texture: smaller when the source shrank and the pool still has
+    /// the old size, so only the top-left part of the texture holds the image.
     Capture {
         texture: ID3D11Texture2D,
         frame: Direct3D11CaptureFrame,
         read_until: u64,
+        content: (u32, u32),
     },
     /// An NV12 pool slot of the converter, complete when the device fence reaches `fence`.
     Converted {
@@ -48,10 +51,12 @@ impl Surfaces {
         self.lock().insert(entry)
     }
 
-    /// A capture surface's texture.
-    pub fn capture_texture(&self, id: u64) -> Option<ID3D11Texture2D> {
+    /// A capture surface's texture and the size of the image in it.
+    pub fn capture_texture(&self, id: u64) -> Option<(ID3D11Texture2D, (u32, u32))> {
         match self.lock().get(id)? {
-            Entry::Capture { texture, .. } => Some(texture.clone()),
+            Entry::Capture {
+                texture, content, ..
+            } => Some((texture.clone(), *content)),
             Entry::Converted { .. } => None,
         }
     }
@@ -76,7 +81,9 @@ impl Surfaces {
         }
     }
 
-    /// The converter fence completed `value` (fence thread): frees the entries it was holding.
+    /// The converter fence has completed `value` (fence thread, which passes only what the GPU
+    /// has reached): frees the entries it was holding. Entries a convert still reads stay until
+    /// a later `reap` or, at the latest, until the table is dropped.
     pub fn reap(&self, value: u64) {
         let done: Vec<Entry> = {
             let mut deferred = self.deferred.lock().unwrap_or_else(|p| p.into_inner());

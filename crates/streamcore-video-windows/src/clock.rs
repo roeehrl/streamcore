@@ -27,9 +27,51 @@ pub fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+/// A process power-throttling state, `(ControlMask, StateMask)`, with only `bit` changed:
+/// `restore: None` opts the process out of that throttling (set in the control mask, cleared in
+/// the state mask: "always off"), `Some(saved)` puts `bit` back as it was in `saved`. Every other
+/// policy (EcoQoS's execution speed, anything a host set) is left as `current` has it.
+pub fn throttling_with(current: (u32, u32), bit: u32, restore: Option<(u32, u32)>) -> (u32, u32) {
+    let (control, state) = current;
+    match restore {
+        None => (control | bit, state & !bit),
+        Some((saved_control, saved_state)) => (
+            (control & !bit) | (saved_control & bit),
+            (state & !bit) | (saved_state & bit),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throttling_touches_only_its_bit() {
+        const SPEED: u32 = 0x1; // EXECUTION_SPEED (EcoQoS)
+        const TIMER: u32 = 0x4; // IGNORE_TIMER_RESOLUTION
+        // A host that turned EcoQoS on: opting out of timer throttling keeps it.
+        let eco = (SPEED, SPEED);
+        let held = throttling_with(eco, TIMER, None);
+        assert_eq!(held, (SPEED | TIMER, SPEED));
+        assert_eq!(throttling_with(held, TIMER, Some(eco)), eco);
+        // A host that had asked for timer throttling explicitly gets it back.
+        let throttled = (TIMER, TIMER);
+        let held = throttling_with(throttled, TIMER, None);
+        assert_eq!(held, (TIMER, 0));
+        assert_eq!(throttling_with(held, TIMER, Some(throttled)), throttled);
+        // A change the host made to another policy while held survives the restore.
+        let changed = (held.0 | SPEED, held.1 | SPEED);
+        assert_eq!(
+            throttling_with(changed, TIMER, Some(throttled)),
+            (TIMER | SPEED, TIMER | SPEED)
+        );
+        // The default (system decides) round-trips to the default.
+        assert_eq!(
+            throttling_with(throttling_with((0, 0), TIMER, None), TIMER, Some((0, 0))),
+            (0, 0)
+        );
+    }
 
     #[test]
     fn ten_megahertz_is_exact() {

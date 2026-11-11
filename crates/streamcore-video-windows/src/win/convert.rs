@@ -13,6 +13,7 @@ use super::sys::com::{Event, Wake, now_ns, wait};
 use super::sys::d3d::{Fence, Gpu, Readback, texture_size};
 use super::sys::vp::{DestRect, VideoProcessor, letterbox};
 use crate::barcode;
+use crate::geometry;
 use crate::trace::Recorder;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -140,7 +141,8 @@ impl VpConverter {
         lock(&self.pipeline).as_ref().map_or(0, |p| p.vp.copies)
     }
 
-    /// Stops the fence thread after the stream has closed.
+    /// Stops the fence thread after the stream has closed and waits for it (up to a second per
+    /// value still pending on a lost device): call it on no executor.
     pub fn shutdown(&self) {
         let (tx, join) = {
             let mut t = lock(&self.thread);
@@ -207,27 +209,29 @@ fn fence_main(
     surfaces: &Surfaces,
 ) {
     while let Ok(w) = rx.recv() {
-        if fence.completed() < w.value {
-            if fence.notify(w.value, event).is_err() {
-                continue;
-            }
+        if fence.completed() < w.value && fence.notify(w.value, event).is_ok() {
             // Bounded: a lost device must not wedge the thread.
             while fence.completed() < w.value {
-                if wait(&[event.raw()], 1000) == Wake::Timeout && fence.completed() < w.value {
+                if wait(&[event.raw()], 1000) == Wake::Timeout {
                     break;
                 }
             }
         }
         let at = now_ns();
-        if let Some(r) = recorder {
+        // What the GPU has actually finished: after a timeout (a TDR in progress) the blit may
+        // still read its capture frames, so they stay open until a later value completes or
+        // the slot table is dropped. A removed device's fence reads as complete.
+        let completed = fence.completed();
+        let reached = completed >= w.value;
+        if reached && let Some(r) = recorder {
             r.fence_done(w.value, at);
         }
-        // Capture frames released while this blit read them close now. After a timeout (a lost
-        // device) the GPU will not read them either.
-        surfaces.reap(w.value);
+        // Capture frames released while this blit read them close now.
+        surfaces.reap(completed);
         if let Some((rb, strip)) = w.readback {
-            // The copy was recorded before the signal, so it is complete now.
-            if let (Ok(Some(row)), Some(r)) = (rb.try_read_row(gpu), recorder)
+            // The copy was recorded before the signal, so it is complete once the value is.
+            if reached
+                && let (Ok(Some(row)), Some(r)) = (rb.try_read_row(gpu), recorder)
                 && let Some(counter) = decode_row(&row, strip)
             {
                 r.counter(w.value, counter);
@@ -242,11 +246,14 @@ impl Converter for VpConverter {
         if job.format != PixelFormat::Nv12 {
             return Err(MediaError::Unsupported);
         }
-        let source = self
+        let (source, content) = self
             .surfaces
             .capture_texture(input)
             .ok_or(MediaError::InvalidSettings)?;
         let in_size = texture_size(&source);
+        // The image may fill only part of the texture (a source that shrank before the pool
+        // was recreated).
+        let image = (content.0.min(in_size.0), content.1.min(in_size.1));
         let out_size = (job.width & !1, job.height & !1);
         let strip = *lock(&self.strip);
         let mut guard = lock(&self.pipeline);
@@ -259,7 +266,9 @@ impl Converter for VpConverter {
         pipeline
             .vp
             .set_output_colour(job.color.matrix == YCbCrMatrix::Bt601, job.color.full_range);
-        pipeline.vp.set_source(job.source.map(|r| crop(r, in_size)));
+        pipeline
+            .vp
+            .set_source(source_rect(job.source, image, in_size));
         let view = pipeline.slots[index].view;
         pipeline
             .vp
@@ -333,20 +342,28 @@ impl Converter for VpConverter {
 
 impl Drop for VpConverter {
     fn drop(&mut self) {
-        self.shutdown();
+        // Close the channel and let the fence thread finish what is queued and exit on its own:
+        // joining here could wait a second per pending value on a lost device, and the last
+        // reference may be dropped on an executor. `shutdown` joins, off any executor.
+        drop(lock(&self.thread).tx.take());
     }
 }
 
-/// A job's source rect clamped into the input, with an even origin and size of at least 2 × 2.
-pub fn crop(r: Rect, input: (u32, u32)) -> DestRect {
-    let x = (r.x & !1).min(input.0.saturating_sub(2));
-    let y = (r.y & !1).min(input.1.saturating_sub(2));
-    DestRect {
-        left: x,
-        top: y,
-        width: (r.width & !1).clamp(2, (input.0 - x) & !1),
-        height: (r.height & !1).clamp(2, (input.1 - y) & !1),
-    }
+/// The part of the input the video processor reads: the job's source rect clamped into the
+/// image (even origin and size, `geometry::crop`), the whole image when it fills only part of
+/// the texture, or `None` for the whole texture.
+fn source_rect(job: Option<Rect>, image: (u32, u32), texture: (u32, u32)) -> Option<DestRect> {
+    let (left, top, width, height) = match job {
+        Some(r) => geometry::crop(r.x, r.y, r.width, r.height, image),
+        None if image != texture => geometry::crop(0, 0, image.0, image.1, image),
+        None => return None,
+    };
+    Some(DestRect {
+        left,
+        top,
+        width,
+        height,
+    })
 }
 
 /// Decodes a barcode from a luma row.

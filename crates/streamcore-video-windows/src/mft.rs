@@ -78,9 +78,14 @@ impl<S, M> MftBook<S, M> {
         self.max_in_encoder = self.max_in_encoder.max(self.in_encoder.len());
     }
 
-    /// `ProcessInput` failed for `time`: its metadata comes back (the frame is dropped).
-    pub fn input_failed(&mut self, time: i64) -> Option<M> {
+    /// `ProcessInput` failed for `time`: its metadata comes back (the frame is dropped). With
+    /// `keep_credit` the `NeedInput` credit it took is given back: the MFT did not take the
+    /// input, so it will not send another `NeedInput` for that slot.
+    pub fn input_failed(&mut self, time: i64, keep_credit: bool) -> Option<M> {
         let at = self.in_encoder.iter().rposition(|(t, _)| *t == time)?;
+        if keep_credit {
+            self.credits += 1;
+        }
         self.in_encoder.remove(at).map(|(_, m)| m)
     }
 
@@ -184,14 +189,39 @@ mod tests {
         let mut b: MftBook<(), u64> = MftBook::default();
         let _ = b.need_input();
         let _ = b.submit(10, (), 1);
-        assert_eq!(b.input_failed(10), Some(1));
-        assert_eq!(b.input_failed(10), None);
+        assert_eq!(b.input_failed(10, false), Some(1));
+        assert_eq!(b.input_failed(10, false), None);
+        assert_eq!(b.credits(), 0);
         let _ = b.need_input();
         let _ = b.submit(20, (), 2);
         b.input_accepted();
         let _ = b.submit(30, (), 3); // held
         assert_eq!(b.take_all(), vec![2, 3]);
         assert_eq!(b.take_all(), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn failed_input_keeps_its_credit() {
+        let mut b: MftBook<&str, u64> = MftBook::default();
+        let _ = b.need_input();
+        assert_eq!(b.submit(10, "s1", 1), (Accept::Now("s1"), None));
+        assert_eq!(b.credits(), 0);
+        // A non-fatal ProcessInput failure gives the credit back...
+        assert_eq!(b.input_failed(10, true), Some(1));
+        assert_eq!(b.credits(), 1);
+        // ...so the next input goes in at once instead of waiting for a NeedInput that never
+        // comes.
+        assert_eq!(b.submit(20, "s2", 2), (Accept::Now("s2"), None));
+        b.input_accepted();
+        // An unknown time changes nothing.
+        assert_eq!(b.input_failed(99, true), None);
+        assert_eq!(b.credits(), 0);
+        // A held input fed on NeedInput that fails keeps that credit too.
+        assert_eq!(b.submit(30, "s3", 3), (Accept::Held, None));
+        assert_eq!(b.need_input(), Some("s3"));
+        assert_eq!(b.input_failed(30, true), Some(3));
+        assert_eq!(b.credits(), 1);
+        assert_eq!(b.take_all(), vec![2]);
     }
 
     #[test]

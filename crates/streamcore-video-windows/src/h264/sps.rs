@@ -161,7 +161,11 @@ fn skip_scaling_list(b: &mut Bits<'_>, size: usize) -> Option<()> {
     let mut next = 8i32;
     for _ in 0..size {
         if next != 0 {
+            // delta_scale is -128..=127 (7.4.2.1.1.1); anything else is a corrupt SPS.
             let delta = b.se()?;
+            if !(-128..=127).contains(&delta) {
+                return None;
+            }
             next = (last + delta + 256) % 256;
         }
         last = if next == 0 { last } else { next };
@@ -194,6 +198,8 @@ struct VuiLayout {
     restriction: (usize, usize),
     /// The restriction's motion-vector fields, kept by the normaliser.
     mv: Option<(bool, u32, u32, u32, u32)>,
+    /// The encoder's `video_format`, kept by the normaliser.
+    video_format: Option<u32>,
 }
 
 fn parse_vui(b: &mut Bits<'_>, layout: &mut VuiLayout) -> Option<Vui> {
@@ -211,7 +217,7 @@ fn parse_vui(b: &mut Bits<'_>, layout: &mut VuiLayout) -> Option<Vui> {
     }
     let signal_start = b.pos;
     if b.flag()? {
-        b.bits(3)?; // video_format
+        layout.video_format = Some(b.bits(3)?);
         let full = b.flag()?;
         let mut cd = ColourDescription {
             video_full_range: full,
@@ -314,8 +320,8 @@ fn parse_with_layout(nal: &[u8]) -> Option<(Sps, Layout)> {
     }
     let max_num_ref_frames = b.ue()?;
     b.flag()?; // gaps_in_frame_num_value_allowed
-    let width_mbs = b.ue()? + 1;
-    let height_map_units = b.ue()? + 1;
+    let width_mbs = b.ue()?.checked_add(1)?;
+    let height_map_units = b.ue()?.checked_add(1)?;
     let frame_mbs_only = b.flag()?;
     if !frame_mbs_only {
         b.flag()?;
@@ -344,16 +350,21 @@ fn parse_with_layout(nal: &[u8]) -> Option<(Sps, Layout)> {
         2 => (2, 1),
         _ => (1, 1),
     };
-    let frame_height_factor = if frame_mbs_only { 1 } else { 2 };
-    let crop_unit_x = if chroma_array_type == 0 { 1 } else { sub_w };
-    let crop_unit_y = if chroma_array_type == 0 {
+    let frame_height_factor: u32 = if frame_mbs_only { 1 } else { 2 };
+    let crop_unit_x: u32 = if chroma_array_type == 0 { 1 } else { sub_w };
+    let crop_unit_y: u32 = if chroma_array_type == 0 {
         frame_height_factor
     } else {
         sub_h * frame_height_factor
     };
-    let width = (width_mbs * 16).saturating_sub(crop_unit_x * (crop.0 + crop.1));
-    let height = (height_map_units * 16 * frame_height_factor)
-        .saturating_sub(crop_unit_y * (crop.2 + crop.3));
+    // Checked: a crafted SPS must not overflow (it is parsed on the encoder's event thread).
+    let crop_x = crop_unit_x.checked_mul(crop.0.checked_add(crop.1)?)?;
+    let crop_y = crop_unit_y.checked_mul(crop.2.checked_add(crop.3)?)?;
+    let width = width_mbs.checked_mul(16)?.saturating_sub(crop_x);
+    let height = height_map_units
+        .checked_mul(16)?
+        .checked_mul(frame_height_factor)?
+        .saturating_sub(crop_y);
     let sps = Sps {
         profile_idc,
         constraint_flags,
@@ -393,8 +404,9 @@ impl Sps {
 
 /// Rewrites an SPS so its VUI states `colour` and declares zero reordering
 /// (`max_num_reorder_frames = 0`, `max_dec_frame_buffering = max_num_ref_frames`). Everything
-/// else is kept bit for bit: the fields before the VUI, aspect ratio, overscan, chroma location,
-/// timing, HRD and `pic_struct_present_flag`. Returns the NAL unit unchanged when it already
+/// else is kept bit for bit: the fields before the VUI, aspect ratio, overscan, `video_format`
+/// (5, unspecified, when the encoder wrote no `video_signal_type`), chroma location, timing, HRD
+/// and `pic_struct_present_flag`. Returns the NAL unit unchanged when it already
 /// says both, and `None` when it cannot be parsed.
 pub fn normalize(nal: &[u8], colour: Colour) -> Option<Vec<u8>> {
     let (sps, (rbsp, vui_flag, layout)) = parse_with_layout(nal)?;
@@ -412,7 +424,8 @@ pub fn normalize(nal: &[u8], colour: Colour) -> Option<Vec<u8>> {
         }
     }
     w.flag(true); // video_signal_type_present_flag
-    w.bits(3, 5); // video_format: unspecified
+    // video_format: the encoder's, else 5 (unspecified).
+    w.bits(3, layout.and_then(|l| l.video_format).unwrap_or(5));
     w.flag(colour.full_range);
     w.flag(true); // colour_description_present_flag
     w.bits(8, u32::from(colour.primaries));
@@ -610,6 +623,106 @@ pub(crate) mod tests {
         assert!(sps.declares_zero_reorder());
         // Already normal: returned unchanged.
         assert_eq!(normalize(&out, srgb), Some(out.clone()));
+    }
+
+    /// A Main SPS with the given size fields and cropping, no VUI.
+    fn crafted(
+        width_mbs_minus1: u32,
+        height_minus1: u32,
+        frame_mbs_only: bool,
+        crop: [u32; 4],
+    ) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.bits(8, 77);
+        w.bits(8, 0);
+        w.bits(8, 40);
+        w.ue(0);
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(2); // poc type 2
+        w.ue(1); // refs
+        w.flag(false);
+        w.ue(width_mbs_minus1);
+        w.ue(height_minus1);
+        w.flag(frame_mbs_only);
+        if !frame_mbs_only {
+            w.flag(false); // mb_adaptive_frame_field
+        }
+        w.flag(true); // direct_8x8
+        w.flag(true); // cropping
+        for c in crop {
+            w.ue(c);
+        }
+        w.flag(false); // no VUI
+        let mut nal = vec![0x67];
+        nal.extend(escape(&w.finish()));
+        nal
+    }
+
+    #[test]
+    fn crafted_sizes_do_not_overflow() {
+        const MAX: u32 = u32::MAX - 1; // the largest ue(v) the parser reads
+        // width_mbs * 16 and height * 16 * 2 overflow.
+        assert!(parse(&crafted(MAX, 0, true, [0; 4])).is_none());
+        assert!(parse(&crafted(0, MAX, true, [0; 4])).is_none());
+        assert!(parse(&crafted(0, 1 << 28, false, [0; 4])).is_none());
+        // The crop offsets' sum and the crop unit times the sum overflow.
+        assert!(parse(&crafted(0, 0, true, [MAX, MAX, 0, 0])).is_none());
+        assert!(parse(&crafted(0, 0, true, [1 << 31, 0, 0, 0])).is_none());
+        assert!(parse(&crafted(0, 0, false, [0, 0, 1 << 30, 0])).is_none());
+        // Normalising them fails the same way instead of panicking.
+        assert!(normalize(&crafted(MAX, 0, true, [0; 4]), BT709).is_none());
+        // In range, a crop larger than the picture clamps to zero.
+        let sps = parse(&crafted(0, 0, true, [100, 0, 0, 0])).unwrap_or_default();
+        assert_eq!((sps.width, sps.height), (0, 16));
+    }
+
+    #[test]
+    fn crafted_scaling_list_delta_is_rejected() {
+        let mut w = Writer::default();
+        w.bits(8, 100); // High
+        w.bits(8, 0);
+        w.bits(8, 40);
+        w.ue(0);
+        w.ue(1); // 4:2:0
+        w.ue(0);
+        w.ue(0);
+        w.flag(false);
+        w.flag(true); // seq_scaling_matrix_present
+        w.flag(true); // list 0 present
+        w.ue(u32::MAX - 1); // delta_scale = se(+2^31 - 1)
+        let mut nal = vec![0x67];
+        nal.extend(escape(&w.finish()));
+        assert!(parse(&nal).is_none());
+    }
+
+    #[test]
+    fn normalize_keeps_video_format() {
+        let mut nal = build(100, true, Some(2));
+        // build() writes video_format 5; make it 2 (MAC) in place: the first 3 bits after the
+        // aspect and overscan flags. Re-parse to find them rather than hard-coding offsets.
+        let (_, (mut rbsp, _, layout)) = parse_with_layout(&nal).unwrap_or_default();
+        let at = layout.map(|l| l.signal.0 + 1).unwrap_or_default();
+        for (i, bit) in [0u8, 1, 0].into_iter().enumerate() {
+            let pos = at + i;
+            let mask = 1 << (7 - (pos % 8));
+            if bit == 1 {
+                rbsp[pos / 8] |= mask;
+            } else {
+                rbsp[pos / 8] &= !mask;
+            }
+        }
+        nal = vec![0x67];
+        nal.extend(escape(&rbsp));
+        let (_, (_, _, before)) = parse_with_layout(&nal).unwrap_or_default();
+        assert_eq!(before.and_then(|l| l.video_format), Some(2));
+        let out = normalize(&nal, BT709).unwrap_or_default();
+        let (sps, (_, _, after)) = parse_with_layout(&out).unwrap_or_default();
+        assert_eq!(after.and_then(|l| l.video_format), Some(2));
+        assert!(sps.declares_zero_reorder());
+        // No video_signal_type in the input: 5 (unspecified) is written.
+        let out = normalize(&build(77, false, None), BT709).unwrap_or_default();
+        let (_, (_, _, after)) = parse_with_layout(&out).unwrap_or_default();
+        assert_eq!(after.and_then(|l| l.video_format), Some(5));
     }
 
     #[test]

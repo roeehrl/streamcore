@@ -247,6 +247,8 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         std::thread::sleep(Duration::from_nanos(end_at.saturating_sub(now_ns())));
     }
     let stats = controller.stats();
+    // Read while the capture still holds the timer period (nothing is held after close).
+    let timer = super::timer_report(options.timer_period);
     let outcome = controller.close_and_wait(10_000);
     notes.push(format!("close: {outcome:?}"));
     drop(controller);
@@ -262,8 +264,11 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
             _ => {}
         }
     }
-    // Give the MFT event threads a moment to finish after shutdown.
-    std::thread::sleep(Duration::from_millis(200));
+    // The closed stream dropped its encoders: wait until their MFTs are shut down and their
+    // event threads joined, so the session counters below are final.
+    if !factory.wait_sessions(Duration::from_secs(10)) {
+        errors.push("encoder sessions still shutting down 10 s after close".into());
+    }
     let leaked = surfaces.len();
     if leaked > 0 {
         errors.push(format!("{leaked} surfaces still leased after close"));
@@ -343,7 +348,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         permit_target: permits,
         pool_buffers: buffers,
         min_update_interval_set: min_interval_ns > 0,
-        timer: super::timer_report(options.timer_period),
+        timer,
         encoder: session.setup.clone().unwrap_or_default(),
         min_inputs_before_output_probe: min_inputs,
         inputs_before_first_output: session.inputs_before_first_output,

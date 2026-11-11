@@ -10,6 +10,17 @@
 //! form, hands the bytes to the sink and posts `encoded` at once (R1). It touches no stream state
 //! (reentrancy rule 4) and holds no lock while it posts.
 //!
+//! Failures. A failed event, a failed `ProcessOutput`, a `GetEvent` that keeps failing or a lost
+//! device ends the session: the event thread drops every frame still in the encoder (the oldest
+//! with `DeviceLost` or `EncoderFailed { recoverable: false }`, so the stream reacts once), later
+//! submits fail with the same error, and the thread exits. A `ProcessInput` that fails otherwise
+//! loses its frame but not its `NeedInput` credit.
+//!
+//! Teardown. Dropping the encoder hands `END_STREAMING`, `IMFShutdown` and `ShutdownObject` to an
+//! `mft-shutdown` thread, which then joins the event thread and releases the MFT last, so the
+//! executor never waits on the driver (VIDEO-THREADING "Dropping native objects").
+//! `MfEncoderFactory::wait_sessions` waits for those threads (the bench, after close).
+//!
 //! Fencing. `submit` makes the device wait (on the GPU) for the converter's fence value before
 //! `ProcessInput`, so the MFT never reads a half-written NV12 texture; the MFT uses the stream's
 //! device through its DXGI device manager, so the wait orders its reads.
@@ -27,7 +38,8 @@ use crate::trace::Recorder;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use streamcore_media::stream::VideoWorkPermit;
 use streamcore_video::bitstream::annexb_to_length_prefixed;
 use streamcore_video::{
@@ -92,6 +104,8 @@ pub struct MfEncoderFactory {
     /// From the probe; reported in `EncoderCaps`.
     min_inputs_before_output: Option<u64>,
     stats: Arc<Mutex<SessionStats>>,
+    /// The `mft-shutdown` threads of dropped sessions.
+    closers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl MfEncoderFactory {
@@ -109,11 +123,39 @@ impl MfEncoderFactory {
             recorder,
             min_inputs_before_output,
             stats: Arc::default(),
+            closers: Arc::default(),
         })
     }
 
     pub fn stats(&self) -> SessionStats {
         lock(&self.stats).clone()
+    }
+
+    /// Waits up to `timeout` until every dropped session is shut down (its MFT shut down, its
+    /// event thread joined, its last references released). Blocks: call it on no executor (the
+    /// bench calls it after the stream closed). Returns whether all of them finished.
+    pub fn wait_sessions(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (done, left) = {
+                let mut closers = lock(&self.closers);
+                let (done, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *closers)
+                    .into_iter()
+                    .partition(|h| h.is_finished());
+                *closers = rest;
+                (done, closers.len())
+            };
+            for h in done {
+                let _ = h.join();
+            }
+            if left == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -201,12 +243,13 @@ impl EncoderFactory for MfEncoderFactory {
             input: Mutex::new(()),
             book: Mutex::new(MftBook::default()),
             accepted: Mutex::new(HashMap::new()),
+            failure: Mutex::new(None),
             wants_ready: AtomicBool::new(false),
             invalidated: AtomicBool::new(false),
             next_token: AtomicU64::new(1),
         });
         let thread_inner = inner.clone();
-        std::thread::Builder::new()
+        let events_thread = std::thread::Builder::new()
             .name("mft-events".into())
             .spawn(move || {
                 let _apartment = Apartment::mta();
@@ -216,7 +259,12 @@ impl EncoderFactory for MfEncoderFactory {
                 inner.encoder.shutdown();
                 MediaError::OutOfResources
             })?;
-        Ok(Arc::new(MfEncoder { inner }))
+        Ok(Arc::new(MfEncoder {
+            info: inner.info.clone(),
+            inner: Some(inner),
+            events_thread: Some(events_thread),
+            closers: self.closers.clone(),
+        }))
     }
 }
 
@@ -233,6 +281,8 @@ struct Input {
     sample_time: i64,
     surface: SurfaceId,
     seq: u64,
+    /// Ask for an IDR right before this input enters the MFT (not before it is held).
+    keyframe: bool,
 }
 
 struct Inner {
@@ -253,6 +303,8 @@ struct Inner {
     book: Mutex<MftBook<Input, Meta>>,
     /// H3 per sequence, for the output's `EncodeTimings`.
     accepted: Mutex<HashMap<u64, u64>>,
+    /// Set by a fatal error: every later submit fails with it.
+    failure: Mutex<Option<MediaError>>,
     /// A submit was refused with `Busy`: call `input_ready` at the next `NeedInput`.
     wants_ready: AtomicBool,
     invalidated: AtomicBool,
@@ -260,9 +312,15 @@ struct Inner {
 }
 
 impl Inner {
-    /// `ProcessInput` for an input whose credit was taken; returns false on failure (the frame
-    /// is then dropped).
+    /// `ProcessInput` for an input whose credit was taken, with its keyframe request applied
+    /// first; returns false on failure (the frame is then dropped). A failure that is not fatal
+    /// gives the credit back: the MFT did not take the input and sends no new `NeedInput` for it.
     fn feed(&self, input: &Input, time: i64) -> bool {
+        if input.keyframe && self.encoder.force_keyframe().is_err() {
+            lock(&self.stats)
+                .errors
+                .push("AVEncVideoForceKeyFrame refused".into());
+        }
         match self.encoder.process_input(&input.sample) {
             Ok(()) => {
                 let h3 = now_ns();
@@ -273,9 +331,22 @@ impl Inner {
                 }
                 true
             }
+            Err(_) if self.encoder.is_closing() || self.invalidated.load(Ordering::Acquire) => {
+                // Teardown: the frame's output was being discarded anyway.
+                let meta = lock(&self.book).input_failed(time, false);
+                if let Some(meta) = meta {
+                    self.drop_frame(meta, DropReason::NoOutput);
+                }
+                false
+            }
+            Err(e) if mf::is_device_lost(e.code()) => {
+                self.fail(mf::Failure::new(e.code(), format!("ProcessInput: {e}")));
+                false
+            }
             Err(e) => {
-                lock(&self.stats).errors.push(format!("ProcessInput: {e}"));
-                let meta = lock(&self.book).input_failed(time);
+                self.record_error(format!("ProcessInput: {e}"));
+                let keep_credit = !mf::is_not_accepting(&e);
+                let meta = lock(&self.book).input_failed(time, keep_credit);
                 if let Some(meta) = meta {
                     self.drop_frame(
                         meta,
@@ -317,7 +388,20 @@ impl Inner {
         let split = split_access_unit(&out.bytes);
         let keyframe = out.keyframe || split.idr;
         let mut config_token = None;
-        if let (Some(sps_nal), Some(pps)) = (&split.sps, &split.pps) {
+        // An encoder that keeps SPS and PPS out of its keyframes has them in the output type.
+        let header = (keyframe && (split.sps.is_none() || split.pps.is_none()))
+            .then(|| self.encoder.sequence_header())
+            .flatten()
+            .map(|h| split_access_unit(&h));
+        let sps_nal = split
+            .sps
+            .as_ref()
+            .or(header.as_ref().and_then(|h| h.sps.as_ref()));
+        let pps = split
+            .pps
+            .as_ref()
+            .or(header.as_ref().and_then(|h| h.pps.as_ref()));
+        if let (Some(sps_nal), Some(pps)) = (sps_nal, pps) {
             let normalized = sps::normalize(sps_nal, self.colour);
             {
                 let mut s = lock(&self.stats);
@@ -379,6 +463,43 @@ impl Inner {
         }
     }
 
+    fn record_error(&self, error: String) {
+        let mut s = lock(&self.stats);
+        if s.errors.len() < 50 {
+            s.errors.push(error);
+        }
+    }
+
+    /// A fatal MFT error. Later submits fail with it; every frame in the encoder is dropped, the
+    /// oldest with the error (`DeviceLost` rebuilds the encoder, `EncoderFailed { recoverable:
+    /// false }` fails the stream) and the rest as no-output; with nothing in flight,
+    /// `input_ready` makes the stream submit again and meet the error.
+    fn fail(&self, failure: mf::Failure) {
+        self.record_error(failure.message);
+        let error = if failure.device_lost {
+            MediaError::DeviceLost
+        } else {
+            MediaError::EncoderFailed { recoverable: false }
+        };
+        {
+            let mut slot = lock(&self.failure);
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(error.clone());
+        }
+        let metas = lock(&self.book).take_all();
+        lock(&self.accepted).clear();
+        let reported = !metas.is_empty();
+        let mut reason = Some(DropReason::Error { error });
+        for m in metas {
+            self.drop_frame(m, reason.take().unwrap_or(DropReason::NoOutput));
+        }
+        if !reported && !self.invalidated.load(Ordering::Acquire) {
+            self.events.input_ready();
+        }
+    }
+
     /// Every frame still in the encoder: posted as dropped, permits released.
     fn abandon_all(&self) {
         let metas = lock(&self.book).take_all();
@@ -395,11 +516,9 @@ fn event_main(inner: &Inner, pump: &mf::EventPump) {
             MfEvent::NeedInput => inner.on_need_input(),
             MfEvent::Output(o) => inner.on_output(o),
             MfEvent::DrainComplete | MfEvent::NoOutput | MfEvent::Other(_) => {}
-            MfEvent::Error(e) => {
-                let mut s = lock(&inner.stats);
-                if s.errors.len() < 50 {
-                    s.errors.push(e);
-                }
+            MfEvent::Failed(f) => {
+                inner.fail(f);
+                break;
             }
             MfEvent::Shutdown => break,
         }
@@ -413,22 +532,61 @@ fn event_main(inner: &Inner, pump: &mf::EventPump) {
     s.max_in_encoder = s.max_in_encoder.max(book.max_in_encoder() as u64);
 }
 
-/// The handle the stream holds. Dropping it shuts the MFT down; the event thread then sees
-/// `MF_E_SHUTDOWN`, abandons what is left and exits.
+/// The handle the stream holds. Dropping it hands the MFT's shutdown to an `mft-shutdown`
+/// thread; the event thread then sees `MF_E_SHUTDOWN`, abandons what is left and exits, and the
+/// shutdown thread joins it and releases the session last.
 pub struct MfEncoder {
-    inner: Arc<Inner>,
+    info: EncoderInfo,
+    /// `None` only once `drop` has handed the session to its shutdown thread.
+    inner: Option<Arc<Inner>>,
+    events_thread: Option<JoinHandle<()>>,
+    closers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
+
+type Job = Box<dyn FnOnce() + Send>;
 
 impl Drop for MfEncoder {
     fn drop(&mut self) {
-        self.inner.invalidated.store(true, Ordering::Release);
-        self.inner.encoder.shutdown();
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        inner.invalidated.store(true, Ordering::Release);
+        let events_thread = self.events_thread.take();
+        let close: Job = Box::new(move || {
+            let _apartment = Apartment::mta();
+            inner.encoder.shutdown();
+            if let Some(t) = events_thread {
+                let _ = t.join();
+            }
+            // The last references to the MFT and its device manager go here, off the executor.
+            drop(inner);
+        });
+        let job = Arc::new(Mutex::new(Some(close)));
+        let thread_job = job.clone();
+        let spawned = std::thread::Builder::new()
+            .name("mft-shutdown".into())
+            .spawn(move || {
+                let close = lock(&thread_job).take();
+                if let Some(close) = close {
+                    close();
+                }
+            });
+        match spawned {
+            Ok(handle) => lock(&self.closers).push(handle),
+            Err(_) => {
+                // No thread to be had: shutting down here is the only way not to leak the session.
+                let close = lock(&job).take();
+                if let Some(close) = close {
+                    close();
+                }
+            }
+        }
     }
 }
 
 impl StreamEncoder for MfEncoder {
     fn info(&self) -> EncoderInfo {
-        self.inner.info.clone()
+        self.info.clone()
     }
 
     fn submit(
@@ -437,7 +595,14 @@ impl StreamEncoder for MfEncoder {
         opts: SubmitOpts,
         permit: Arc<VideoWorkPermit>,
     ) -> SubmitResult {
-        let inner = &self.inner;
+        let Some(inner) = &self.inner else {
+            return SubmitResult::Failed {
+                error: MediaError::Internal,
+            };
+        };
+        if let Some(error) = lock(&inner.failure).clone() {
+            return SubmitResult::Failed { error };
+        }
         if inner.invalidated.load(Ordering::Acquire) {
             return SubmitResult::Failed {
                 error: MediaError::Internal,
@@ -463,16 +628,14 @@ impl StreamEncoder for MfEncoder {
                 };
             }
         };
-        if opts.force_keyframe && inner.encoder.force_keyframe().is_err() {
-            lock(&inner.stats)
-                .errors
-                .push("AVEncVideoForceKeyFrame refused".into());
-        }
+        // The keyframe request travels with the input: applied when it is fed (now, or from
+        // NeedInput if held), never for a `Busy` refusal, whose retry asks again.
         let input = Input {
             sample,
             sample_time: time,
             surface: frame,
             seq: opts.submit_seq,
+            keyframe: opts.force_keyframe,
         };
         let meta = Meta {
             seq: opts.submit_seq,
@@ -501,7 +664,8 @@ impl StreamEncoder for MfEncoder {
     }
 
     fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError> {
-        self.inner
+        let inner = self.inner.as_ref().ok_or(MediaError::Internal)?;
+        inner
             .encoder
             .set_bitrate(u32::try_from(update.bitrate_bps).unwrap_or(u32::MAX))
             .map_err(|_| MediaError::Unsupported)
@@ -509,14 +673,22 @@ impl StreamEncoder for MfEncoder {
 
     fn invalidate(&self) {
         // Discard pending output (`COMMAND_FLUSH`), bounded: a flush that hangs is left on its
-        // helper thread and the stream reports EncoderFailed.
-        self.inner.invalidated.store(true, Ordering::Release);
-        let inner = self.inner.clone();
-        let _ = run_bounded(Duration::from_millis(450), move || {
+        // helper thread, and this session's frames are dropped (their permits released) now, so
+        // a hung flush does not hold admission.
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        inner.invalidated.store(true, Ordering::Release);
+        let helper = inner.clone();
+        let finished = run_bounded(Duration::from_millis(450), move || {
             let _apartment = Apartment::mta();
-            let _ = inner.encoder.flush();
-            inner.abandon_all();
+            let _ = helper.encoder.flush();
+            helper.abandon_all();
         });
+        if !finished {
+            inner.record_error("MFT flush did not finish within 450 ms".into());
+            inner.abandon_all();
+        }
     }
 }
 
