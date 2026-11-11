@@ -9,6 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use streamcore_media::media::VideoMetadata;
 use streamcore_media::stream::VideoWorkPermit;
+use streamcore_video::native;
 use streamcore_video::*;
 
 pub const CAPTURE: CaptureId = 7;
@@ -594,6 +595,21 @@ impl Encoder for FakeEncoder {
         opts: SubmitOpts,
         permit: Arc<VideoWorkPermit>,
     ) -> SubmitResult {
+        self.accept(opts, Some(permit))
+    }
+    fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError> {
+        let _call = self.log.outbound();
+        lock(&self.rates).push(update);
+        Ok(())
+    }
+    fn invalidate(&self) {
+        self.invalidate_now();
+    }
+}
+
+impl FakeEncoder {
+    /// `submit`; through the C ABI the stream keeps the permit (`None`).
+    fn accept(&self, opts: SubmitOpts, permit: Option<Arc<VideoWorkPermit>>) -> SubmitResult {
         let _call = self.log.outbound();
         if let Some(hook) = lock(&self.on_submit).as_ref() {
             hook();
@@ -612,19 +628,15 @@ impl Encoder for FakeEncoder {
         lock(&self.pending).push(Pending {
             seq: opts.submit_seq,
             opts,
-            permit: Some(permit),
+            permit,
         });
         if self.sync_output.load(Ordering::SeqCst) {
             self.complete(opts.submit_seq);
         }
         SubmitResult::Submitted
     }
-    fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError> {
-        let _call = self.log.outbound();
-        lock(&self.rates).push(update);
-        Ok(())
-    }
-    fn invalidate(&self) {
+
+    fn invalidate_now(&self) {
         let _call = self.log.outbound();
         self.invalidated.fetch_add(1, Ordering::SeqCst);
         if *lock(&self.invalidate_mode) == InvalidateMode::Stuck {
@@ -652,6 +664,8 @@ pub struct FakeFactory {
     pub create_delay: Mutex<Duration>,
     /// `create` runs on the executor's helper thread, not on the executor.
     pub create_on_executor: AtomicUsize,
+    /// Attach each encoder's C submit (the per-frame C ABI).
+    pub native: AtomicBool,
 }
 
 impl FakeFactory {
@@ -665,6 +679,7 @@ impl FakeFactory {
             invalidate_mode: Mutex::new(InvalidateMode::Quick),
             create_delay: Mutex::new(Duration::ZERO),
             create_on_executor: AtomicUsize::new(0),
+            native: AtomicBool::new(false),
         })
     }
     pub fn encoder(&self, index: usize) -> Arc<FakeEncoder> {
@@ -721,6 +736,13 @@ impl EncoderFactory for FakeFactory {
             on_submit: Mutex::new(None),
         });
         encoders.push(encoder.clone());
+        if self.native.load(Ordering::SeqCst) {
+            assert!(native::streamcore_video_attach_encoder(
+                encoder.spec.sink.native_key(),
+                Arc::as_ptr(&encoder).cast_mut().cast(),
+                Some(glue::submit),
+            ));
+        }
         Ok(encoder)
     }
 }
@@ -785,11 +807,30 @@ pub struct Packet {
     pub bytes: Vec<u8>,
 }
 
+/// A send's completion: a UniFFI receipt, or a packet lent through the C ABI.
+#[derive(Clone)]
+pub enum Receipt {
+    Uniffi(Arc<SinkReceipt>),
+    Native(u64),
+}
+
+impl Receipt {
+    pub fn complete(&self, ok: bool) {
+        match self {
+            Receipt::Uniffi(receipt) => receipt.complete(ok),
+            Receipt::Native(key) => {
+                native::streamcore_video_packet_complete(*key, ok);
+                native::streamcore_video_packet_release(*key);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct OutState {
     pub revoked: bool,
     pub packets: Vec<Packet>,
-    pub receipts: Vec<(VideoMetadata, Arc<SinkReceipt>)>,
+    pub receipts: Vec<(VideoMetadata, Receipt)>,
 }
 
 /// The consumer's send path behind `VideoOut`: a sink lock that `revoke` also
@@ -853,6 +894,19 @@ impl FakeOut {
 
 impl VideoOut for FakeOut {
     fn send(&self, meta: VideoOutMeta, bytes: Vec<u8>, receipt: Arc<SinkReceipt>) {
+        self.accept(meta, bytes, Receipt::Uniffi(receipt));
+    }
+    fn backpressured(&self) -> bool {
+        self.pressured.load(Ordering::SeqCst)
+    }
+    fn revoke(&self) {
+        self.revokes.fetch_add(1, Ordering::SeqCst);
+        lock(&self.state).revoked = true;
+    }
+}
+
+impl FakeOut {
+    fn accept(&self, meta: VideoOutMeta, bytes: Vec<u8>, receipt: Receipt) {
         let _call = self.log.outbound();
         let refused;
         {
@@ -871,13 +925,6 @@ impl VideoOut for FakeOut {
         } else if meta.config || self.sync_receipts.load(Ordering::SeqCst) {
             receipt.complete(true);
         }
-    }
-    fn backpressured(&self) -> bool {
-        self.pressured.load(Ordering::SeqCst)
-    }
-    fn revoke(&self) {
-        self.revokes.fetch_add(1, Ordering::SeqCst);
-        lock(&self.state).revoked = true;
     }
 }
 
@@ -1173,6 +1220,41 @@ impl Manual {
         op
     }
 
+    /// A stream whose queue, capture backend, encoders and `VideoOut` make
+    /// the per-frame calls through the C ABI.
+    pub fn native() -> Self {
+        let s = Self::new();
+        s.factory.native.store(true, Ordering::SeqCst);
+        let callbacks = native::StreamCallbacks {
+            queue: Arc::as_ptr(&s.queue).cast_mut().cast(),
+            wake: Some(glue::wake),
+            capture: Arc::as_ptr(&s.capture).cast_mut().cast(),
+            release: Some(glue::release),
+            out: Arc::as_ptr(&s.out).cast_mut().cast(),
+            send: Some(glue::send),
+        };
+        assert!(native::streamcore_video_attach_stream(
+            s.queue.port.native_key(),
+            callbacks
+        ));
+        s
+    }
+
+    /// Deliver a frame through the C ABI (shaped like the last full frame),
+    /// then pump.
+    pub fn frame_native(&self, capture_ns: u64) -> SurfaceId {
+        let id = self.capture.surface(srgb(), capture_ns).id;
+        assert!(native::streamcore_video_frame(
+            self.queue.port.native_key(),
+            CAPTURE,
+            id,
+            capture_ns,
+            0
+        ));
+        self.pump();
+        id
+    }
+
     /// Deliver a frame "on the queue" (outside any drain), then pump.
     pub fn frame(&self, capture_ns: u64) -> SurfaceId {
         let id = self.capture.emit(srgb(), capture_ns);
@@ -1206,4 +1288,87 @@ pub fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send +
     });
     rx.recv_timeout(limit)
         .expect("deadlock: the call did not return in time")
+}
+
+/// The fakes behind the per-frame C ABI: each context is the fake given to
+/// the stream through `StreamParts` (or returned by `create`), which the
+/// stream keeps alive while it may call.
+#[allow(unsafe_code)]
+pub mod glue {
+    use super::*;
+    use std::ffi::c_void;
+
+    pub extern "C" fn wake(queue: *mut c_void) {
+        // SAFETY: the context is the stream's `ManualQueue`, alive for the call.
+        let queue = unsafe { &*queue.cast::<ManualQueue>() };
+        queue.wake();
+    }
+
+    pub extern "C" fn release(capture: *mut c_void, surface: u64) {
+        // SAFETY: the context is the stream's `FakeCapture`, alive for the call.
+        let capture = unsafe { &*capture.cast::<FakeCapture>() };
+        CaptureBackend::release(capture, surface);
+    }
+
+    pub extern "C" fn send(out: *mut c_void, packet: *const native::Packet) {
+        // SAFETY: the context is the stream's `FakeOut`; the packet is lent
+        // until it is released, which happens after this read.
+        let (out, packet) = unsafe { (&*out.cast::<FakeOut>(), *packet) };
+        // SAFETY: `len` bytes at `bytes` stay valid until the release.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::with_exposed_provenance::<u8>(packet.bytes),
+                packet.len,
+            )
+        }
+        .to_vec();
+        let known = |ns: u64| (ns != 0).then_some(ns);
+        let meta = VideoOutMeta {
+            header: VideoMetadata {
+                stream_id: packet.stream_id,
+                generation: packet.generation,
+                sequence: packet.sequence,
+                flags: packet.flags,
+                pts_micros: packet.pts_micros,
+            },
+            droppable: packet.droppable != 0,
+            keyframe: packet.keyframe != 0,
+            config: packet.config != 0,
+            timing: FrameTiming {
+                source_present_ns: known(packet.source_present_ns),
+                capture_ns: packet.capture_ns,
+                encode: EncodeTimings {
+                    input_ns: known(packet.encode_input_ns),
+                    output_ns: known(packet.encode_output_ns),
+                },
+            },
+        };
+        out.accept(meta, bytes, Receipt::Native(packet.key));
+    }
+
+    pub extern "C" fn submit(
+        encoder: *mut c_void,
+        _surface: u64,
+        submit_seq: u64,
+        pts_ns: u64,
+        capture_ns: u64,
+        force_keyframe: bool,
+    ) -> i32 {
+        // SAFETY: the context is the `FakeEncoder` returned by `create`, which
+        // the stream holds while it may submit.
+        let encoder = unsafe { &*encoder.cast::<FakeEncoder>() };
+        let opts = SubmitOpts {
+            submit_seq,
+            pts_ns,
+            capture_ns,
+            force_keyframe,
+        };
+        match encoder.accept(opts, None) {
+            SubmitResult::Submitted => native::SUBMITTED,
+            SubmitResult::Busy => native::SUBMIT_BUSY,
+            SubmitResult::Failed { error } => {
+                native::SUBMIT_FAILED + native::media_error_code(&error)
+            }
+        }
+    }
 }
