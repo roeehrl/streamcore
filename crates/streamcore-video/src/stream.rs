@@ -180,16 +180,8 @@ pub(crate) fn validate(spec: &CaptureSpec, plan: &StreamPlan) -> Result<(), Medi
         return Err(MediaError::InvalidSettings);
     }
     match &spec.target {
-        CaptureTarget::Region { rect, .. } => {
-            let unit = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
-            if !(unit(rect.x) && unit(rect.y) && unit(rect.width) && unit(rect.height))
-                || rect.width <= 0.0
-                || rect.height <= 0.0
-                || rect.x + rect.width > 1.0
-                || rect.y + rect.height > 1.0
-            {
-                return Err(MediaError::InvalidSettings);
-            }
+        CaptureTarget::Region { rect, .. } if !valid_region(rect) => {
+            return Err(MediaError::InvalidSettings);
         }
         // The canvas policy is a later P1 slice.
         CaptureTarget::Canvas { .. } => return Err(MediaError::Unsupported),
@@ -199,6 +191,19 @@ pub(crate) fn validate(spec: &CaptureSpec, plan: &StreamPlan) -> Result<(), Medi
         _ => {}
     }
     Ok(())
+}
+
+/// A normalized, non-empty rectangle inside its source.
+fn valid_region(rect: &NormalizedRect) -> bool {
+    let unit = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
+    unit(rect.x)
+        && unit(rect.y)
+        && unit(rect.width)
+        && unit(rect.height)
+        && rect.width > 0.0
+        && rect.height > 0.0
+        && rect.x + rect.width <= 1.0
+        && rect.y + rect.height <= 1.0
 }
 
 fn valid_surface(info: &SurfaceInfo) -> bool {
@@ -530,8 +535,8 @@ impl StreamState {
         {
             return self.reply(cx, op, Self::rejected(codes::CONFIG));
         }
-        if let Some(interval) = update.capture.region
-            && !(interval.width > 0.0 && interval.height > 0.0)
+        if let Some(region) = &update.capture.region
+            && !valid_region(region)
         {
             return self.reply(cx, op, Self::rejected(codes::CONFIG));
         }
