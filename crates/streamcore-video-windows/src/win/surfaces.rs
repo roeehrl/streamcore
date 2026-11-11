@@ -1,6 +1,8 @@
 //! The native slot table behind `SurfaceId`s (design doc 3.2), shared by the capture backend, the
-//! converter and the encoder of one device: a capture surface keeps its WGC frame until released,
-//! a converted surface names its pool slot and the fence value that completes it.
+//! converter and the encoder of one device: a capture surface keeps its WGC frame until released
+//! and until the last convert that reads it has completed on the GPU (the converter's contract:
+//! Rust's hold ends when `convert` returns), a converted surface names its pool slot and the fence
+//! value that completes it.
 
 use crate::slots::SlotTable;
 use std::sync::{Mutex, MutexGuard};
@@ -8,10 +10,12 @@ use windows::Graphics::Capture::Direct3D11CaptureFrame;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 pub enum Entry {
-    /// A WGC frame, held (so WGC cannot reuse its buffer) until `release`.
+    /// A WGC frame, held (so WGC cannot reuse its buffer) until `release` and until the
+    /// converter's fence reaches `read_until` (0: no convert has read it).
     Capture {
         texture: ID3D11Texture2D,
         frame: Direct3D11CaptureFrame,
+        read_until: u64,
     },
     /// An NV12 pool slot of the converter, complete when the device fence reaches `fence`.
     Converted {
@@ -21,9 +25,18 @@ pub enum Entry {
     },
 }
 
+/// Released capture entries whose frames a recorded convert still reads.
+#[derive(Default)]
+struct Deferred {
+    /// The converter fence's last completed value seen by the fence thread.
+    completed: u64,
+    entries: Vec<Entry>,
+}
+
 #[derive(Default)]
 pub struct Surfaces {
     table: Mutex<SlotTable<Entry>>,
+    deferred: Mutex<Deferred>,
 }
 
 impl Surfaces {
@@ -41,6 +54,42 @@ impl Surfaces {
             Entry::Capture { texture, .. } => Some(texture.clone()),
             Entry::Converted { .. } => None,
         }
+    }
+
+    /// Records that GPU work completing at converter fence `value` reads capture surface `id`.
+    pub fn mark_read(&self, id: u64, value: u64) {
+        if let Some(Entry::Capture { read_until, .. }) = self.lock().get_mut(id) {
+            *read_until = (*read_until).max(value);
+        }
+    }
+
+    /// Takes a removed entry: returns it to drop now (closing its frame) unless a convert still
+    /// reads it, in which case it is kept until `reap` passes its fence value.
+    pub fn retire(&self, entry: Entry) -> Option<Entry> {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|p| p.into_inner());
+        match &entry {
+            Entry::Capture { read_until, .. } if *read_until > deferred.completed => {
+                deferred.entries.push(entry);
+                None
+            }
+            _ => Some(entry),
+        }
+    }
+
+    /// The converter fence completed `value` (fence thread): frees the entries it was holding.
+    pub fn reap(&self, value: u64) {
+        let done: Vec<Entry> = {
+            let mut deferred = self.deferred.lock().unwrap_or_else(|p| p.into_inner());
+            deferred.completed = deferred.completed.max(value);
+            let completed = deferred.completed;
+            let (done, keep) = std::mem::take(&mut deferred.entries).into_iter().partition(
+                |e| matches!(e, Entry::Capture { read_until, .. } if *read_until <= completed),
+            );
+            deferred.entries = keep;
+            done
+        };
+        // Frames close here, after the lock is released.
+        drop(done);
     }
 
     /// A converted surface's texture and fence value.

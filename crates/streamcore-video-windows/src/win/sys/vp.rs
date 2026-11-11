@@ -63,6 +63,8 @@ pub struct VideoProcessor {
     copy_in: Option<(ID3D11Texture2D, ID3D11VideoProcessorInputView)>,
     pub copies: u64,
     output_colour: Option<DXGI_COLOR_SPACE_TYPE>,
+    /// The cropped part of the input (`None`: all of it).
+    source: Option<DestRect>,
 }
 
 impl VideoProcessor {
@@ -177,7 +179,52 @@ impl VideoProcessor {
             copy_in: None,
             copies: 0,
             output_colour: None,
+            source: None,
         })
+    }
+
+    /// Converts only `source` of the input (`None`: all of it), letterboxed into the output.
+    /// `source` must lie inside the input with an even origin and size.
+    pub fn set_source(&mut self, source: Option<DestRect>) {
+        if self.source == source {
+            return;
+        }
+        let src = source.unwrap_or(DestRect {
+            left: 0,
+            top: 0,
+            width: self.input_size.0,
+            height: self.input_size.1,
+        });
+        let dest = letterbox((src.width, src.height), self.output_size);
+        let src_rect = RECT {
+            left: src.left as i32,
+            top: src.top as i32,
+            right: (src.left + src.width) as i32,
+            bottom: (src.top + src.height) as i32,
+        };
+        let dst_rect = RECT {
+            left: dest.left as i32,
+            top: dest.top as i32,
+            right: (dest.left + dest.width) as i32,
+            bottom: (dest.top + dest.height) as i32,
+        };
+        // SAFETY: valid context and processor; the rects live across each call.
+        unsafe {
+            self.video_context.VideoProcessorSetStreamSourceRect(
+                &self.processor,
+                0,
+                true,
+                Some(&src_rect),
+            );
+            self.video_context.VideoProcessorSetStreamDestRect(
+                &self.processor,
+                0,
+                true,
+                Some(&dst_rect),
+            );
+        }
+        self.dest = dest;
+        self.source = source;
     }
 
     /// Sets the NV12 output's colour space: BT.709 or BT.601 matrix, limited or full range.

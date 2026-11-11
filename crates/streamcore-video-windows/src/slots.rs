@@ -46,6 +46,14 @@ impl<T> SlotTable<T> {
         }
     }
 
+    pub fn get_mut(&mut self, id: u64) -> Option<&mut T> {
+        let (index, generation) = split(id)?;
+        match self.slots.get_mut(index)? {
+            (g, Some(value)) if *g == generation => Some(value),
+            _ => None,
+        }
+    }
+
     /// Removes and returns the value; `None` for an unknown or stale id.
     pub fn remove(&mut self, id: u64) -> Option<T> {
         let (index, generation) = split(id)?;

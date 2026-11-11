@@ -15,6 +15,13 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   the encoder can be fed from the STA executor while its events are drained from an MTA
   helper thread. Opening a synchronous-only MFT fails with "not an asynchronous MFT", and
   `bench probe` reports `async` for every encoder it lists.
+- **Regions.** WGC captures the whole display (`region_in_surface: false`); the video
+  processor crops `ConvertJob::source`, so a region needs the convert path and follows live
+  moves without touching the capture.
+- **Capture frames outlive Rust's hold.** A WGC frame read by a recorded blit stays open
+  until the converter's fence passes that blit, even when the executor releases the surface
+  as soon as `convert` returns (`Surfaces::retire` / `reap`). Frames the pool dropped unseen
+  are reported with `CaptureEvents::skipped`.
 - **Unsafe code** is denied crate-wide and allowed only in `src/win/sys/`, where the
   D3D11, DXGI and Media Foundation calls live. Every `unsafe` block there carries a
   `SAFETY:` comment.

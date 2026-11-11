@@ -243,7 +243,11 @@ impl WgcCapture {
                 });
             (cap.events.clone(), resized)
         };
-        let surface = self.surfaces.insert(Entry::Capture { texture, frame });
+        let surface = self.surfaces.insert(Entry::Capture {
+            texture,
+            frame,
+            read_until: 0,
+        });
         if let Some(r) = &self.recorder {
             r.captured(surface, h0, h1, backlog);
         }
@@ -262,6 +266,10 @@ impl WgcCapture {
             rotation: Rotation::None,
             fence: GpuFence::None,
         };
+        if backlog > 0 {
+            // A leaf call: counts into `StatsSnapshot::capture_skipped`.
+            events.skipped(id, None, u32::try_from(backlog).unwrap_or(u32::MAX));
+        }
         // No lock held: this may drain the executor inline (convert and submit run now).
         events.frame(id, None, info, FrameStatus::Complete);
         if let Some((size, display, buffers)) = resized {
@@ -311,15 +319,18 @@ impl WgcCapture {
 impl CaptureBackend for WgcCapture {
     fn caps(&self) -> CaptureCaps {
         CaptureCaps {
-            target_kinds: vec![CaptureTargetKind::Display],
+            // A region captures its whole display; the converter crops `ConvertJob::source`,
+            // which follows live moves.
+            target_kinds: vec![CaptureTargetKind::Display, CaptureTargetKind::Region],
             window_fit: false,
-            live_region_move: false,
+            live_region_move: true,
             cursor_modes: vec![CursorMode::Hidden, CursorMode::Composited],
             surface_kinds: vec![SurfaceKind::D3d11Texture {
                 adapter_luid: self.gpu.luid,
             }],
             pool_depth: 8,
             virtual_displays: false,
+            region_in_surface: false,
         }
     }
 
@@ -355,8 +366,11 @@ impl CaptureBackend for WgcCapture {
         if spec.adapter_luid.is_some_and(|l| l != self.gpu.luid) {
             return Err(MediaError::Unsupported);
         }
-        let CaptureTarget::Display { display_id } = spec.target else {
-            return Err(MediaError::Unsupported);
+        let display_id = match spec.target {
+            CaptureTarget::Display { display_id } | CaptureTarget::Region { display_id, .. } => {
+                display_id
+            }
+            _ => return Err(MediaError::Unsupported),
         };
         let output = self
             .outputs
@@ -390,7 +404,7 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn update(&self, id: CaptureId, update: CaptureUpdate, op: OpToken) {
-        let (events, session) = {
+        let (events, session, region) = {
             let state = self.lock();
             let Some(cap) = state.captures.get(&id) else {
                 return;
@@ -398,10 +412,13 @@ impl CaptureBackend for WgcCapture {
             (
                 cap.events.clone(),
                 cap.running.as_ref().map(|r| r.session.clone()),
+                matches!(cap.spec.target, CaptureTarget::Region { .. }),
             )
         };
         let mut error = None;
-        if update.region.is_some() {
+        // A region move needs nothing here: the capture holds the whole display and the
+        // executor crops the new rect from the next convert on.
+        if update.region.is_some() && !region {
             error = Some(MediaError::Unsupported);
         } else if let Some(session) = session {
             if let Some(ns) = update.min_interval_ns
@@ -433,13 +450,14 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn release(&self, surface: SurfaceId) {
-        // A leaf: the table lock only; the WGC frame closes after it is released.
-        let entry = self.surfaces.remove(surface);
-        if entry.is_some()
-            && let Some(r) = &self.recorder
-        {
+        // A leaf: the table locks only. The WGC frame closes after they are released, or, while
+        // a recorded convert still reads it, when the converter's fence passes (`Surfaces::retire`).
+        let Some(entry) = self.surfaces.remove(surface) else {
+            return;
+        };
+        if let Some(r) = &self.recorder {
             r.capture_released(surface);
         }
-        drop(entry);
+        drop(self.surfaces.retire(entry));
     }
 }

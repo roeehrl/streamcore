@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use streamcore_video::{
-    ConvertJob, Converter, GpuFence, MediaError, PixelFormat, Rotation, SurfaceId, SurfaceInfo,
-    SurfaceKind, YCbCrMatrix,
+    ConvertJob, Converter, GpuFence, MediaError, PixelFormat, Rect, Rotation, SurfaceId,
+    SurfaceInfo, SurfaceKind, YCbCrMatrix,
 };
 use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, ID3D11Texture2D};
 
@@ -86,15 +86,16 @@ impl VpConverter {
         let readbacks: Arc<Mutex<Vec<Readback>>> = Arc::default();
         let (tx, rx) = mpsc::channel::<Watch>();
         let event = Event::new().map_err(|e| format!("event: {e}"))?;
-        let (f, g, r, pool) = (
+        let (f, g, r, pool, s) = (
             fence.clone(),
             gpu.clone(),
             recorder.clone(),
             readbacks.clone(),
+            surfaces.clone(),
         );
         let join = std::thread::Builder::new()
             .name("convert-fence".into())
-            .spawn(move || fence_main(&rx, &f, &g, r.as_deref(), &pool, &event))
+            .spawn(move || fence_main(&rx, &f, &g, r.as_deref(), &pool, &event, &s))
             .map_err(|e| format!("spawn fence thread: {e}"))?;
         Ok(Arc::new(Self {
             gpu,
@@ -203,6 +204,7 @@ fn fence_main(
     recorder: Option<&Recorder>,
     pool: &Mutex<Vec<Readback>>,
     event: &Event,
+    surfaces: &Surfaces,
 ) {
     while let Ok(w) = rx.recv() {
         if fence.completed() < w.value {
@@ -220,6 +222,9 @@ fn fence_main(
         if let Some(r) = recorder {
             r.fence_done(w.value, at);
         }
+        // Capture frames released while this blit read them close now. After a timeout (a lost
+        // device) the GPU will not read them either.
+        surfaces.reap(w.value);
         if let Some((rb, strip)) = w.readback {
             // The copy was recorded before the signal, so it is complete now.
             if let (Ok(Some(row)), Some(r)) = (rb.try_read_row(gpu), recorder)
@@ -254,6 +259,7 @@ impl Converter for VpConverter {
         pipeline
             .vp
             .set_output_colour(job.color.matrix == YCbCrMatrix::Bt601, job.color.full_range);
+        pipeline.vp.set_source(job.source.map(|r| crop(r, in_size)));
         let view = pipeline.slots[index].view;
         pipeline
             .vp
@@ -267,6 +273,9 @@ impl Converter for VpConverter {
             Some((rb, s))
         });
         let value = self.next_value.fetch_add(1, Ordering::Relaxed);
+        // The blit reads `input` until the fence passes `value`: its WGC frame stays open until
+        // then even if Rust releases the surface first (`Surfaces::retire`).
+        self.surfaces.mark_read(input, value);
         self.fence
             .signal(value)
             .map_err(|_| MediaError::DeviceLost)?;
@@ -325,6 +334,18 @@ impl Converter for VpConverter {
 impl Drop for VpConverter {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// A job's source rect clamped into the input, with an even origin and size of at least 2 × 2.
+pub fn crop(r: Rect, input: (u32, u32)) -> DestRect {
+    let x = (r.x & !1).min(input.0.saturating_sub(2));
+    let y = (r.y & !1).min(input.1.saturating_sub(2));
+    DestRect {
+        left: x,
+        top: y,
+        width: (r.width & !1).clamp(2, (input.0 - x) & !1),
+        height: (r.height & !1).clamp(2, (input.1 - y) & !1),
     }
 }
 
