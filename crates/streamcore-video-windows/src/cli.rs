@@ -24,6 +24,7 @@ options:
   --buffers N                WGC frame-pool buffers (default permits + 3)
   --no-min-update-interval   do not set GraphicsCaptureSession.MinUpdateInterval
   --cursor                   capture the cursor
+  --timer-1ms                raise this process's timer resolution to 1 ms (timeBeginPeriod)
   --json PATH                also write the report as JSON
 ";
 
@@ -75,6 +76,7 @@ pub struct Options {
     pub buffers: Option<u8>,
     pub min_update_interval: bool,
     pub cursor: bool,
+    pub timer_1ms: bool,
     pub json: Option<String>,
 }
 
@@ -95,6 +97,7 @@ impl Options {
             buffers: None,
             min_update_interval: true,
             cursor: false,
+            timer_1ms: false,
             json: None,
         }
     }
@@ -195,6 +198,7 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
             }
             "--no-min-update-interval" => o.min_update_interval = false,
             "--cursor" => o.cursor = true,
+            "--timer-1ms" => o.timer_1ms = true,
             "--json" => o.json = Some(it.next().ok_or("--json needs a path")?),
             other => return Err(format!("unknown option {other}")),
         }

@@ -6,6 +6,8 @@ use super::com::now_ns;
 use super::d3d::{Gpu, u64_to_luid};
 use crate::model::{CodecSetting, EncoderInfo, EncoderSetup};
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::{E_FAIL, VARIANT_BOOL, VARIANT_TRUE};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::*;
@@ -173,6 +175,8 @@ pub struct Encoder {
     provides_samples: bool,
     output_buffer_size: u32,
     pub setup: EncoderSetup,
+    /// Set by `shutdown`: a `HaveOutput` the pump reads afterwards is teardown, not an error.
+    closing: Arc<AtomicBool>,
     // Kept alive for the encoder's lifetime.
     _manager: IMFDXGIDeviceManager,
 }
@@ -384,6 +388,7 @@ impl Encoder {
             provides_samples,
             output_buffer_size: info.cbSize.max(p.width * p.height * 3 / 2),
             setup,
+            closing: Arc::default(),
             _manager: manager,
         })
     }
@@ -460,12 +465,14 @@ impl Encoder {
             output_id: self.output_id,
             provides_samples: self.provides_samples,
             output_buffer_size: self.output_buffer_size,
+            closing: self.closing.clone(),
         }
     }
 
     /// Shuts the MFT down: a blocked `GetEvent` on the event thread returns `MF_E_SHUTDOWN`.
     /// Idempotent.
     pub fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
         // SAFETY: valid MFT; the message carries no pointer. Errors are irrelevant at shutdown.
         unsafe {
             let _ = self
@@ -512,6 +519,7 @@ pub struct EventPump {
     output_id: u32,
     provides_samples: bool,
     output_buffer_size: u32,
+    closing: Arc<AtomicBool>,
 }
 
 // SAFETY: asynchronous MFTs are free-threaded (see `Encoder`), and
@@ -544,6 +552,9 @@ impl EventPump {
             match self.process_output() {
                 Ok(Some(o)) => MfEvent::Output(o),
                 Ok(None) => MfEvent::NoOutput,
+                // A HaveOutput queued before END_STREAMING fails once the MFT is shut down
+                // (E_UNEXPECTED): the stream is closing, so it is not reported as an error.
+                Err(_) if self.closing.load(Ordering::Acquire) => MfEvent::Shutdown,
                 Err(e) => MfEvent::Error(format!("ProcessOutput: {e}")),
             }
         } else if ty == METransformDrainComplete {
@@ -554,66 +565,74 @@ impl EventPump {
     }
 
     fn process_output(&self) -> Result<Option<Output>> {
-        for _ in 0..2 {
-            let sample = if self.provides_samples {
-                None
-            } else {
-                // SAFETY: creates a sample with a memory buffer of the size the MFT asked for.
-                unsafe {
-                    let s = MFCreateSample()?;
-                    s.AddBuffer(&MFCreateMemoryBuffer(self.output_buffer_size)?)?;
-                    Some(s)
-                }
-            };
-            let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
-                dwStreamID: self.output_id,
-                pSample: ManuallyDrop::new(sample),
-                dwStatus: 0,
-                pEvents: ManuallyDrop::new(None),
-            }];
-            let mut status = 0u32;
-            // SAFETY: valid MFT; `buffers` is a valid one-element array the MFT fills.
-            let r = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
-            let h4_ns = now_ns();
-            let [b] = buffers;
-            // Both fields hold owned references now (ours, or the MFT's); they drop here.
-            let sample = ManuallyDrop::into_inner(b.pSample);
-            drop(ManuallyDrop::into_inner(b.pEvents));
-            match r {
-                Ok(()) => {}
-                Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
-                    // SAFETY: valid MFT; adopt the encoder's new output type and retry once.
-                    unsafe {
-                        let t = self.transform.GetOutputAvailableType(self.output_id, 0)?;
-                        self.transform.SetOutputType(self.output_id, &t, 0)?;
-                    }
-                    continue;
-                }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
-                Err(e) => return Err(e),
+        let sample = if self.provides_samples {
+            None
+        } else {
+            // SAFETY: creates a sample with a memory buffer of the size the MFT asked for.
+            unsafe {
+                let s = MFCreateSample()?;
+                s.AddBuffer(&MFCreateMemoryBuffer(self.output_buffer_size)?)?;
+                Some(s)
             }
-            let Some(sample) = sample else {
+        };
+        let mut buffers = [MFT_OUTPUT_DATA_BUFFER {
+            dwStreamID: self.output_id,
+            pSample: ManuallyDrop::new(sample),
+            dwStatus: 0,
+            pEvents: ManuallyDrop::new(None),
+        }];
+        let mut status = 0u32;
+        // SAFETY: valid MFT; `buffers` is a valid one-element array the MFT fills.
+        let r = unsafe { self.transform.ProcessOutput(0, &mut buffers, &mut status) };
+        let h4_ns = now_ns();
+        let [b] = buffers;
+        // Both fields hold owned references now (ours, or the MFT's); they drop here.
+        let sample = ManuallyDrop::into_inner(b.pSample);
+        drop(ManuallyDrop::into_inner(b.pEvents));
+        match r {
+            Ok(()) => {}
+            Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                // SAFETY: valid MFT; adopt the encoder's new output type. An asynchronous MFT
+                // sends a new METransformHaveOutput for the pending frame: calling
+                // ProcessOutput again now fails with E_UNEXPECTED (Intel QSV).
+                unsafe {
+                    let t = self.transform.GetOutputAvailableType(self.output_id, 0)?;
+                    self.transform.SetOutputType(self.output_id, &t, 0)?;
+                }
                 return Ok(None);
-            };
-            // SAFETY: valid sample; the contiguous buffer is locked only while copied.
-            let (bytes, time_100ns, keyframe) = unsafe {
-                let buf = sample.ConvertToContiguousBuffer()?;
-                let mut ptr = std::ptr::null_mut();
-                let mut len = 0u32;
-                buf.Lock(&mut ptr, None, Some(&mut len))?;
-                let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
-                buf.Unlock()?;
-                let time = sample.GetSampleTime().unwrap_or(-1);
-                let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
-                (bytes, time, key)
-            };
-            return Ok(Some(Output {
-                bytes,
-                time_100ns,
-                keyframe,
-                h4_ns,
-            }));
+            }
+            Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+            Err(e) => {
+                return Err(Error::new(
+                    e.code(),
+                    format!(
+                        "{} (status {status:#x}, provides samples {})",
+                        e.message(),
+                        self.provides_samples
+                    ),
+                ));
+            }
         }
-        Ok(None)
+        let Some(sample) = sample else {
+            return Ok(None);
+        };
+        // SAFETY: valid sample; the contiguous buffer is locked only while copied.
+        let (bytes, time_100ns, keyframe) = unsafe {
+            let buf = sample.ConvertToContiguousBuffer()?;
+            let mut ptr = std::ptr::null_mut();
+            let mut len = 0u32;
+            buf.Lock(&mut ptr, None, Some(&mut len))?;
+            let bytes = std::slice::from_raw_parts(ptr, len as usize).to_vec();
+            buf.Unlock()?;
+            let time = sample.GetSampleTime().unwrap_or(-1);
+            let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) == 1;
+            (bytes, time, key)
+        };
+        Ok(Some(Output {
+            bytes,
+            time_100ns,
+            keyframe,
+            h4_ns,
+        }))
     }
 }

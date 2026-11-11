@@ -255,3 +255,23 @@ pub fn system_times() -> Option<(u64, u64, u64)> {
     unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).ok()? };
     Some((ft(idle), ft(kernel), ft(user)))
 }
+
+/// `timeBeginPeriod(1)` for this process until dropped: waits inside the process (ours and the
+/// MFT's) wake within about 1 ms instead of the default 15.6 ms tick.
+pub struct TimerPeriod(bool);
+
+impl TimerPeriod {
+    pub fn one_ms() -> Self {
+        // SAFETY: no pointers; paired with timeEndPeriod in Drop.
+        Self(unsafe { windows::Win32::Media::timeBeginPeriod(1) } == 0)
+    }
+}
+
+impl Drop for TimerPeriod {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: ends the period begun in `one_ms`.
+            unsafe { windows::Win32::Media::timeEndPeriod(1) };
+        }
+    }
+}

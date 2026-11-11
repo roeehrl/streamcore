@@ -92,6 +92,7 @@ pub fn run(options: &Options) -> Result<(), Error> {
     // The process MTA: helper threads (encoder create, bounded invalidate) join it.
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = sys::com::MediaFoundation::start().map_err(err("MFStartup"))?;
+    let _timer = options.timer_1ms.then(sys::com::TimerPeriod::one_ms);
     let adapters = report::build();
     match options.command {
         Command::Report => {

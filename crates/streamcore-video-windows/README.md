@@ -22,6 +22,13 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   until the converter's fence passes that blit, even when the executor releases the surface
   as soon as `convert` returns (`Surfaces::retire` / `reap`). Frames the pool dropped unseen
   are reported with `CaptureEvents::skipped`.
+- **Timer resolution.** Intel's Quick Sync H.264 MFT waits on the system timer: at the default
+  15.6 ms tick one encode takes about 15 ms, at 1 ms about 6 ms (an Intel integrated GPU,
+  720p). A host should hold `timeBeginPeriod(1)` while it streams (`TimerPeriod`, bench
+  `--timer-1ms`).
+- **Stream changes.** On `MF_E_TRANSFORM_STREAM_CHANGE` the output type is adopted and the
+  pending frame comes with the next `METransformHaveOutput`; calling `ProcessOutput` again at
+  once fails with E_UNEXPECTED on Quick Sync.
 - **Unsafe code** is denied crate-wide and allowed only in `src/win/sys/`, where the
   D3D11, DXGI and Media Foundation calls live. Every `unsafe` block there carries a
   `SAFETY:` comment.
