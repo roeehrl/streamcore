@@ -184,7 +184,8 @@ fn revoked_ownership_cannot_start_or_revive_capture() {
 fn invalid_settings_are_refused_before_any_native_allocation() {
     let fakes = Fakes::new();
     let clock = std::sync::Arc::new(ManualClock::default());
-    let bad_plans: Vec<Box<dyn Fn(&mut StreamParts)>> = vec![
+    type Adjust = Box<dyn Fn(&mut StreamParts)>;
+    let bad_plans: Vec<Adjust> = vec![
         Box::new(|p| p.plan.encode_width = 1),
         Box::new(|p| p.plan.encode_height = 8193),
         Box::new(|p| p.plan.fps = 0),
