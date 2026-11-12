@@ -11,7 +11,11 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use streamcore_media::binary::{ClockPing, ClockPong, Frame};
+use streamcore_media::{
+    binary::{ClockPing, ClockPong, Frame},
+    media::VIDEO_FLAG_EXTENSION,
+    video_control::{is_video_control_kind, validate_video_control},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::{Mutex as AsyncMutex, Notify, oneshot, watch},
@@ -29,6 +33,8 @@ const MAX_QUEUED: usize = 64 * MIB;
 // Weighted round robin guarantees bulk progress while giving interactive work
 // frequent opportunities. A fragment already writing cannot be preempted on TCP.
 const ORDER: [usize; 16] = [0, 2, 0, 3, 0, 1, 0, 4, 0, 2, 0, 3, 0, 1, 0, 1];
+const VIDEO_LANE: usize = 1;
+const BULK_LANE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 #[repr(u8)]
@@ -73,6 +79,31 @@ pub fn application_lane(bytes: &[u8], policy: LanePolicy) -> Result<ChannelLane,
         0x40 => ChannelLane::Bulk,
         _ => ChannelLane::Interactive,
     })
+}
+
+/// Sender side of `frames.v4`: without it, a lane-0 video kind or a video frame
+/// with the extension flag is refused; with it, lane-0 video bodies must be valid.
+pub fn check_frames_version(bytes: &[u8], frames_v4: bool) -> Result<(), ChannelError> {
+    let (frame, _) = Frame::read(bytes)
+        .map_err(|_| ChannelError::InvalidConfiguration)?
+        .ok_or(ChannelError::InvalidConfiguration)?;
+    if is_video_control_kind(frame.kind) {
+        if !frames_v4 {
+            return Err(ChannelError::InvalidConfiguration);
+        }
+        validate_video_control(frame.kind, frame.payload)
+            .map_err(|_| ChannelError::InvalidConfiguration)?;
+    }
+    if frame.kind == 0x10
+        && !frames_v4
+        && frame
+            .payload
+            .get(4)
+            .is_some_and(|flags| flags & VIDEO_FLAG_EXTENSION != 0)
+    {
+        return Err(ChannelError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 #[derive(uniffi::Object)]
@@ -156,6 +187,99 @@ struct Outstanding {
     count: usize,
     consumed: oneshot::Sender<Result<(), ChannelError>>,
 }
+/// The bulk token bucket (docs/STREAMCORE-VIDEO.md 6.4 item 5). While video is
+/// active (a video message queued, or one enqueued within [`VIDEO_ACTIVE_US`]),
+/// bulk fragments spend tokens refilled at (capacity − video rate) × 0.8, never
+/// below [`MIN_BULK_BPS`]; otherwise bulk is unlimited. A fragment may take the
+/// bucket negative; the next waits until it refills to zero. The per-connection
+/// message and byte limits stay as safety nets.
+#[derive(Default)]
+pub(crate) struct BulkBucket {
+    /// Refill rate in bytes per second; zero until rate inputs are set.
+    rate: u64,
+    tokens: i64,
+    refilled_us: u64,
+    video_us: u64,
+}
+/// How long after the last video message video counts as active.
+pub(crate) const VIDEO_ACTIVE_US: u64 = 1_000_000;
+/// Bulk keeps at least this rate (bits per second) while video is active.
+pub(crate) const MIN_BULK_BPS: u64 = 1_000_000;
+impl BulkBucket {
+    fn burst(&self) -> i64 {
+        // 20 ms at the refill rate, and at least two fragments.
+        i64::try_from(self.rate / 50)
+            .unwrap_or(i64::MAX)
+            .max(2 * CHUNK as i64)
+    }
+    /// Rate inputs in bits per second; a zero capacity removes them.
+    pub(crate) fn set_rates(&mut self, capacity_bps: u64, video_bps: u64) {
+        if capacity_bps == 0 {
+            *self = Self {
+                video_us: self.video_us,
+                ..Self::default()
+            };
+            return;
+        }
+        let bulk_bps = (capacity_bps.saturating_sub(video_bps) / 5 * 4).max(MIN_BULK_BPS);
+        let first = self.rate == 0;
+        self.rate = bulk_bps / 8;
+        // New inputs start with a full burst; later ones keep the current level.
+        self.tokens = if first {
+            self.burst()
+        } else {
+            self.tokens.min(self.burst())
+        };
+    }
+    pub(crate) fn rate_bytes_per_second(&self) -> u64 {
+        self.rate
+    }
+    fn video(&mut self, now_us: u64) {
+        self.video_us = now_us.max(1);
+    }
+    fn active(&self, now_us: u64, video_queued: bool) -> bool {
+        self.rate != 0
+            && (video_queued
+                || (self.video_us != 0 && now_us.saturating_sub(self.video_us) <= VIDEO_ACTIVE_US))
+    }
+    /// Spends `bytes` for one bulk fragment, or returns how many microseconds to
+    /// wait before trying again.
+    pub(crate) fn admit(
+        &mut self,
+        now_us: u64,
+        bytes: usize,
+        video_queued: bool,
+    ) -> Result<(), u64> {
+        if !self.active(now_us, video_queued) {
+            self.tokens = self.burst();
+            self.refilled_us = now_us.max(1);
+            return Ok(());
+        }
+        // No refill before the first admission under these inputs.
+        let elapsed = if self.refilled_us == 0 {
+            0
+        } else {
+            now_us.saturating_sub(self.refilled_us)
+        };
+        let refill = u128::from(elapsed) * u128::from(self.rate) / 1_000_000;
+        self.tokens =
+            (i128::from(self.tokens) + refill as i128).min(i128::from(self.burst())) as i64;
+        self.refilled_us = now_us.max(1);
+        if self.tokens < 0 {
+            let wait = (self.tokens.unsigned_abs() * 1_000_000).div_ceil(self.rate);
+            // Video going idle also ends the limit.
+            let idle = if video_queued {
+                wait
+            } else {
+                (self.video_us + VIDEO_ACTIVE_US + 1).saturating_sub(now_us)
+            };
+            return Err(wait.min(idle).max(1));
+        }
+        self.tokens -= bytes as i64;
+        Ok(())
+    }
+}
+
 struct Sender {
     queues: [VecDeque<Outgoing>; LANES],
     outstanding: [VecDeque<Outstanding>; LANES],
@@ -166,6 +290,10 @@ struct Sender {
     count: usize,
     bytes: usize,
     cursor: usize,
+    bulk: BulkBucket,
+    /// Set by `next` when the bucket held back a bulk fragment: retry after this
+    /// many microseconds even without a wake-up.
+    bulk_retry_us: Option<u64>,
 }
 impl Default for Sender {
     fn default() -> Self {
@@ -179,6 +307,8 @@ impl Default for Sender {
             count: 0,
             bytes: 0,
             cursor: 0,
+            bulk: BulkBucket::default(),
+            bulk_retry_us: None,
         }
     }
 }
@@ -244,6 +374,19 @@ pub(crate) struct Multiplexer {
     pub(crate) endpoint: Option<quinn::Endpoint>,
     /// Present when both peers negotiated `clock.v1`.
     pub(crate) clock: Option<Clock>,
+    pub(crate) features: Features,
+}
+
+/// What a channel negotiated or was configured with when it was created.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Features {
+    /// Both peers negotiated `clock.v1`.
+    pub(crate) clock: bool,
+    /// Both peers negotiated `frames.v4`: the video extension flag and the lane-0
+    /// video kinds may be sent and received.
+    pub(crate) frames_v4: bool,
+    /// The bulk token bucket flag ([`crate::tuning::TransportTuning`]).
+    pub(crate) bulk_token_bucket: bool,
 }
 impl Multiplexer {
     #[cfg(test)]
@@ -251,12 +394,12 @@ impl Multiplexer {
         quic: Option<quinn::Connection>,
         endpoint: Option<quinn::Endpoint>,
     ) -> Arc<Self> {
-        Self::with_clock(quic, endpoint, false)
+        Self::with_features(quic, endpoint, Features::default())
     }
-    pub(crate) fn with_clock(
+    pub(crate) fn with_features(
         quic: Option<quinn::Connection>,
         endpoint: Option<quinn::Endpoint>,
-        clock: bool,
+        features: Features,
     ) -> Arc<Self> {
         Arc::new(Self {
             sender: Mutex::new(Sender::default()),
@@ -267,7 +410,8 @@ impl Multiplexer {
             closed: watch::channel(false).0,
             quic,
             endpoint,
-            clock: clock.then(Clock::default),
+            clock: features.clock.then(Clock::default),
+            features,
         })
     }
     pub(crate) fn close(&self) {
@@ -312,6 +456,26 @@ impl Multiplexer {
         data: Vec<u8>,
     ) -> Result<Arc<PendingSend>, ChannelError> {
         self.enqueue_stamped(lane, data, Stamp::None)
+    }
+    /// The bulk bucket's rate inputs in bits per second (a zero capacity removes
+    /// them). They take effect only when the bucket flag is on.
+    pub(crate) fn set_bulk_rates(
+        &self,
+        capacity_bps: u64,
+        video_bps: u64,
+    ) -> Result<(), ChannelError> {
+        let mut s = self.sender.lock().map_err(|_| ChannelError::Closed)?;
+        s.bulk.set_rates(capacity_bps, video_bps);
+        drop(s);
+        self.notify(BULK_LANE);
+        Ok(())
+    }
+    /// The bulk limit in bytes per second while video is active, if the bucket
+    /// flag is on and rate inputs are set.
+    pub(crate) fn bulk_limit(&self) -> Option<u64> {
+        let s = self.sender.lock().ok()?;
+        let rate = s.bulk.rate_bytes_per_second();
+        (self.features.bulk_token_bucket && rate != 0).then_some(rate)
     }
     /// Sends a typed ping on lane 0; its send time is stamped as it is written.
     pub(crate) fn ping(&self) -> Result<(), ChannelError> {
@@ -362,6 +526,9 @@ impl Multiplexer {
         }
         s.bytes += data.len();
         s.count += 1;
+        if lane == VIDEO_LANE {
+            s.bulk.video(monotonic_now_us());
+        }
         s.queues[lane].push_back(Outgoing {
             stamp,
             consumed: Some(consumed),
@@ -384,6 +551,7 @@ impl Multiplexer {
         if *self.closed.borrow() {
             return Err(ChannelError::Closed);
         }
+        s.bulk_retry_us = None;
         if (only.is_none() || only == Some(0))
             && s.credit_streak < 8
             && let Some(record) = self.take_credit(&mut s)?
@@ -402,6 +570,14 @@ impl Multiplexer {
             let (offset, length) = (front.offset, front.data.len());
             if offset == 0 && (s.credits[lane] < length || s.outstanding[lane].len() >= MESSAGES) {
                 continue;
+            }
+            if lane == BULK_LANE && self.features.bulk_token_bucket {
+                let video_queued = !s.queues[VIDEO_LANE].is_empty();
+                let fragment = (length - offset).min(CHUNK);
+                if let Err(wait) = s.bulk.admit(monotonic_now_us(), fragment, video_queued) {
+                    s.bulk_retry_us = Some(wait);
+                    continue;
+                }
             }
             let front = s.queues[lane].front_mut().ok_or(ChannelError::Closed)?;
             if offset == 0 && front.stamp != Stamp::None {
@@ -481,6 +657,20 @@ impl Multiplexer {
         } else {
             ClockMessage::Pong(ClockPong::decode(frame.payload).map_err(|_| ChannelError::Io)?)
         }))
+    }
+    /// Lane 0: a lane-0 video kind without `frames.v4`, or with a malformed body,
+    /// fails closed.
+    fn check_video_control(&self, message: &[u8]) -> Result<(), ChannelError> {
+        if !message.first().is_some_and(|k| is_video_control_kind(*k)) {
+            return Ok(());
+        }
+        if !self.features.frames_v4 {
+            return Err(ChannelError::Io);
+        }
+        let Some((frame, _)) = Frame::read(message).map_err(|_| ChannelError::Io)? else {
+            return Err(ChannelError::Io);
+        };
+        validate_video_control(frame.kind, frame.payload).map_err(|_| ChannelError::Io)
     }
     /// Answers a typed ping and records a pong. Both are still delivered to the
     /// application.
@@ -622,6 +812,7 @@ impl Multiplexer {
             // A typed ping or pong is checked before delivery and answered
             // outside the receiver lock (sender -> receiver is the lock order).
             let clock = if lane == 0 {
+                self.check_video_control(&complete.data)?;
                 self.clock_message(&complete.data)?
             } else {
                 None
@@ -731,7 +922,21 @@ impl Multiplexer {
     ) -> Result<(), ChannelError> {
         loop {
             let Some(record) = self.next(only)? else {
-                self.wake[only.unwrap_or(0)].notified().await;
+                let retry = self
+                    .sender
+                    .lock()
+                    .map_err(|_| ChannelError::Closed)?
+                    .bulk_retry_us;
+                let wake = self.wake[only.unwrap_or(0)].notified();
+                match retry {
+                    Some(us) => {
+                        tokio::select! {
+                            _ = wake => {}
+                            _ = tokio::time::sleep(std::time::Duration::from_micros(us)) => {}
+                        }
+                    }
+                    None => wake.await,
+                }
                 continue;
             };
             let mut bytes = Vec::with_capacity(CHUNK + 18);
@@ -921,5 +1126,163 @@ mod tests {
             application_lane(&partial, overridden).unwrap(),
             ChannelLane::Bulk
         );
+    }
+
+    #[test]
+    fn bulk_bucket_limits_bulk_only_while_video_is_active() {
+        let mut bucket = BulkBucket::default();
+        // No rate inputs: unlimited.
+        assert!(bucket.admit(0, CHUNK, true).is_ok());
+        // 100 Mbit/s capacity, 50 Mbit/s video: bulk gets 40 Mbit/s = 5 MB/s.
+        bucket.set_rates(100_000_000, 50_000_000);
+        assert_eq!(bucket.rate_bytes_per_second(), 5_000_000);
+        // Video idle: unlimited.
+        for _ in 0..100 {
+            assert!(bucket.admit(1, CHUNK, false).is_ok());
+        }
+        // Video active: the burst (20 ms = 100 kB) passes, then bulk waits.
+        bucket.video(10);
+        let mut sent = 0;
+        let wait = loop {
+            match bucket.admit(10, CHUNK, false) {
+                Ok(()) => sent += CHUNK,
+                Err(wait) => break wait,
+            }
+        };
+        assert!((100_000..100_000 + 2 * CHUNK).contains(&sent), "{sent}");
+        // The deficit (less than one fragment) refills at 5 bytes per µs.
+        assert!(wait > 0 && wait <= (CHUNK as u64).div_ceil(5), "{wait}");
+        assert!(bucket.admit(10 + wait, CHUNK, false).is_ok());
+        // Over one second at 5 MB/s, about 5 MB passes.
+        let mut now = 10 + wait;
+        let mut sent = 0;
+        while now < 1_000_000 {
+            match bucket.admit(now, CHUNK, true) {
+                Ok(()) => sent += CHUNK,
+                Err(wait) => now += wait,
+            }
+        }
+        assert!((4_800_000..5_200_000).contains(&sent), "{sent}");
+        // Video stopping lifts the limit after VIDEO_ACTIVE_US.
+        assert!(bucket.admit(now + VIDEO_ACTIVE_US, CHUNK, false).is_ok());
+        for _ in 0..100 {
+            assert!(
+                bucket
+                    .admit(now + 2 * VIDEO_ACTIVE_US, CHUNK, false)
+                    .is_ok()
+            );
+        }
+        // Video above capacity still leaves the floor; zero capacity clears inputs.
+        bucket.set_rates(10_000_000, 20_000_000);
+        assert_eq!(bucket.rate_bytes_per_second(), MIN_BULK_BPS / 8);
+        bucket.set_rates(0, 0);
+        assert_eq!(bucket.rate_bytes_per_second(), 0);
+    }
+
+    #[test]
+    fn bulk_bucket_is_off_unless_the_flag_is_set() {
+        for enabled in [false, true] {
+            let mux = Multiplexer::with_features(
+                None,
+                None,
+                Features {
+                    bulk_token_bucket: enabled,
+                    ..Features::default()
+                },
+            );
+            mux.set_bulk_rates(16_000_000, 15_000_000).unwrap();
+            assert_eq!(mux.bulk_limit().is_some(), enabled);
+            mux.enqueue(ChannelLane::Video, vec![1]).unwrap();
+            mux.enqueue(ChannelLane::Bulk, vec![2; 16 * CHUNK]).unwrap();
+            let mut bulk = 0;
+            while let Some(record) = mux.next(None).unwrap() {
+                if let Record::Data(f) = record {
+                    bulk += usize::from(f.lane == BULK_LANE);
+                    mux.written(&f).unwrap();
+                }
+            }
+            if enabled {
+                // 1 Mbit/s floor: the two-fragment burst, plus at most one more.
+                assert!((2..=3).contains(&bulk), "{bulk}");
+                assert!(mux.sender.lock().unwrap().bulk_retry_us.is_some());
+            } else {
+                assert_eq!(bulk, 16);
+            }
+        }
+    }
+
+    #[test]
+    fn frames_v4_gates_lane_zero_kinds_and_the_extension_flag() {
+        let video = |flags: u8| {
+            let mut payload = vec![1, 0, 0, 0, flags];
+            payload.extend([0; 24]);
+            payload.extend([0, 0, 1]);
+            Frame {
+                kind: 0x10,
+                payload: &payload,
+            }
+            .encode()
+            .unwrap()
+        };
+        let nack = Frame {
+            kind: 0x13,
+            payload: &[0; 3],
+        }
+        .encode()
+        .unwrap();
+        assert!(check_frames_version(&video(0x81), false).is_err());
+        assert!(check_frames_version(&video(0x81), true).is_ok());
+        assert!(check_frames_version(&video(1), false).is_ok());
+        assert!(check_frames_version(&nack, false).is_err());
+        assert!(check_frames_version(&nack, true).is_err()); // malformed body
+        for kind in 0x12..=0x15 {
+            let bytes = Frame {
+                kind,
+                payload: b"{}",
+            }
+            .encode()
+            .unwrap();
+            assert_eq!(
+                application_lane(&bytes, binary_lanes).unwrap(),
+                ChannelLane::Interactive
+            );
+        }
+        // Receiving a lane-0 video kind without frames.v4 fails closed.
+        let mux = Multiplexer::new(None, None);
+        let mut record = data(0, 1, nack.len() as u32, 0, &nack);
+        assert!(mux.ingest(&record, None).is_err());
+        let mux = Multiplexer::with_features(
+            None,
+            None,
+            Features {
+                frames_v4: true,
+                ..Features::default()
+            },
+        );
+        assert!(mux.ingest(&record, None).is_err()); // malformed body
+        let mux = Multiplexer::with_features(
+            None,
+            None,
+            Features {
+                frames_v4: true,
+                ..Features::default()
+            },
+        );
+        let body = streamcore_media::video_control::VideoNack {
+            stream_id: 1,
+            generation: 1,
+            sequence: 1,
+            fragments: vec![0],
+        }
+        .encode()
+        .unwrap();
+        let valid = Frame {
+            kind: 0x13,
+            payload: &body,
+        }
+        .encode()
+        .unwrap();
+        record = data(0, 1, valid.len() as u32, 0, &valid);
+        mux.ingest(&record, None).unwrap();
     }
 }

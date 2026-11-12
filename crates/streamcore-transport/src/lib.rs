@@ -12,7 +12,9 @@ pub mod pairing;
 pub mod pairing_transport;
 pub mod protocol;
 mod runtime;
+mod sockopt;
 pub mod transport;
+pub mod tuning;
 pub use runtime::OperationCancellation;
 
 uniffi::setup_scaffolding!();

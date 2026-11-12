@@ -25,5 +25,17 @@ argon2.workspace = true
 rand.workspace = true
 hmac.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Not `[lints] workspace = true`: `TCP_NOTSENT_LOWAT` needs one `setsockopt` call
+# that neither std nor socket2 offers on Apple platforms. As in
+# streamcore-input-ffi, unsafe stays denied crate-wide and is allowed only in
+# `src/sockopt.rs`, with a SAFETY comment.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+undocumented_unsafe_blocks = "deny"

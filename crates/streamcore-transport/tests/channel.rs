@@ -1,5 +1,11 @@
 use std::{sync::Arc, time::Duration};
-use streamcore_media::binary::{ClockPing, ClockPong, Frame};
+use streamcore_media::{
+    binary::{ClockPing, ClockPong, Frame},
+    media::{
+        ExtendedVideoPacket, FRAMES_V4_CAPABILITY, FrameVersion, VideoExtensions, VideoMetadata,
+    },
+    video_control::FrameTimingReport,
+};
 use streamcore_transport::{
     channel::{
         ChannelPath, ChannelTransport, SecureChannel, SecureListener, SessionOptions,
@@ -393,4 +399,101 @@ async fn receive_timing_and_write_time_follow_the_monotonic_clock() {
     assert!(message.first_byte_us >= before);
     assert!(message.complete_us >= message.first_byte_us);
     assert!(monotonic_now_us() >= message.complete_us);
+}
+
+fn frames_options(v4: bool) -> SessionOptions {
+    let mut capabilities = vec!["inventory.v1".to_string()];
+    if v4 {
+        capabilities.push(FRAMES_V4_CAPABILITY.into());
+    }
+    SessionOptions {
+        capabilities,
+        required: vec!["inventory.v1".into()],
+    }
+}
+
+fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+    Frame { kind, payload }.encode().unwrap()
+}
+
+fn extended_video() -> Vec<u8> {
+    let packet = ExtendedVideoPacket {
+        metadata: VideoMetadata {
+            stream_id: 1,
+            generation: 1,
+            sequence: 1,
+            flags: 1,
+            pts_micros: 1,
+        },
+        extensions: VideoExtensions {
+            capture_us: Some(5),
+            discardable: true,
+            ..Default::default()
+        },
+        data: &[1, 2, 3],
+    };
+    frame(0x10, &packet.encode(FrameVersion::V4).unwrap())
+}
+
+fn timing() -> Vec<u8> {
+    let body = FrameTimingReport {
+        stream_id: 1,
+        generation: 1,
+        sequence: 1,
+        h5_us: 1,
+        h6_us: 2,
+        backpressured: false,
+    }
+    .encode()
+    .unwrap();
+    frame(0x14, &body)
+}
+
+#[tokio::test]
+async fn frames_v4_lane_zero_kinds_and_extensions_flow_only_when_negotiated() {
+    for transport in [ChannelTransport::TlsTcp, ChannelTransport::Quic] {
+        let (_listener, server, client) =
+            channels_with(transport, frames_options(true), frames_options(true)).await;
+        assert!(server.frames_v4() && client.frames_v4());
+        server.enqueue_application_frame(timing()).unwrap();
+        server.enqueue_application_frame(extended_video()).unwrap();
+        let mut received = vec![client.receive().await.unwrap()];
+        received.push(client.receive().await.unwrap());
+        received.sort();
+        assert_eq!(received, {
+            let mut expected = vec![timing(), extended_video()];
+            expected.sort();
+            expected
+        });
+        let video = extended_video();
+        let decoded = Frame::read(&video).unwrap().unwrap().0;
+        let packet = ExtendedVideoPacket::decode(decoded.payload, FrameVersion::V4).unwrap();
+        assert!(packet.extensions.discardable);
+        // A malformed lane-0 video body is refused before it is sent.
+        assert!(
+            server
+                .enqueue_application_frame(frame(0x14, &[0; 3]))
+                .is_err()
+        );
+
+        // One side without frames.v4: neither may send the new kinds or the flag.
+        let (_listener, server, client) =
+            channels_with(transport, frames_options(true), frames_options(false)).await;
+        assert!(!server.frames_v4() && !client.frames_v4());
+        assert!(server.enqueue_application_frame(timing()).is_err());
+        assert!(server.enqueue_application_frame(extended_video()).is_err());
+        // A peer that sends one anyway (bypassing the check) is disconnected.
+        server
+            .enqueue(
+                streamcore_transport::multiplex::ChannelLane::Interactive,
+                timing(),
+            )
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), client.receive())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 }

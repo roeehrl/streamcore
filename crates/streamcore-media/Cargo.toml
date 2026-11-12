@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "StreamCore media framing: frames.v3 headers, binary lane frames and video stream continuity."
+description = "StreamCore media framing: frames.v3 headers, the frames.v4 extension, binary lane frames and video stream continuity."
 
 [dependencies]
 uniffi.workspace = true
