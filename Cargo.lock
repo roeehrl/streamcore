@@ -1302,6 +1302,7 @@ dependencies = [
  "streamcore-media",
  "streamcore-transport",
  "thiserror",
+ "tokio",
  "uniffi",
 ]
 

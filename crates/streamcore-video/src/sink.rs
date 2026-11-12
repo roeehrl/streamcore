@@ -1004,7 +1004,11 @@ impl Inner {
     /// `frameTiming` (`0x14`) for every Nth written frame, under frames.v4.
     fn frame_timing(&self, core: &mut Core, transit: &Transit, at_us: Option<u64>) {
         let every = u64::from(self.policy.frame_timing_every);
-        if !self.frames_v4 || every == 0 || core.written_frames % every != 0 || core.revoked {
+        if !self.frames_v4
+            || every == 0
+            || !core.written_frames.is_multiple_of(every)
+            || core.revoked
+        {
             return;
         }
         let h6_us = at_us
@@ -1094,5 +1098,106 @@ impl Inner {
         }
         *last = Some((now, capacity, video));
         Some((capacity, video))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use streamcore_media::binary::Frame;
+    use streamcore_media::media::{ExtendedVideoPacket, FrameVersion};
+
+    fn header(flags: u8, sequence: u64) -> VideoMetadata {
+        VideoMetadata {
+            stream_id: 3,
+            generation: 9,
+            sequence,
+            flags,
+            pts_micros: if flags == 2 { 0 } else { 77 },
+        }
+    }
+
+    /// One copy, the same bytes as the reference encoders (packet, then envelope).
+    #[test]
+    fn video_messages_match_the_reference_encoding() {
+        let ext = VideoExtensions {
+            capture_us: Some(123),
+            discardable: true,
+            temporal_id: 1,
+            ..VideoExtensions::default()
+        };
+        for (flags, sequence) in [(0, 5), (1, 6), (2, 0)] {
+            for v4 in [false, true] {
+                let data = b"payload-bytes";
+                let version = if v4 {
+                    FrameVersion::V4
+                } else {
+                    FrameVersion::V3
+                };
+                // Configuration packets never carry extensions.
+                let reference_ext = if flags == 2 {
+                    VideoExtensions::default()
+                } else {
+                    ext
+                };
+                let packet = ExtendedVideoPacket {
+                    metadata: header(flags, sequence),
+                    extensions: reference_ext,
+                    data,
+                }
+                .encode(version)
+                .unwrap();
+                let reference = Frame {
+                    kind: 0x10,
+                    payload: &packet,
+                }
+                .encode()
+                .unwrap();
+                let built = video_message(header(flags, sequence), &ext, v4, data).unwrap();
+                assert_eq!(built, reference, "flags {flags} v4 {v4}");
+            }
+        }
+        assert!(video_message(header(0, 1), &ext, true, b"").is_none());
+        assert!(video_message(header(0, 0), &ext, true, b"x").is_none());
+    }
+
+    #[test]
+    fn the_plan_selects_the_extensions() {
+        let fields = FrameFields {
+            h0_ns: Some(1_000_000),
+            h1_ns: 1_500_000,
+            h3_ns: Some(3_000_000),
+            h4_ns: None,
+            capture_us: Some(42),
+            discardable: true,
+            temporal_id: Some(2),
+            ltr: Some(crate::types::LtrInfo {
+                token: 7,
+                flags: 0xff,
+            }),
+            layout_epoch: 4,
+        };
+        assert!(extensions(&[], &fields, true).is_empty());
+        let all = [
+            FrameExtension::Timing,
+            FrameExtension::CaptureUs,
+            FrameExtension::Discardable,
+            FrameExtension::TemporalId,
+            FrameExtension::Ltr,
+            FrameExtension::Content,
+        ];
+        let ext = extensions(&all, &fields, true);
+        let timing = ext.timing.unwrap();
+        assert_eq!(timing.h1_minus_h0_us, 500);
+        assert_eq!(timing.h3_us, 2_000);
+        assert_eq!(timing.h4_us, WireTiming::NOT_MEASURED);
+        assert_eq!(timing.h2_us, WireTiming::NOT_MEASURED);
+        assert_eq!(ext.capture_us, Some(42));
+        assert!(ext.discardable);
+        assert_eq!(ext.temporal_id, 2);
+        assert_eq!(ext.ltr.unwrap().flags, WireLtr::MARK | WireLtr::REFRESH);
+        assert_eq!(ext.layout_epoch, Some(4));
+        // Timing is sampled.
+        assert!(extensions(&all, &fields, false).timing.is_none());
     }
 }

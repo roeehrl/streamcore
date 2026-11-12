@@ -1711,7 +1711,7 @@ impl StreamState {
             } else {
                 let fields = self.frame_fields(cx, &frame, &timing);
                 let every = u64::from(cx.sink.policy().timing_every);
-                let with_timing = every != 0 && header.sequence % every == 0;
+                let with_timing = every != 0 && header.sequence.is_multiple_of(every);
                 let extensions =
                     crate::sink::extensions(&self.plan.extensions, &fields, with_timing);
                 wire = Some(header);

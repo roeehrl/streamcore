@@ -529,6 +529,21 @@ impl FakeEncoder {
     }
 
     pub fn complete_as(&self, seq: u64, form: BitstreamForm) -> bool {
+        self.complete_with(seq, form, false, None)
+    }
+
+    /// A discardable (temporal layer) output, as a layered encoder makes.
+    pub fn complete_discardable(&self, seq: u64) -> bool {
+        self.complete_with(seq, BitstreamForm::Avcc4, true, Some(1))
+    }
+
+    pub fn complete_with(
+        &self,
+        seq: u64,
+        form: BitstreamForm,
+        discardable: bool,
+        temporal_id: Option<u8>,
+    ) -> bool {
         let Some(pending) = self.take(seq) else {
             return false;
         };
@@ -553,8 +568,8 @@ impl FakeEncoder {
             config_token,
             payload_token,
             form,
-            discardable: false,
-            temporal_id: None,
+            discardable,
+            temporal_id,
             ltr: None,
             timings: EncodeTimings {
                 input_ns: Some(pending.opts.capture_ns + 10),
@@ -846,6 +861,9 @@ pub struct Packet {
     pub bytes: Vec<u8>,
     /// The whole enveloped message as enqueued.
     pub message: Vec<u8>,
+    /// Enqueued on the stream's executor (inside `push`), not by a write
+    /// completion.
+    pub on_executor: bool,
 }
 
 #[derive(Default)]
@@ -1010,6 +1028,7 @@ impl SinkTransport for FakeOut {
             },
             bytes: decoded.data.to_vec(),
             message: message.clone(),
+            on_executor: on_executor(),
         };
         let sync = config || self.sync_receipts.load(Ordering::SeqCst);
         {
@@ -1371,6 +1390,13 @@ impl Manual {
 
     pub fn encoder(&self) -> Arc<FakeEncoder> {
         self.factory.last()
+    }
+
+    /// Run `f` (which creates the encoder, e.g. the first frame), then return
+    /// the encoder.
+    pub fn encoder_after(&self, f: impl FnOnce(&Self)) -> Arc<FakeEncoder> {
+        f(self);
+        self.encoder()
     }
 
     /// Close: begin, answer the capture stop, check the outcome.

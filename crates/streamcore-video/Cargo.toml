@@ -20,6 +20,7 @@ async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+tokio.workspace = true
 
 [features]
 # The binding smoke surface (an async foreign trait round trip, 3.8). Built into the
