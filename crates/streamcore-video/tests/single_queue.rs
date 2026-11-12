@@ -31,7 +31,9 @@ fn encoded_output_cannot_escape_after_ownership_revocation() {
 
 #[test]
 fn encoder_dropped_final_capture_recovers_without_another_offer() {
-    let s = Manual::new();
+    // P1's delayed recovery (the 11.1 rollback); P2's immediate one is in
+    // tests/pacing.rs.
+    let s = Manual::with(|_, parts| parts.plan.pacing = PacingPolicy::p1());
     s.start_running();
     s.frame(1_000);
     let encoder = s.encoder();

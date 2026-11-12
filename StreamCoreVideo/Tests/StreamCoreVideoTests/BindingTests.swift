@@ -212,7 +212,8 @@ private func waitUntil(_ condition: () -> Bool) async throws {
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
                           bitrateBps: 2_000_000, convert: .identity, encoderInput: .nv12, encoder: "swift",
                           colorOut: srgb, colorMapping: ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil)
+                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil,
+                          refreshIntervalNs: nil, pacing: PacingPolicy(refreshAligned: true, adaptivePermits: true, immediateRecovery: true))
     let controller = try StreamController(parts: StreamParts(
         streamId: 1, spec: spec, plan: plan, port: port, queue: queue, capture: capture, converter: nil,
         encoders: Encoders(), out: out, observer: observer, timings: nil))
@@ -242,7 +243,8 @@ private func waitUntil(_ condition: () -> Bool) async throws {
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
                           bitrateBps: 2_000_000, convert: .identity, encoderInput: .nv12, encoder: "swift",
                           colorOut: srgb, colorMapping: ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil)
+                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil,
+                          refreshIntervalNs: nil, pacing: PacingPolicy(refreshAligned: true, adaptivePermits: true, immediateRecovery: true))
     #expect(throws: MediaError.self) {
         _ = try StreamController(parts: StreamParts(
             streamId: 1, spec: spec, plan: plan, port: port, queue: Queue(port: port), capture: Capture(),
@@ -259,7 +261,8 @@ private func waitUntil(_ condition: () -> Bool) async throws {
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
                           bitrateBps: 2_000_000, convert: .identity, encoderInput: .nv12, encoder: "swift",
                           colorOut: srgb, colorMapping: ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil)
+                          extensions: [], permitTarget: 3, recovery: [.idr], onSourceGone: .fail, mediumCapBps: nil, adapterLuid: nil,
+                          refreshIntervalNs: nil, pacing: PacingPolicy(refreshAligned: true, adaptivePermits: true, immediateRecovery: true))
     let controller = try StreamController(parts: StreamParts(
         streamId: 1, spec: spec, plan: plan, port: port, queue: queue, capture: capture, converter: nil,
         encoders: Encoders(native: true), out: out, observer: observer, timings: nil))

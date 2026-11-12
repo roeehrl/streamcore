@@ -1073,6 +1073,8 @@ pub fn plan() -> StreamPlan {
         on_source_gone: OnSourceGone::Fail,
         medium_cap_bps: None,
         adapter_luid: None,
+        refresh_interval_ns: None,
+        pacing: PacingPolicy::default(),
     }
 }
 

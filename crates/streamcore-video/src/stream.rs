@@ -3,15 +3,22 @@
 //! `submitted_seq` / `delivered_keyframe` / `lost_seq` fences. Nothing outside a
 //! drain reads or writes it.
 //!
-//! Recovery keeps the reference host's behaviour (2.3): a host-detected loss is
-//! recovered after the recovery delay, at most once per recovery interval, never
-//! while the sink is backpressured, until a keyframe submitted after the loss is
-//! delivered; a client request fences the latest submission and recovers at
-//! once.
+//! Recovery (6.5): a host-detected loss is recovered at once (P2,
+//! `PacingPolicy::immediate_recovery`; P1 waited the recovery delay), then at
+//! most once per recovery interval, never while the sink is backpressured, until
+//! a keyframe submitted after the loss is delivered; a client request fences the
+//! latest submission and recovers at once.
+//!
+//! Admission (6.2, 6.3, [`crate::pacing`]): a frame is due when refresh-aligned
+//! admission accepts it (or a hold timer finds nothing newer came); a due frame
+//! is submitted while fewer frames than the permit target are in the encoder,
+//! else it waits in the latest slot, where a newer frame replaces it (drop
+//! before encode, D7).
 
 use crate::bounded::run_bounded_value;
 use crate::error::{MediaError, codes};
 use crate::executor::*;
+use crate::pacing::{PermitGovernor, RefreshPacer};
 use crate::traits::*;
 use crate::types::*;
 use std::collections::{BTreeMap, VecDeque};
@@ -24,6 +31,10 @@ pub(crate) enum Command {
     Update(OpToken, StreamUpdate),
     Stop(OpToken),
     RequestKeyframe,
+    /// The display's refresh interval changed (`None`: unknown).
+    Refresh(Option<u64>),
+    /// The client flushed this many frames (skip cause e).
+    ClientFlush(u64),
     Revoked,
     Stats,
 }
@@ -35,6 +46,10 @@ pub(crate) enum Internal {
     SubmitFailed(MediaError),
     ConvertFailed(MediaError),
     Fail(&'static str),
+    /// A host-detected loss with immediate recovery (6.5): recover on this wake.
+    Recover,
+    /// Nothing to do: the wake arms a timer set during an inline frame drain.
+    Arm,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,6 +68,8 @@ struct PendingOp {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TimerKind {
     Recovery,
+    /// A frame refresh-aligned admission held: submit it if nothing newer came.
+    Pace,
     Op(OpToken),
     Command(OpToken),
 }
@@ -79,6 +96,8 @@ struct Retained {
     info: SurfaceInfo,
     mapped: ColorTags,
     pending: bool,
+    /// Due for submit: admitted by the pacer, a recovery or a re-send.
+    admitted: bool,
     /// A recovery re-encode's submission time.
     restamp: Option<u64>,
 }
@@ -92,6 +111,8 @@ struct InFlight {
     /// H0 and H1 of the submitted image.
     source_present_ns: Option<u64>,
     capture_ns: u64,
+    /// Executor clock at submit, for the encode time (6.2).
+    submitted_at: u64,
 }
 
 impl InFlight {
@@ -154,6 +175,16 @@ pub(crate) struct StreamState {
     force_keyframe: bool,
     last_recovery_ns: Option<u64>,
     recovery_timer: Option<TimerToken>,
+    /// An `Internal::Recover` is posted and not yet handled.
+    recovery_posted: bool,
+    /// The newest submit that forced a keyframe.
+    keyframe_submitted_seq: u64,
+
+    /// Refresh-aligned admission (6.3) and its hold timer.
+    pacer: RefreshPacer,
+    pace_timer: Option<TimerToken>,
+    /// The adaptive permit target (6.2).
+    permits: PermitGovernor,
 
     timers: BTreeMap<TimerToken, (u64, TimerKind)>,
     next_timer: TimerToken,
@@ -239,6 +270,16 @@ fn crop_rect(rect: &NormalizedRect, width: u32, height: u32) -> Rect {
     }
 }
 
+/// A display refresh interval between 1 ms and 100 ms, else unknown.
+pub(crate) fn valid_refresh(refresh_ns: Option<u64>) -> Option<u64> {
+    refresh_ns.filter(|ns| (1_000_000..=100_000_000).contains(ns))
+}
+
+/// One frame interval at `fps`.
+fn interval_ns(fps: u32) -> u64 {
+    1_000_000_000 / u64::from(fps.max(1))
+}
+
 fn valid_surface(info: &SurfaceInfo) -> bool {
     info.id != 0 && (2..=8192).contains(&info.width) && (2..=8192).contains(&info.height)
 }
@@ -252,6 +293,11 @@ impl StreamState {
         timings: StreamTimings,
         backends: Backends,
     ) -> Self {
+        let mut plan = plan;
+        // A refresh outside 1–100 ms is no display mode: treated as unknown.
+        plan.refresh_interval_ns = valid_refresh(plan.refresh_interval_ns);
+        let pacer = RefreshPacer::new(interval_ns(plan.fps), plan.refresh_interval_ns.unwrap_or(0));
+        let permits = PermitGovernor::new(plan.permit_target);
         Self {
             executor,
             spec,
@@ -286,6 +332,11 @@ impl StreamState {
             force_keyframe: false,
             last_recovery_ns: None,
             recovery_timer: None,
+            recovery_posted: false,
+            keyframe_submitted_seq: 0,
+            pacer,
+            pace_timer: None,
+            permits,
             timers: BTreeMap::new(),
             next_timer: 0,
             armed: None,
@@ -425,6 +476,12 @@ impl StreamState {
         stats.capture_skipped = cx
             .capture_skipped
             .load(std::sync::atomic::Ordering::Relaxed);
+        stats.permit_target = u32::from(self.permit_target());
+        stats.encode_p95_us = self.permits.p95_ns().map_or(0, |ns| ns / 1_000);
+        if self.plan.pacing.refresh_aligned {
+            stats.refresh_interval_ns = self.pacer.refresh_ns();
+            stats.refresh_fallback = self.plan.refresh_interval_ns.is_none();
+        }
         let phase = if self.closed.is_some() {
             StreamPhase::Closed
         } else if self.closing {
@@ -518,7 +575,15 @@ impl StreamState {
             Command::Update(op, update) => self.on_update(cx, op, update),
             Command::Stop(op) => self.on_stop(cx, op),
             Command::RequestKeyframe => self.request_recovery(cx),
+            Command::Refresh(refresh) => {
+                self.plan.refresh_interval_ns = refresh;
+                self.pacer.set_refresh(refresh.unwrap_or(0));
+            }
+            Command::ClientFlush(frames) => {
+                self.stats.client_flushed = self.stats.client_flushed.saturating_add(frames);
+            }
             Command::Revoked => {
+                self.cancel_pace();
                 self.latest = None;
                 self.recovery_needed = false;
                 self.recovery_timer = None;
@@ -637,6 +702,7 @@ impl StreamState {
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
         if let Some(rate) = update.rate {
             self.plan.fps = rate.fps;
+            self.pacer.set_target(interval_ns(rate.fps));
             self.plan.bitrate_bps = rate.bitrate_bps;
             if let Some(slot) = &self.encoder {
                 let encoder = slot.encoder.clone();
@@ -696,6 +762,7 @@ impl StreamState {
             self.phase = StreamPhase::Idle;
             return;
         };
+        self.cancel_pace();
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -845,6 +912,7 @@ impl StreamState {
         }
         self.notify(cx, ObserverJob::Failed { code: code.into() });
         self.finish_command(cx, Self::rejected(code));
+        self.cancel_pace();
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -865,6 +933,7 @@ impl StreamState {
         self.closing = true;
         cx.work.close();
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
+        self.cancel_pace();
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -913,6 +982,12 @@ impl StreamState {
                     self.recover(cx);
                 }
             }
+            TimerKind::Pace => {
+                if self.pace_timer == Some(token) {
+                    self.pace_timer = None;
+                    self.admit_held(cx);
+                }
+            }
             TimerKind::Op(op) => self.on_op_timeout(cx, op),
             TimerKind::Command(op) => {
                 if self.command == Some(op) {
@@ -927,6 +1002,10 @@ impl StreamState {
     // Encoder sessions.
 
     fn reset_stream_state(&mut self) {
+        self.cancel_pace();
+        self.pacer.reset();
+        self.permits.reset();
+        self.cancel_pace();
         self.latest = None;
         self.clear_recovery();
         self.stalled = false;
@@ -1097,6 +1176,11 @@ impl StreamState {
             Internal::SubmitFailed(error) => self.on_encoder_error(cx, None, error),
             Internal::ConvertFailed(error) => self.fail(cx, error.wire_code(codes::OUTPUT)),
             Internal::Fail(code) => self.fail(cx, code),
+            Internal::Recover => {
+                self.recovery_posted = false;
+                self.recover(cx);
+            }
+            Internal::Arm => {}
         }
     }
 
@@ -1238,16 +1322,15 @@ impl StreamState {
             ConvertPath::Convert => self.plan.encoder_input,
         };
         let mapped = self.plan.color_mapping.map(info.color, info.format, output);
-        if self.latest.as_ref().is_some_and(|latest| latest.pending) {
-            self.stats.frames_replaced += 1;
-        }
         self.time_anchor = Some((info.capture_ns, cx.clock.now_ns()));
         let format = info.format;
+        let admitted = self.admit(cx, &info);
         self.latest = Some(Retained {
             lease: Arc::new(lease),
             info,
             mapped,
             pending: true,
+            admitted,
             restamp: None,
         });
         self.stalled = false;
@@ -1273,7 +1356,10 @@ impl StreamState {
         let Some(latest) = &self.latest else {
             return;
         };
-        if !latest.pending || cx.work.in_flight() >= u32::from(self.plan.permit_target) {
+        if !latest.pending
+            || !latest.admitted
+            || cx.work.in_flight() >= u32::from(self.permit_target())
+        {
             return;
         }
         let Some(permit) = cx.work.acquire() else {
@@ -1370,6 +1456,9 @@ impl StreamState {
         match result {
             SubmitResult::Submitted => {
                 self.submitted_seq = seq;
+                if force_keyframe {
+                    self.keyframe_submitted_seq = seq;
+                }
                 self.last_pts_ns = pts_ns;
                 self.force_keyframe = false;
                 self.stats.submitted += 1;
@@ -1378,6 +1467,7 @@ impl StreamState {
                 }
                 if let Some(latest) = &mut self.latest {
                     latest.pending = false;
+                    latest.admitted = false;
                     latest.restamp = None;
                 }
                 self.in_flight.insert(
@@ -1388,6 +1478,7 @@ impl StreamState {
                         _converted: converted,
                         source_present_ns,
                         capture_ns: image_capture_ns,
+                        submitted_at: cx.clock.now_ns(),
                     },
                 );
             }
@@ -1404,6 +1495,73 @@ impl StreamState {
                 self.post_internal(cx, Internal::SubmitFailed(error));
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pacing (6.2, 6.3).
+
+    /// The encoder permit target in effect.
+    fn permit_target(&self) -> u8 {
+        if self.plan.pacing.adaptive_permits {
+            self.permits.target()
+        } else {
+            self.plan.permit_target
+        }
+    }
+
+    /// Whether a new frame is due for submit. A frame admitted earlier and
+    /// still waiting for a permit passes its admission on to the newer one,
+    /// which replaces it (skip cause b: dropped before encode, D7).
+    fn admit(&mut self, cx: &Shared, info: &SurfaceInfo) -> bool {
+        let waiting = self.latest.as_ref().filter(|latest| latest.pending);
+        if let Some(waiting) = waiting {
+            if waiting.admitted || !self.plan.pacing.refresh_aligned {
+                self.stats.frames_replaced += 1;
+                return true;
+            }
+            self.stats.pacer_held += 1;
+        }
+        if !self.plan.pacing.refresh_aligned {
+            return true;
+        }
+        let Some(h0) = info.source_present_ns else {
+            // Nothing to align: admitted unpaced.
+            return true;
+        };
+        if self.pacer.offer(h0) {
+            self.cancel_pace();
+            return true;
+        }
+        if self.pace_timer.is_none() {
+            let delay = self.pacer.hold_delay_ns(h0);
+            self.pace_timer = Some(self.set_timer(cx, delay, TimerKind::Pace));
+            // An inline frame drain arms no timer: the next wake does.
+            self.post_internal(cx, Internal::Arm);
+        }
+        false
+    }
+
+    fn cancel_pace(&mut self) {
+        if self.pace_timer.take().is_some() {
+            self.cancel_timers(|kind| *kind == TimerKind::Pace);
+        }
+    }
+
+    /// The hold timer fired with nothing newer admitted: the held frame is due.
+    fn admit_held(&mut self, cx: &Arc<Shared>) {
+        let Some(latest) = self.latest.as_mut().filter(|l| l.pending && !l.admitted) else {
+            return;
+        };
+        latest.admitted = true;
+        self.stats.pacer_timer_admits += 1;
+        // The executor clock mapped to the host clock (H1 of the latest frame).
+        let now_host = self
+            .time_anchor
+            .map(|(host, local)| host.saturating_add(cx.clock.now_ns().saturating_sub(local)));
+        if let Some(now_host) = now_host {
+            self.pacer.admit_held(now_host);
+        }
+        self.submit_due(cx);
     }
 
     // -----------------------------------------------------------------------
@@ -1477,6 +1635,7 @@ impl StreamState {
             self.record_loss(cx, frame.submit_seq);
             if let Some(latest) = &mut self.latest {
                 latest.pending = true;
+                latest.admitted = true;
             }
             self.submit_due(cx);
             return;
@@ -1512,6 +1671,10 @@ impl StreamState {
             self.last_config = Some(config);
         }
         self.stats.encoded += 1;
+        if let Some(entry) = &entry {
+            let encode_ns = cx.clock.now_ns().saturating_sub(entry.submitted_at);
+            self.permits.record(encode_ns, interval_ns(self.plan.fps));
+        }
         let Some(out) = self.backends.as_ref().map(|b| b.out.clone()) else {
             return;
         };
@@ -1607,6 +1770,9 @@ impl StreamState {
             }
         } else {
             self.stats.packets_refused += 1;
+            if !keyframe {
+                self.stats.sender_shed += 1;
+            }
             self.record_loss(cx, seq);
         }
     }
@@ -1615,11 +1781,13 @@ impl StreamState {
     // Recovery.
 
     fn clear_recovery(&mut self) {
+        self.recovery_posted = false;
         self.recovery_needed = false;
         self.force_keyframe = false;
         self.recovery_timer = None;
         self.cancel_timers(|kind| *kind == TimerKind::Recovery);
         self.delivered_keyframe = 0;
+        self.keyframe_submitted_seq = 0;
         self.lost_seq = 0;
         self.last_recovery_ns = None;
     }
@@ -1630,7 +1798,22 @@ impl StreamState {
         }
         self.lost_seq = self.lost_seq.max(seq);
         self.recovery_needed = true;
+        if self.plan.pacing.immediate_recovery && !self.recovery_too_soon(cx) {
+            // The first recovery fires at once (6.5), on the next wake: the
+            // event that reported the loss finishes first.
+            if !self.recovery_posted && self.recovery_timer.is_none() {
+                self.recovery_posted = true;
+                self.post_internal(cx, Internal::Recover);
+            }
+            return;
+        }
         self.schedule_recovery(cx);
+    }
+
+    fn recovery_too_soon(&self, cx: &Shared) -> bool {
+        self.last_recovery_ns.is_some_and(|last| {
+            cx.clock.now_ns().saturating_sub(last) < self.timings.recovery_interval_ns
+        })
     }
 
     fn schedule_recovery(&mut self, cx: &Shared) {
@@ -1642,7 +1825,16 @@ impl StreamState {
         {
             return;
         }
-        let token = self.set_timer(cx, self.timings.recovery_delay_ns, TimerKind::Recovery);
+        let delay = match self.last_recovery_ns {
+            // Immediate recovery: the next one as soon as the interval allows.
+            Some(last) if self.plan.pacing.immediate_recovery => {
+                let next = last.saturating_add(self.timings.recovery_interval_ns);
+                next.saturating_sub(cx.clock.now_ns())
+                    .clamp(1_000_000, self.timings.recovery_delay_ns.max(1_000_000))
+            }
+            _ => self.timings.recovery_delay_ns,
+        };
+        let token = self.set_timer(cx, delay, TimerKind::Recovery);
         self.recovery_timer = Some(token);
     }
 
@@ -1661,14 +1853,16 @@ impl StreamState {
             return;
         }
         let now = cx.clock.now_ns();
-        let too_soon = self
-            .last_recovery_ns
-            .is_some_and(|last| now.saturating_sub(last) < self.timings.recovery_interval_ns);
+        let too_soon = self.recovery_too_soon(cx);
         let pressured = self
             .backends
             .as_ref()
             .is_some_and(|b| b.out.backpressured());
-        if too_soon || pressured {
+        // Immediate recovery: a keyframe submitted after the loss is already
+        // on its way; the timer re-checks that it was delivered.
+        let in_flight =
+            self.plan.pacing.immediate_recovery && self.keyframe_submitted_seq > self.lost_seq;
+        if too_soon || pressured || in_flight {
             self.schedule_recovery(cx);
             return;
         }
@@ -1680,6 +1874,7 @@ impl StreamState {
             .map(|(host, local)| host.saturating_add(now.saturating_sub(local)));
         if let Some(latest) = &mut self.latest {
             latest.pending = true;
+            latest.admitted = true;
             latest.restamp = restamp;
         }
         self.submit_due(cx);

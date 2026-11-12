@@ -76,8 +76,8 @@ timer token. A stale event is discarded after its permit and lease are released.
 `dropped`, receipts) are always posted, even when known at once.
 
 `convert` and `submit` have exactly one caller, the executor's internal submit job, scheduled by a
-frame, a permit release, an output, a drop, `EncoderEvents::input_ready` or a recovery timer,
-never by a public call. After a `Busy` submit the frame stays retained; the encoder calls
+frame, a permit release, an output, a drop, `EncoderEvents::input_ready`, a recovery timer or a
+pacing hold timer, never by a public call. After a `Busy` submit the frame stays retained; the encoder calls
 `input_ready` once it can take input (MF `METransformNeedInput`), so a still screen still gets its
 frame encoded.
 
@@ -147,6 +147,33 @@ is dropped or stale. A native encoder keeps its own reference until it has poste
 session is torn down, the executor drops (but does not release) its references, so a permit that
 native code still holds keeps counting. The exception is a hung `invalidate` (one that returned
 `TimedOut` or overran the stream's bound): that session's permits are released (see above).
+
+## Pacing (P2)
+
+Admission runs on the executor, in `crate::pacing` and the frame handler (design 6.2, 6.3):
+
+- **Refresh-aligned admission.** A frame with an H0 (`SurfaceInfo::source_present_ns`) is due when
+  `H0 >= due - refresh / 2`; the due time advances by the target interval from the previous due
+  time and resynchronises after idle. An earlier frame only replaces the latest slot
+  (`StatsSnapshot::pacer_held`, not a skip) and sets a hold timer half a refresh past the due
+  time: if nothing newer is due by then, the held frame is (`pacer_timer_admits`), so a still
+  screen still shows its last change. The refresh interval is an input
+  (`StreamPlan::refresh_interval_ns`, then `StreamController::set_refresh_interval` on a display
+  mode change), never inferred from frame times; without one the target interval is used
+  (`refresh_fallback`). A frame without an H0 is admitted unpaced. A hold timer set during an
+  inline frame drain is armed by a wake the drain posts (inline drains arm no timer).
+- **Drop before encode.** A due frame that cannot get a permit waits in the latest slot, and a
+  newer frame replaces it and inherits its admission (skip cause b, `frames_replaced`).
+- **Adaptive permits.** The permit target is the plan's `permit_target`, plus one while the encode
+  time p95 (submit to output on the executor clock, last 32 frames) exceeds 0.8 x the frame
+  interval, withdrawn at 0.6 x; never above 3.
+- **Immediate recovery.** A host-detected loss posts a recovery for the next wake instead of
+  arming the 0.5 s timer; later recoveries keep `recovery_interval_ns` apart, and a keyframe
+  already submitted after the loss defers a new one to the timer.
+
+Each is a `PacingPolicy` switch in the plan (rollback, design 11.1). Skip causes (6.7): (a)
+`capture_skipped`, (b) `frames_replaced`, (c) `encoder_drops`, (d) `sender_shed`, (e)
+`client_flushed` (reported by the consumer with `StreamController::note_client_flush`).
 
 ## Reentrancy rule
 

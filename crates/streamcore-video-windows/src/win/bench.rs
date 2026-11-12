@@ -205,6 +205,8 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
             on_source_gone: OnSourceGone::Fail,
             medium_cap_bps: None,
             adapter_luid: Some(luid),
+            refresh_interval_ns: None,
+            pacing: streamcore_video::PacingPolicy::default(),
         },
         port,
         queue: executor.queue(),

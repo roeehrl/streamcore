@@ -16,6 +16,7 @@ pub mod controller;
 pub mod error;
 pub(crate) mod executor;
 pub mod native;
+pub mod pacing;
 #[cfg(feature = "ffi-probe")]
 pub mod probe;
 pub(crate) mod stream;

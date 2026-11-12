@@ -76,6 +76,22 @@ impl StreamController {
         self.shared.post(Event::Command(Command::RequestKeyframe));
     }
 
+    /// The source display's refresh interval changed (a display mode change);
+    /// `None` when unknown, which aligns admission to the target interval
+    /// instead (6.3). The initial value is `StreamPlan::refresh_interval_ns`.
+    pub fn set_refresh_interval(&self, refresh_interval_ns: Option<u64>) {
+        self.shared.post(Event::Command(Command::Refresh(
+            crate::stream::valid_refresh(refresh_interval_ns),
+        )));
+    }
+
+    /// The client reported flushing `frames` frames (skip cause e,
+    /// `StatsSnapshot::client_flushed`).
+    pub fn note_client_flush(&self, frames: u64) {
+        self.shared
+            .post(Event::Command(Command::ClientFlush(frames)));
+    }
+
     /// Post a `Stats` job to the observer queue.
     pub fn request_stats(&self) {
         self.shared.post(Event::Command(Command::Stats));

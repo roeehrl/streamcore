@@ -604,6 +604,63 @@ pub struct StreamPlan {
     /// several (Windows: the DXGI LUID packed as `(HighPart << 32) | LowPart`).
     /// Passed to `CaptureSpec` and `EncoderSpec`. `None`: the platform default.
     pub adapter_luid: Option<u64>,
+    /// The source display's refresh interval (ns), supplied by the backend or
+    /// consumer from the display mode (macOS: the display link or `NSScreen`;
+    /// Windows: the DXGI output mode), never inferred from frame times. Kept
+    /// current with [`crate::StreamController::set_refresh_interval`]. `None`:
+    /// refresh-aligned admission uses the target interval instead
+    /// (`StatsSnapshot::refresh_fallback`).
+    #[uniffi(default = None)]
+    pub refresh_interval_ns: Option<u64>,
+    /// The P2 pacing behaviours, each a rollback switch (11.1).
+    pub pacing: PacingPolicy,
+}
+
+/// The P2 pacing behaviours (6.2, 6.3, 6.5). Each can be switched off to fall
+/// back to P1's admission and recovery (11.1); [`Default`] switches all on.
+///
+/// Drop before encode (D7) has no switch: since P1 a frame that cannot be
+/// submitted only replaces the latest slot (skip cause b), and nothing queues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PacingPolicy {
+    /// Refresh-aligned admission (6.3): the due time advances by the target
+    /// interval from the previous due time, resynchronised after idle, and the
+    /// first frame with `H0 >= due - refresh_interval / 2` is admitted; earlier
+    /// frames only update the latest slot, which is submitted when due if
+    /// nothing newer comes. Frames without an H0 are admitted unpaced.
+    /// Off: every frame is admitted at once (P1).
+    pub refresh_aligned: bool,
+    /// Adaptive encoder permits (6.2): `StreamPlan::permit_target` (the plan's
+    /// `max(min_inputs_before_output, 1)`), plus one while the encode time p95
+    /// exceeds 0.8 x the frame interval, never above 3. Off: the plan's
+    /// `permit_target` as is (P1).
+    pub adaptive_permits: bool,
+    /// Host-detected loss (6.5): the first recovery fires at once instead of
+    /// after `StreamTimings::recovery_delay_ns`; later ones keep at least
+    /// `recovery_interval_ns` apart (at most 2 IDRs per second). Off: P1's
+    /// delayed recovery.
+    pub immediate_recovery: bool,
+}
+
+impl Default for PacingPolicy {
+    fn default() -> Self {
+        Self {
+            refresh_aligned: true,
+            adaptive_permits: true,
+            immediate_recovery: true,
+        }
+    }
+}
+
+impl PacingPolicy {
+    /// Every P2 behaviour off: P1's admission and recovery.
+    pub fn p1() -> Self {
+        Self {
+            refresh_aligned: false,
+            adaptive_permits: false,
+            immediate_recovery: false,
+        }
+    }
 }
 
 /// A command's result, posted to the observer queue.
@@ -664,6 +721,27 @@ pub struct StatsSnapshot {
     /// Skip cause (a): frames the capture backend dropped unseen
     /// ([`crate::CaptureEvents::skipped`]).
     pub capture_skipped: u64,
+    /// Skip cause (d): delta frames the sender refused or shed (a refused
+    /// receipt for a frame that is neither a keyframe nor a configuration).
+    pub sender_shed: u64,
+    /// Skip cause (e): frames the client flushed, as reported to
+    /// [`crate::StreamController::note_client_flush`].
+    pub client_flushed: u64,
+    /// Not a skip: frames refresh-aligned admission replaced before they were
+    /// due (a source faster than the target rate).
+    pub pacer_held: u64,
+    /// Frames a pacer timer submitted after nothing newer came.
+    pub pacer_timer_admits: u64,
+    /// The encoder permit target in effect (6.2).
+    pub permit_target: u32,
+    /// Encode time p95 (submit to output, executor clock) over the recent window, µs.
+    pub encode_p95_us: u64,
+    /// The refresh interval admission aligns to (ns); 0 while refresh-aligned
+    /// admission is off.
+    pub refresh_interval_ns: u64,
+    /// Refresh-aligned admission has no refresh interval and uses the target
+    /// interval instead.
+    pub refresh_fallback: bool,
 }
 
 /// Jobs for the consumer, posted to its [`crate::ObserverQueue`] and never run on
