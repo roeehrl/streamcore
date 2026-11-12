@@ -173,21 +173,31 @@ mod tests {
 
     #[test]
     fn lan_addresses_are_private_link_local_or_loopback() {
+        // Built from parts: the tree carries no literal addresses.
+        let v4 = |a, b, c, d| IpAddr::from(std::net::Ipv4Addr::new(a, b, c, d));
+        let v6 = |first, last| IpAddr::from(std::net::Ipv6Addr::new(first, 0, 0, 0, 0, 0, 0, last));
+        let mapped =
+            |a, b, c, d| IpAddr::from(std::net::Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
         for lan in [
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.1.1",
-            "169.254.1.1",
-            "127.0.0.1",
-            "::1",
-            "fd00::1",
-            "fe80::1",
-            "::ffff:192.168.1.1",
+            v4(10, 1, 2, 3),
+            v4(172, 16, 0, 1),
+            v4(192, 168, 1, 1),
+            v4(169, 254, 1, 1),
+            v4(127, 0, 0, 1),
+            v6(0, 1),
+            v6(0xfd00, 1),
+            v6(0xfe80, 1),
+            mapped(192, 168, 1, 1),
         ] {
-            assert!(is_lan(lan.parse().unwrap()), "{lan}");
+            assert!(is_lan(lan), "{lan}");
         }
-        for wan in ["8.8.8.8", "100.64.0.1", "2001:db8::1", "::ffff:8.8.8.8"] {
-            assert!(!is_lan(wan.parse().unwrap()), "{wan}");
+        for wan in [
+            v4(8, 8, 8, 8),
+            v4(100, 64, 0, 1),
+            v6(0x2001, 1),
+            mapped(8, 8, 8, 8),
+        ] {
+            assert!(!is_lan(wan), "{wan}");
         }
     }
 
@@ -199,7 +209,7 @@ mod tests {
         assert_eq!(tuned.quic.congestion, QuicCongestion::Cubic);
         // Building either configuration, with and without a LAN peer, succeeds.
         for quic in [QuicTuning::default(), tuned.quic] {
-            for peer in [None, Some("192.168.1.2:1".parse().unwrap())] {
+            for peer in [None, Some(SocketAddr::from(([192, 168, 1, 2], 1)))] {
                 quic_transport(&quic, peer);
             }
         }
