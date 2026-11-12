@@ -47,16 +47,7 @@ static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, std::io::Error>> = Once
 pub(crate) async fn run<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> Result<T, ()> {
-    let runtime = RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .thread_name("streamcore-network")
-                .build()
-        })
-        .as_ref()
-        .map_err(|_| ())?;
+    let runtime = runtime().ok_or(())?;
     struct AbortOnDrop(tokio::task::AbortHandle);
     impl Drop for AbortOnDrop {
         fn drop(&mut self) {
@@ -66,6 +57,33 @@ pub(crate) async fn run<T: Send + 'static>(
     let task = runtime.spawn(future);
     let _abort = AbortOnDrop(task.abort_handle());
     task.await.map_err(|_| ())
+}
+
+/// Runs `future` to completion on the `streamcore-network` runtime, detached
+/// (for Rust callers, such as `streamcore-video`'s sink, that await a
+/// [`crate::multiplex::PendingSend`] and post its result). False, with `future`
+/// dropped on this thread, when the runtime cannot start.
+pub fn spawn(future: impl Future<Output = ()> + Send + 'static) -> bool {
+    match runtime() {
+        Some(runtime) => {
+            runtime.spawn(future);
+            true
+        }
+        None => false,
+    }
+}
+
+fn runtime() -> Option<&'static tokio::runtime::Runtime> {
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("streamcore-network")
+                .build()
+        })
+        .as_ref()
+        .ok()
 }
 
 pub(crate) fn cleanup(future: impl Future<Output = ()> + Send + 'static) {

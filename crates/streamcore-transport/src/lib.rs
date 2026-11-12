@@ -15,6 +15,6 @@ mod runtime;
 mod sockopt;
 pub mod transport;
 pub mod tuning;
-pub use runtime::OperationCancellation;
+pub use runtime::{OperationCancellation, spawn};
 
 uniffi::setup_scaffolding!();

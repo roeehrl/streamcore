@@ -241,25 +241,44 @@ fn a_region_nothing_can_crop_is_refused_before_anything_native_starts() {
 }
 
 #[test]
-fn the_send_hop_carries_the_frames_stage_times() {
-    let s = Manual::new();
+fn the_sink_carries_the_frames_stage_times_under_frames_v4() {
+    let s = Manual::with(|fakes, parts| {
+        fakes.out.frames_v4.store(true, Ordering::SeqCst);
+        parts.plan.extensions = vec![FrameExtension::Timing, FrameExtension::CaptureUs];
+        parts.output = VideoOutput::with_transport(
+            fakes.out.clone(),
+            SinkPolicy {
+                timing_every: 1,
+                ..fakes.policy()
+            },
+            None,
+        );
+    });
     s.start_running();
-    let mut info = s.capture.surface(srgb(), 5_000);
-    info.source_present_ns = Some(4_000);
+    let mut info = s.capture.surface(srgb(), 5_000_000);
+    info.source_present_ns = Some(4_000_000);
     s.capture.emit_info(info);
     s.pump();
     s.encoder().complete_all();
     s.pump();
     let packets = s.out.packets();
     assert_eq!(packets.len(), 2, "config and keyframe");
-    for packet in packets {
-        let timing = packet.meta.timing;
-        assert_eq!(timing.source_present_ns, Some(4_000));
-        assert_eq!(timing.capture_ns, 5_000);
-        // The fake encoder reports H3 and H4 relative to the submitted H0.
-        assert_eq!(timing.encode.input_ns, Some(4_010));
-        assert_eq!(timing.encode.output_ns, Some(4_020));
-    }
+    assert!(
+        packets[0].meta.extensions.is_empty(),
+        "config carries no TLVs"
+    );
+    let ext = packets[1].meta.extensions;
+    let timing = ext.timing.expect("timing TLV");
+    assert_eq!(timing.h1_minus_h0_us, 1_000);
+    assert_eq!(
+        timing.h2_us,
+        streamcore_media::media::FrameTiming::NOT_MEASURED
+    );
+    // The fake encoder reports H3 and H4 10 and 20 ns after the submitted H0.
+    assert_eq!((timing.h3_us, timing.h4_us), (0, 0));
+    // H0 on the transport clock: its age from the host clock now (H1 here).
+    assert_eq!(ext.capture_us, Some(1_000_000 - 1_000));
+    assert!(s.controller.stats().frames_v4);
     s.close();
     s.assert_clean();
 }

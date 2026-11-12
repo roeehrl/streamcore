@@ -1300,6 +1300,7 @@ dependencies = [
  "async-trait",
  "rand 0.8.5",
  "streamcore-media",
+ "streamcore-transport",
  "thiserror",
  "uniffi",
 ]

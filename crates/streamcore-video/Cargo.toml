@@ -13,6 +13,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 streamcore-media = { path = "../streamcore-media" }
+streamcore-transport = { path = "../streamcore-transport" }
 uniffi.workspace = true
 thiserror.workspace = true
 async-trait = { workspace = true, optional = true }

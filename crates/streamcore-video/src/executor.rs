@@ -188,13 +188,8 @@ pub(crate) enum Event {
         submit_seq: u64,
         reason: DropReason,
     },
-    Receipt {
-        encoder: u64,
-        sequence: u64,
-        keyframe: bool,
-        config: bool,
-        accepted: bool,
-    },
+    /// The sink's report (written, failed, shed, consumed).
+    Sink(crate::sink::SinkEvent),
     PermitReleased,
     Timer(TimerToken),
     Command(Command),
@@ -283,8 +278,8 @@ pub(crate) struct Shared {
     state: Mutex<Option<Box<StreamState>>>,
     pub(crate) revoked: AtomicBool,
     pub(crate) closing: AtomicBool,
-    /// For `revoke` from any thread (a leaf call into the adapter).
-    out: Mutex<Option<Arc<dyn VideoOut>>>,
+    /// The stream's `VideoSink` (3.4): `revoke` and its state are leaf calls.
+    pub(crate) sink: crate::sink::VideoSink,
     pub(crate) work: VideoWorkQueue,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) published: Mutex<Published>,
@@ -307,7 +302,7 @@ pub(crate) struct Shared {
 impl Shared {
     pub(crate) fn new(
         queue: Arc<dyn SerialQueue>,
-        out: Arc<dyn VideoOut>,
+        sink: crate::sink::VideoSink,
         clock: Arc<dyn Clock>,
         build: impl FnOnce(&Weak<Shared>) -> StreamState,
     ) -> Arc<Self> {
@@ -331,7 +326,7 @@ impl Shared {
                 state: Mutex::new(Some(Box::new(build(weak)))),
                 revoked: AtomicBool::new(false),
                 closing: AtomicBool::new(false),
-                out: Mutex::new(Some(out)),
+                sink,
                 work,
                 clock,
                 published: Mutex::new(Published {
@@ -353,14 +348,11 @@ impl Shared {
         self.revoked.load(Ordering::Acquire)
     }
 
-    /// Revoke the sink's authority. A leaf call: an atomic, then the adapter's
-    /// own `revoke` with no Rust lock held.
+    /// Revoke the sink's authority. A leaf call: an atomic, then the sink's own
+    /// `revoke` (its lock, then the transport's).
     pub(crate) fn revoke(&self) {
         self.revoked.store(true, Ordering::Release);
-        let out = lock(&self.out).clone();
-        if let Some(out) = out {
-            out.revoke();
-        }
+        self.sink.revoke();
     }
 
     /// Enqueue and return in O(1). A newer frame for the same capture and member
@@ -581,17 +573,14 @@ impl Shared {
             queue.take()
         };
         *lock(&self.capture_port) = Weak::new();
-        native::close_stream(self.id);
-        let out = lock(&self.out).take();
+        self.sink.revoke();
         {
             let mut published = lock(&self.published);
             published.phase = StreamPhase::Closed;
         }
         // Dropping the state releases its leases and permits; a panic there is
         // contained as well.
-        let _ = catch_unwind(AssertUnwindSafe(move || {
-            drop((state, leftovers, queue, out))
-        }));
+        let _ = catch_unwind(AssertUnwindSafe(move || drop((state, leftovers, queue))));
         self.close_slot.complete(CloseOutcome::StopUnknown);
     }
 
@@ -608,16 +597,15 @@ impl Shared {
             queue.take()
         };
         // The C ABI's frames are refused from now on (the caller releases), and
-        // the receipts of lent packets go.
+        // the sink enqueues nothing more.
         *lock(&self.capture_port) = Weak::new();
-        native::close_stream(self.id);
-        let out = lock(&self.out).take();
+        self.sink.revoke();
         let mut state = state;
         let keepalive = state.keepalive.take();
         let outcome = state.close_outcome().unwrap_or(CloseOutcome::Closed);
         state.publish(self);
         drop(state);
-        drop((queue, out));
+        drop(queue);
         self.close_slot.complete(outcome);
         drop(keepalive);
     }
@@ -1042,66 +1030,5 @@ impl VideoSinkHandle {
 impl Drop for VideoSinkHandle {
     fn drop(&mut self) {
         native::unregister_sink(self.key);
-    }
-}
-
-/// The completion of one [`VideoOut::send`]. Complete it exactly once; dropping
-/// it uncompleted counts as refused. Callable from any thread (it only posts).
-#[derive(uniffi::Object)]
-pub struct SinkReceipt {
-    executor: Weak<Shared>,
-    encoder: u64,
-    sequence: u64,
-    keyframe: bool,
-    config: bool,
-    done: AtomicBool,
-}
-
-#[uniffi::export]
-impl SinkReceipt {
-    pub fn complete(&self, accepted: bool) {
-        if self.done.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // An accepted delta or configuration changes nothing on the executor:
-        // only a refusal (a loss) and an accepted keyframe (the end of a
-        // recovery) are posted.
-        if self.config || (accepted && !self.keyframe) {
-            return;
-        }
-        if let Some(executor) = self.executor.upgrade() {
-            executor.post(Event::Receipt {
-                encoder: self.encoder,
-                sequence: self.sequence,
-                keyframe: self.keyframe,
-                config: self.config,
-                accepted,
-            });
-        }
-    }
-}
-
-impl SinkReceipt {
-    pub(crate) fn new(
-        executor: Weak<Shared>,
-        encoder: u64,
-        sequence: u64,
-        keyframe: bool,
-        config: bool,
-    ) -> Self {
-        Self {
-            executor,
-            encoder,
-            sequence,
-            keyframe,
-            config,
-            done: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Drop for SinkReceipt {
-    fn drop(&mut self) {
-        self.complete(false);
     }
 }

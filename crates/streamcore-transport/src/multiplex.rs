@@ -939,7 +939,11 @@ impl Multiplexer {
                 }
                 continue;
             };
-            let mut bytes = Vec::with_capacity(CHUNK + 18);
+            // One buffer per record, length prefix included, written with one
+            // `write_all` (single-write records): over TLS each record is then one
+            // TLS record instead of a 4-byte one plus the body.
+            let mut bytes = Vec::with_capacity(4 + CHUNK + 18);
+            bytes.extend([0; 4]);
             match &record {
                 Record::Credit(lane, sequence, count) => {
                     bytes.extend([1, *lane as u8]);
@@ -954,10 +958,8 @@ impl Multiplexer {
                     bytes.extend_from_slice(&f.data[f.offset..f.end]);
                 }
             }
-            writer
-                .write_u32(bytes.len() as u32)
-                .await
-                .map_err(|_| ChannelError::Io)?;
+            let length = (bytes.len() - 4) as u32;
+            bytes[..4].copy_from_slice(&length.to_be_bytes());
             writer
                 .write_all(&bytes)
                 .await
@@ -1016,6 +1018,60 @@ mod tests {
             mux.written(&packet).unwrap();
         }
         assert!(finished_bulk);
+    }
+    /// Records every `poll_write` call's buffer as one write.
+    struct CountingWriter(Arc<Mutex<Vec<Vec<u8>>>>);
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn every_lane_record_is_one_write_with_its_length_prefix() {
+        let mux = Multiplexer::new(None, None);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let video = mux
+            .enqueue(ChannelLane::Video, vec![9; 2 * CHUNK + 100])
+            .unwrap();
+        mux.enqueue(ChannelLane::Interactive, vec![1; 10]).unwrap();
+        let writer = mux.clone();
+        let sink = CountingWriter(writes.clone());
+        let task = tokio::spawn(async move { writer.write_loop(Box::new(sink), None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), video.written())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        let writes = writes.lock().unwrap().clone();
+        // Three video fragments and one control message, each a single write.
+        assert_eq!(writes.len(), 4);
+        let mut video_bytes = 0;
+        for write in &writes {
+            let length = u32::from_be_bytes(write[..4].try_into().unwrap()) as usize;
+            assert_eq!(length, write.len() - 4, "a record split across writes");
+            assert!(length <= CHUNK + 18);
+            if write[5] == 1 {
+                video_bytes += length - 18;
+            }
+        }
+        assert_eq!(video_bytes, 2 * CHUNK + 100);
     }
     #[tokio::test]
     async fn consumption_credits_are_bounded_until_the_credit_is_scheduled() {

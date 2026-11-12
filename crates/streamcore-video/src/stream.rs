@@ -126,7 +126,6 @@ pub(crate) struct Backends {
     pub(crate) capture: Arc<dyn CaptureBackend>,
     pub(crate) converter: Option<Arc<dyn Converter>>,
     pub(crate) encoders: Arc<dyn EncoderFactory>,
-    pub(crate) out: Arc<dyn VideoOut>,
     pub(crate) observer: Arc<dyn ObserverQueue>,
 }
 
@@ -406,13 +405,7 @@ impl StreamState {
                 submit_seq,
                 reason,
             } => self.on_dropped(cx, encoder, submit_seq, reason),
-            Event::Receipt {
-                encoder,
-                sequence,
-                keyframe,
-                config,
-                accepted,
-            } => self.on_receipt(cx, encoder, sequence, keyframe, config, accepted),
+            Event::Sink(event) => self.on_sink_event(cx, event),
             Event::PermitReleased => self.submit_due(cx),
             Event::Timer(token) => {
                 if self.armed.is_some_and(|(_, armed)| armed == token) {
@@ -477,6 +470,19 @@ impl StreamState {
             .capture_skipped
             .load(std::sync::atomic::Ordering::Relaxed);
         stats.permit_target = u32::from(self.permit_target());
+        let sink = cx.sink.counters();
+        stats.sink_discardable_shed = sink.discardable_shed;
+        stats.sink_superseded = sink.superseded;
+        stats.sink_aged_shed = sink.aged_shed;
+        stats.sink_unsent_max = sink.unsent_max;
+        stats.credit_rtt_ms = cx.sink.state().credit_rtt_ms;
+        stats.frame_timing_sent = sink.frame_timing_sent;
+        stats.frames_v4 = cx.sink.frames_v4();
+        stats.sink_age_bound = cx.sink.age_bound_active();
+        stats.video_bps = sink.video_bps;
+        stats.bulk_capacity_bps = sink.capacity_bps;
+        stats.bulk_capacity_estimated = sink.capacity_estimated;
+        stats.bulk_bucket_inactive = cx.sink.bucket_inactive();
         stats.encode_p95_us = self.permits.p95_ns().map_or(0, |ns| ns / 1_000);
         if self.plan.pacing.refresh_aligned {
             stats.refresh_interval_ns = self.pacer.refresh_ns();
@@ -702,6 +708,7 @@ impl StreamState {
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
         if let Some(rate) = update.rate {
             self.plan.fps = rate.fps;
+            cx.sink.set_fps(rate.fps);
             self.pacer.set_target(interval_ns(rate.fps));
             self.plan.bitrate_bps = rate.bitrate_bps;
             if let Some(slot) = &self.encoder {
@@ -1362,6 +1369,12 @@ impl StreamState {
         {
             return;
         }
+        // 6.2: the previous frame is written and the peer keeps up; else the
+        // frame waits in the latest slot and a sink report retries it.
+        if !cx.sink.admits() {
+            self.stats.sink_held += 1;
+            return;
+        }
         let Some(permit) = cx.work.acquire() else {
             return;
         };
@@ -1675,53 +1688,103 @@ impl StreamState {
             let encode_ns = cx.clock.now_ns().saturating_sub(entry.submitted_at);
             self.permits.record(encode_ns, interval_ns(self.plan.fps));
         }
-        let Some(out) = self.backends.as_ref().map(|b| b.out.clone()) else {
+        // Authority is checked before the sink is called; the sink checks its
+        // own revocation under its lock.
+        if cx.revoked() {
+            if let Some(entry) = entry {
+                entry.finish();
+            }
             return;
-        };
-        let mut payload = Some(payload);
+        }
+        let frames_v4 = cx.sink.frames_v4();
+        let mut config_message = None;
+        let mut payload_message = None;
+        let mut wire = None;
         for header in headers {
             self.stats.wire_generation = header.generation;
-            // The authority is checked before each outbound call.
-            if cx.revoked() {
-                break;
-            }
             let is_config = header.flags == 2;
-            let bytes = if is_config {
-                self.last_config.clone()
+            let message = if is_config {
+                let Some(config) = self.last_config.as_deref() else {
+                    continue;
+                };
+                crate::sink::video_message(header, &Default::default(), frames_v4, config)
             } else {
-                payload.take()
+                let fields = self.frame_fields(cx, &frame, &timing);
+                let every = u64::from(cx.sink.policy().timing_every);
+                let with_timing = every != 0 && header.sequence % every == 0;
+                let extensions =
+                    crate::sink::extensions(&self.plan.extensions, &fields, with_timing);
+                wire = Some(header);
+                crate::sink::video_message(header, &extensions, frames_v4, &payload)
             };
-            let Some(bytes) = bytes else {
-                continue;
+            let Some(message) = message else {
+                if let Some(entry) = entry {
+                    entry.finish();
+                }
+                self.fail(cx, codes::OUTPUT);
+                return;
             };
-            let receipt = SinkReceipt::new(
-                self.executor.clone(),
-                generation,
-                header.sequence,
-                frame.keyframe,
-                is_config,
-            );
-            let meta = VideoOutMeta {
-                header,
-                droppable: !is_config && !frame.keyframe,
-                keyframe: frame.keyframe && !is_config,
-                config: is_config,
-                timing,
-            };
-            debug_assert!(is_current(cx.id));
-            // `out` (the C send's context) is held for the call.
-            match cx.native().send {
-                Some(send) => crate::native::send(send, cx.id, &meta, bytes, receipt),
-                None => out.send(meta, bytes, Arc::new(receipt)),
+            if is_config {
+                config_message = Some(message);
+            } else {
+                payload_message = Some(message);
             }
-            self.stats.packets_sent += 1;
         }
-        // The sink accepted the frame: release admission, then admit the frame
-        // waiting in the latest slot.
+        drop(payload);
+        // The sink accepted the frame: release admission (its encoder permit)
+        // first, so the frame waiting in the latest slot can follow once the
+        // sink admits it.
         if let Some(entry) = entry {
             entry.finish();
         }
+        if let (Some(header), Some(payload_message)) = (wire, payload_message) {
+            let mut messages = Vec::with_capacity(2);
+            messages.extend(config_message);
+            messages.push(payload_message);
+            self.stats.packets_sent += messages.len() as u64;
+            debug_assert!(is_current(cx.id));
+            let events = cx.sink.push(crate::sink::SinkUnit {
+                encoder: generation,
+                generation: header.generation,
+                sequence: header.sequence,
+                keyframe: frame.keyframe,
+                discardable: frame.discardable && !frame.keyframe,
+                messages,
+            });
+            for event in events {
+                self.on_sink_event(cx, event);
+            }
+        }
         self.submit_due(cx);
+    }
+
+    /// The frames.v4 fields of `frame` (9.4): its stage times, H0 on the
+    /// transport clock, and the encoder's layer and LTR state.
+    fn frame_fields(
+        &self,
+        cx: &Shared,
+        frame: &EncodedFrame,
+        timing: &FrameTiming,
+    ) -> crate::sink::FrameFields {
+        // H0 on the transport clock: the host time now (from the latest frame's
+        // anchor) and the transport's clock now, read together.
+        let capture_us = timing.source_present_ns.and_then(|h0| {
+            let (host, local) = self.time_anchor?;
+            let host_now = host.saturating_add(cx.clock.now_ns().saturating_sub(local));
+            let age_us = host_now.saturating_sub(h0) / 1_000;
+            Some(cx.sink.now_us().saturating_sub(age_us))
+        });
+        crate::sink::FrameFields {
+            h0_ns: timing.source_present_ns,
+            h1_ns: timing.capture_ns,
+            h3_ns: timing.encode.input_ns,
+            h4_ns: timing.encode.output_ns,
+            capture_us,
+            discardable: frame.discardable && !frame.keyframe,
+            temporal_id: frame.temporal_id,
+            ltr: frame.ltr,
+            layout_epoch: self.layout_epoch,
+        }
     }
 
     fn on_dropped(&mut self, cx: &Arc<Shared>, generation: u64, seq: u64, reason: DropReason) {
@@ -1746,34 +1809,57 @@ impl StreamState {
         }
     }
 
-    fn on_receipt(
-        &mut self,
-        cx: &Shared,
-        generation: u64,
-        seq: u64,
-        keyframe: bool,
-        config: bool,
-        ok: bool,
-    ) {
-        if config || self.closing || !self.is_current_encoder(generation) {
-            return;
-        }
-        if ok {
-            if keyframe {
-                self.delivered_keyframe = self.delivered_keyframe.max(seq);
-                // A keyframe submitted before the loss cannot end its recovery.
-                if seq > self.lost_seq {
-                    self.recovery_needed = false;
-                    self.recovery_timer = None;
-                    self.cancel_timers(|kind| *kind == TimerKind::Recovery);
+    /// The sink's report (3.4): a written keyframe can end a recovery; a
+    /// refusal or an aged delta is a loss; every report may let the pacer admit
+    /// the next frame (6.2).
+    fn on_sink_event(&mut self, cx: &Arc<Shared>, event: crate::sink::SinkEvent) {
+        use crate::sink::{Shed, SinkEvent};
+        let current = |encoder| !self.closing && self.is_current_encoder(encoder);
+        match event {
+            SinkEvent::Written {
+                encoder,
+                sequence,
+                keyframe,
+            } => {
+                if keyframe && current(encoder) {
+                    self.delivered_keyframe = self.delivered_keyframe.max(sequence);
+                    // A keyframe submitted before the loss cannot end its recovery.
+                    if sequence > self.lost_seq {
+                        self.recovery_needed = false;
+                        self.recovery_timer = None;
+                        self.cancel_timers(|kind| *kind == TimerKind::Recovery);
+                    }
                 }
             }
-        } else {
-            self.stats.packets_refused += 1;
-            if !keyframe {
-                self.stats.sender_shed += 1;
+            SinkEvent::Failed {
+                encoder,
+                sequence,
+                keyframe,
+            } => {
+                if current(encoder) {
+                    self.stats.packets_refused += 1;
+                    if !keyframe {
+                        self.stats.sender_shed += 1;
+                    }
+                    self.record_loss(cx, sequence);
+                }
             }
-            self.record_loss(cx, seq);
+            SinkEvent::Shed {
+                encoder,
+                sequence,
+                why,
+            } => {
+                // A discardable frame breaks no chain; a superseded one is
+                // covered by the newer keyframe. Only an aged delta is a loss.
+                if why == Shed::Aged && current(encoder) {
+                    self.stats.sender_shed += 1;
+                    self.record_loss(cx, sequence);
+                }
+            }
+            SinkEvent::Ready => {}
+        }
+        if !self.closing {
+            self.submit_due(cx);
         }
     }
 
@@ -1854,10 +1940,7 @@ impl StreamState {
         }
         let now = cx.clock.now_ns();
         let too_soon = self.recovery_too_soon(cx);
-        let pressured = self
-            .backends
-            .as_ref()
-            .is_some_and(|b| b.out.backpressured());
+        let pressured = cx.sink.state().backpressured;
         // Immediate recovery: a keyframe submitted after the loss is already
         // on its way; the timer re-checks that it was delivered.
         let in_flight =

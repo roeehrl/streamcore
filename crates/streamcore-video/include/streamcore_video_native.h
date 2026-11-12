@@ -3,7 +3,7 @@
 //
 // A foreign backend makes the per-frame calls through these functions, with primitives
 // only, and keeps the UniFFI bindings for everything else. Native code names Rust objects
-// by key (StreamPort.nativeKey(), VideoSinkHandle.nativeKey(), streamcore_video_packet.key),
+// by key (StreamPort.nativeKey(), VideoSinkHandle.nativeKey()),
 // never by pointer; a key whose object is gone names nothing. Rust calls native code through
 // the attached function pointers, passing each one's context back unretained: the context
 // must be the very backend object given to the stream through UniFFI, which the stream
@@ -23,38 +23,14 @@ extern "C" {
 // ---------------------------------------------------------------------------------------
 // Out: Rust calls these instead of the UniFFI trait methods once attached.
 
-// A packet handed to `send`: its metadata and bytes, valid until
-// streamcore_video_packet_release(key); the bytes are the consumer's to read (or write) until then. The 0/1 fields are flags; times are host-monotonic
-// nanoseconds, 0 when unknown.
-typedef struct streamcore_video_packet {
-    uint64_t key;
-    uint64_t generation;
-    uint64_t sequence;
-    uint64_t pts_micros;
-    uint64_t capture_ns;         // H1
-    uint64_t source_present_ns;  // H0
-    uint64_t encode_input_ns;    // H3
-    uint64_t encode_output_ns;   // H4
-    const uint8_t *bytes;
-    size_t len;
-    uint32_t stream_id;
-    uint8_t flags;  // the wire header's flags
-    uint8_t droppable;
-    uint8_t keyframe;
-    uint8_t config;
-} streamcore_video_packet;
-
-// The per-frame calls of a stream's SerialQueue (wake), CaptureBackend (release) and
-// VideoOut (send). Each context is that object as given in StreamParts; a NULL function
-// keeps the UniFFI call. `send` must complete and release the packet once each
-// (streamcore_video_packet_complete / _release), in either order, possibly inside the call.
+// The per-frame calls of a stream's SerialQueue (wake) and CaptureBackend (release). Each
+// context is that object as given in StreamParts; a NULL function keeps the UniFFI call.
+// Encoded video leaves through the stream's VideoSink in Rust: there is no send callback.
 typedef struct streamcore_video_stream_callbacks {
     void *queue;
     void (*wake)(void *queue);
     void *capture;
     void (*release)(void *capture, uint64_t surface);
-    void *out;
-    void (*send)(void *out, const streamcore_video_packet *packet);
 } streamcore_video_stream_callbacks;
 
 // Attaches the callbacks of the stream whose StreamPort has key `port`: after creating the
@@ -133,17 +109,6 @@ typedef struct streamcore_video_encoded_output {
 // `output` must point to a valid struct for the call; `payload` must point to `payload_len`
 // readable bytes and `config` be NULL or point to `config_len` readable bytes, for the call.
 bool streamcore_video_encoded(uint64_t sink, const streamcore_video_encoded_output *output);
-
-// SinkReceipt.complete for a packet given to `send`: true once the consumer's send path
-// took it, false when it refused or failed it. Before or after the release; only the first
-// call counts; any thread. A packet never completed counts as refused when its stream closes.
-void streamcore_video_packet_complete(uint64_t packet, bool accepted);
-
-// Ends the loan of a packet's bytes: its descriptor and bytes are freed; the send is not
-// completed by it. Once; any thread. A released packet must be completed within 5 s, and at
-// most 64 released packets per stream wait for their completion; beyond either, the oldest
-// counts as refused (a loss).
-void streamcore_video_packet_release(uint64_t packet);
 
 #ifdef __cplusplus
 }

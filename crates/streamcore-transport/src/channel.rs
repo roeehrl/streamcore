@@ -188,6 +188,13 @@ impl SecureChannel {
     pub fn bulk_limit_bytes_per_second(&self) -> Option<u64> {
         self.io.bulk_limit()
     }
+    /// Whether this channel runs the bulk token bucket: the process's
+    /// `TransportTuning::bulk_token_bucket` was on when it was created. Without
+    /// it, rate inputs are kept but limit nothing, and bulk can starve video
+    /// (6.4 item 5).
+    pub fn bulk_bucket_enabled(&self) -> bool {
+        self.io.features.bulk_token_bucket
+    }
     pub fn close(&self) {
         self.io.close();
     }
