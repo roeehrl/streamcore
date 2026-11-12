@@ -16,6 +16,7 @@ use crate::identity::{
     IdentityError, PEER_DNS_NAME, PeerIdentity, SESSION_ALPN, certificate_fingerprint,
 };
 use crate::protocol::{self, Hello, ProtocolError};
+use crate::tuning::{TransportTuning, quic_transport, transport_tuning};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PATHS: usize = 16;
@@ -149,6 +150,7 @@ struct ListenerTrust {
 
 pub struct SessionListener {
     address: SocketAddr,
+    tuning: TransportTuning,
     trust: Arc<StdMutex<ListenerTrust>>,
     quic: quinn::Endpoint,
     accepted: Mutex<mpsc::Receiver<Result<Session, TransportError>>>,
@@ -156,11 +158,23 @@ pub struct SessionListener {
 }
 
 impl SessionListener {
+    /// Binds with the process's [`transport_tuning`].
     pub async fn bind(
         address: SocketAddr,
         identity: &PeerIdentity,
         trusted: Vec<Vec<u8>>,
         hello: Hello,
+    ) -> Result<Self, TransportError> {
+        Self::bind_tuned(address, identity, trusted, hello, transport_tuning()).await
+    }
+
+    /// Binds with explicit transport tuning, used for every accepted connection.
+    pub async fn bind_tuned(
+        address: SocketAddr,
+        identity: &PeerIdentity,
+        trusted: Vec<Vec<u8>>,
+        hello: Hello,
+        tuning: TransportTuning,
     ) -> Result<Self, TransportError> {
         hello.negotiate(&hello)?;
         let peers = trusted
@@ -169,7 +183,8 @@ impl SessionListener {
             .collect();
         let config = identity.server_config(trusted)?;
         let tcp = TcpListener::bind(address).await?;
-        let (tcp, quic) = bind_both_transports(address, tcp, quic_server(&config)?).await?;
+        let (tcp, quic) =
+            bind_both_transports(address, tcp, quic_server(&config, &tuning)?).await?;
         let address = tcp.local_addr()?;
         let trust = Arc::new(StdMutex::new(ListenerTrust {
             config,
@@ -182,10 +197,12 @@ impl SessionListener {
             quic.clone(),
             trust.clone(),
             hello,
+            tuning,
             sender,
         ));
         Ok(Self {
             address,
+            tuning,
             trust,
             quic,
             accepted: Mutex::new(receiver),
@@ -210,7 +227,7 @@ impl SessionListener {
             .map(|cert| certificate_fingerprint(cert))
             .collect();
         let config = identity.server_config(peers)?;
-        let server = quic_server(&config)?;
+        let server = quic_server(&config, &self.tuning)?;
         let mut trust = self.trust.lock().map_err(|_| TransportError::Closed)?;
         if trust.peers == pins {
             return Ok(());
@@ -274,11 +291,14 @@ async fn bind_both_transports(
     unreachable!("last binding attempt returns its error")
 }
 
-fn quic_server(config: &rustls::ServerConfig) -> Result<quinn::ServerConfig, TransportError> {
+fn quic_server(
+    config: &rustls::ServerConfig,
+    tuning: &TransportTuning,
+) -> Result<quinn::ServerConfig, TransportError> {
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(config.clone())
         .map_err(|_| TransportError::Connection)?;
     let mut server = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    server.transport_config(quic_transport());
+    server.transport_config(quic_transport(&tuning.quic, None));
     Ok(server)
 }
 
@@ -295,6 +315,7 @@ async fn accept_connections(
     quic: quinn::Endpoint,
     trust: Arc<StdMutex<ListenerTrust>>,
     hello: Hello,
+    tuning: TransportTuning,
     sender: mpsc::Sender<Result<Session, TransportError>>,
 ) {
     let mut pending = JoinSet::new();
@@ -331,7 +352,7 @@ async fn accept_connections(
         };
         let hello = hello.clone();
         pending.spawn(async move {
-            let mut session = accept_connection(incoming, tls, hello).await?;
+            let mut session = accept_connection(incoming, tls, hello, tuning).await?;
             session.accepted_generation = Some(generation);
             Ok(session)
         });
@@ -342,12 +363,13 @@ async fn accept_connection(
     incoming: Incoming,
     tls: tokio_rustls::TlsAcceptor,
     hello: Hello,
+    tuning: TransportTuning,
 ) -> Result<Session, TransportError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let session = match incoming {
             Incoming::Tcp(stream) => {
                 let peer_address = stream.peer_addr()?;
-                stream.set_nodelay(true)?;
+                configure_tcp(&stream, &tuning)?;
                 let tls = tls.accept(stream).await?;
                 let (_, state) = tls.get_ref();
                 if state.alpn_protocol() != Some(SESSION_ALPN) {
@@ -410,11 +432,23 @@ impl Drop for SessionListener {
     }
 }
 
+/// Dials with the process's [`transport_tuning`].
 pub async fn dial(
     identity: &PeerIdentity,
     trusted_peer: Vec<u8>,
     paths: Vec<DialPath>,
     hello: Hello,
+) -> Result<Session, TransportError> {
+    dial_tuned(identity, trusted_peer, paths, hello, transport_tuning()).await
+}
+
+/// Dials with explicit transport tuning.
+pub async fn dial_tuned(
+    identity: &PeerIdentity,
+    trusted_peer: Vec<u8>,
+    paths: Vec<DialPath>,
+    hello: Hello,
+    tuning: TransportTuning,
 ) -> Result<Session, TransportError> {
     if paths.is_empty()
         || paths.len() > MAX_PATHS
@@ -435,9 +469,12 @@ pub async fn dial(
         let hello = hello.clone();
         pending.spawn(async move {
             tokio::time::sleep(path.delay).await;
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_path(config, path, &hello))
-                .await
-                .map_err(|_| TransportError::Timeout)?
+            tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                connect_path(config, path, &hello, &tuning),
+            )
+            .await
+            .map_err(|_| TransportError::Timeout)?
         });
     }
     while let Some(result) = pending.join_next().await {
@@ -454,10 +491,11 @@ async fn connect_path(
     config: Arc<rustls::ClientConfig>,
     path: DialPath,
     hello: &Hello,
+    tuning: &TransportTuning,
 ) -> Result<Session, TransportError> {
     let mut retry_delay = Duration::from_millis(150);
     loop {
-        let result = connect_path_once(config.clone(), path.clone(), hello).await;
+        let result = connect_path_once(config.clone(), path.clone(), hello, tuning).await;
         // A short outage can reject TCP before a black-holed QUIC attempt
         // finishes. Keep that TCP candidate eligible within the same five-second
         // deadline, rather than waiting for every other candidate to time out.
@@ -484,11 +522,12 @@ async fn connect_path_once(
     config: Arc<rustls::ClientConfig>,
     path: DialPath,
     hello: &Hello,
+    tuning: &TransportTuning,
 ) -> Result<Session, TransportError> {
     let session = match path.kind {
         TransportKind::TlsTcp => {
             let stream = TcpStream::connect(path.address).await?;
-            stream.set_nodelay(true)?;
+            configure_tcp(&stream, tuning)?;
             let name = rustls::pki_types::ServerName::try_from(PEER_DNS_NAME)
                 .map_err(|_| TransportError::Connection)?;
             let tls = tokio_rustls::TlsConnector::from(config)
@@ -528,7 +567,7 @@ async fn connect_path_once(
             let crypto = quinn::crypto::rustls::QuicClientConfig::try_from((*config).clone())
                 .map_err(|_| TransportError::Connection)?;
             let mut client = quinn::ClientConfig::new(Arc::new(crypto));
-            client.transport_config(quic_transport());
+            client.transport_config(quic_transport(&tuning.quic, Some(path.address)));
             endpoint.set_default_client_config(client);
             let connection = endpoint
                 .connect(path.address, PEER_DNS_NAME)
@@ -560,15 +599,13 @@ async fn connect_path_once(
     session.negotiate(hello).await
 }
 
-fn quic_transport() -> Arc<quinn::TransportConfig> {
-    let mut config = quinn::TransportConfig::default();
-    config.max_concurrent_bidi_streams((crate::multiplex::LANES as u32).into());
-    config.max_concurrent_uni_streams(0_u32.into());
-    config.keep_alive_interval(Some(Duration::from_secs(2)));
-    config.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(10)).expect("constant idle timeout"),
-    ));
-    Arc::new(config)
+/// No Nagle delay on every TLS/TCP socket; the unsent-byte bound when tuned.
+fn configure_tcp(stream: &TcpStream, tuning: &TransportTuning) -> Result<(), TransportError> {
+    stream.set_nodelay(true)?;
+    if let Some(bytes) = tuning.tcp_notsent_lowat {
+        crate::sockopt::set_notsent_lowat(stream, bytes)?;
+    }
+    Ok(())
 }
 
 fn quic_peer(connection: &quinn::Connection) -> Result<String, TransportError> {
@@ -612,7 +649,11 @@ mod binding_tests {
     async fn udp_collision_reselects_only_an_ephemeral_port() {
         for ephemeral in [true, false] {
             let identity = PeerIdentity::generate().unwrap();
-            let config = quic_server(&identity.server_config(Vec::new()).unwrap()).unwrap();
+            let config = quic_server(
+                &identity.server_config(Vec::new()).unwrap(),
+                &TransportTuning::default(),
+            )
+            .unwrap();
             let (tcp, udp) = collision_fixture().await;
             let occupied = tcp.local_addr().unwrap();
             let mut requested = occupied;

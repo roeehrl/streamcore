@@ -5,7 +5,10 @@
 use crate::{
     clock::{CLOCK_CAPABILITY, ClockEstimate, monotonic_now_us},
     identity::{PeerIdentity, certificate_fingerprint},
-    multiplex::{ChannelLane, LanePolicy, Multiplexer, PendingSend, binary_lanes},
+    multiplex::{
+        ChannelLane, Features, LanePolicy, Multiplexer, PendingSend, binary_lanes,
+        check_frames_version,
+    },
     protocol::{self, Hello},
     transport::{self, DialPath, Session, SessionListener, TransportKind},
 };
@@ -15,6 +18,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
+use streamcore_media::media::FRAMES_V4_CAPABILITY;
 use tokio::sync::watch;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -100,8 +104,13 @@ impl Drop for SecureChannel {
 
 impl SecureChannel {
     fn from_session(mut session: Session, lanes: LanePolicy) -> Arc<Self> {
-        let clock = session.capabilities.iter().any(|c| c == CLOCK_CAPABILITY);
-        let io = Multiplexer::with_clock(session.quic.take(), session.endpoint.take(), clock);
+        let has = |name: &str| session.capabilities.iter().any(|c| c == name);
+        let features = Features {
+            clock: has(CLOCK_CAPABILITY),
+            frames_v4: has(FRAMES_V4_CAPABILITY),
+            bulk_token_bucket: crate::tuning::transport_tuning().bulk_token_bucket,
+        };
+        let io = Multiplexer::with_features(session.quic.take(), session.endpoint.take(), features);
         let reader = std::mem::replace(&mut session.reader, Box::new(tokio::io::empty()));
         let writer = std::mem::replace(&mut session.writer, Box::new(tokio::io::sink()));
         let quic = session.kind == TransportKind::Quic;
@@ -157,6 +166,28 @@ impl SecureChannel {
     pub fn capabilities(&self) -> Vec<String> {
         self.capabilities.clone()
     }
+    /// Both peers negotiated `frames.v4`: video frames may carry the extension
+    /// block and the lane-0 video kinds `0x12`–`0x15` may be sent.
+    pub fn frames_v4(&self) -> bool {
+        self.io.features.frames_v4
+    }
+    /// Rate inputs for the bulk token bucket, in bits per second: the link
+    /// capacity estimate and the current video rate. While video is active, bulk
+    /// is limited to (capacity − video) × 0.8 (at least 1 Mbit/s). A zero
+    /// capacity removes the inputs. They have no effect unless the process's
+    /// `TransportTuning::bulk_token_bucket` was on when this channel was created.
+    pub fn set_bulk_rate_inputs(
+        &self,
+        capacity_bps: u64,
+        video_bps: u64,
+    ) -> Result<(), ChannelError> {
+        self.io.set_bulk_rates(capacity_bps, video_bps)
+    }
+    /// The bulk limit in bytes per second that applies while video is active, or
+    /// None when the bucket is off or has no rate inputs.
+    pub fn bulk_limit_bytes_per_second(&self) -> Option<u64> {
+        self.io.bulk_limit()
+    }
     pub fn close(&self) {
         self.io.close();
     }
@@ -171,7 +202,9 @@ impl SecureChannel {
     }
 
     /// Under `clock.v1` the core alone sends pings and pongs; an application
-    /// frame of either kind is refused.
+    /// frame of either kind is refused. Without `frames.v4` the lane-0 video kinds
+    /// and video frames with the extension flag are refused; with it, the lane-0
+    /// video bodies must be valid.
     pub fn enqueue_application_frame(
         &self,
         payload: Vec<u8>,
@@ -180,6 +213,7 @@ impl SecureChannel {
         if self.io.clock.is_some() && matches!(payload.first(), Some(2 | 3)) {
             return Err(ChannelError::InvalidConfiguration);
         }
+        check_frames_version(&payload, self.io.features.frames_v4)?;
         self.io.enqueue(lane, payload)
     }
 

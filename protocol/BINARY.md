@@ -28,6 +28,101 @@ borrows the payload; it does not duplicate the NALUs. MyCNC's `test-video-contra
 checks explicit byte/field fixtures and exchanges actual encoder output between
 both implementations, including 64-bit boundary values and truncated headers.
 
+## frames.v4: the video extension block
+
+`frames.v4` (`media::FRAMES_V4_CAPABILITY`) is an optional transport Hello
+capability alongside `frames.v3`. A consumer that requires it makes it a hard
+break: host and client ship together. Under it, the 29-byte header above is
+unchanged, and flag bit `0x80` ("extension follows", valid only under `frames.v4`)
+inserts a block between the header and the sample data:
+
+| Offset | Width | Value |
+| --- | --- | --- |
+| 29 | 2 | `ext_len`, u16 little endian |
+| 31 | `ext_len` | TLVs: `[type u8][len u8][value]`, back to back |
+| 31 + `ext_len` | remaining | Nonempty sample or configuration, as in v3 |
+
+The low flag bits keep their v3 meaning and rules (`0x80 | 1` is an extended
+keyframe). A sender sets `0x80` only when `frames.v4` was negotiated; without it,
+`0x80` is an unknown flag and the payload is invalid. Rust: `media::ExtendedVideoPacket`
+with `FrameVersion::{V3, V4}`; `media::VideoPacket` stays the strict v3 codec.
+
+| Type | Name | `len` | Value (little endian) | When absent |
+| --- | --- | --- | --- | --- |
+| `0x01` | timing | 16 | u32 µs from H0 to H2, H3 and H4, then i32 H1 − H0; `0xFFFFFFFF` = stage not measured | no timing |
+| `0x02` | capture_us | 8 | u64 H0 on the host's StreamCore monotonic clock (µs) | no capture time |
+| `0x03` | discardable | 0 | none: presence means the frame is discardable | **not discardable** |
+| `0x04` | ltr | 5 | u32 nonzero token, u8 flags: `0x01` mark (stored as LTR `token`), `0x02` refresh (predicted only from LTR `token`); other bits reserved, written 0 and ignored | no LTR state |
+| `0x05` | temporal_id | 1 | u8 temporal layer | **layer 0** |
+| `0x06` | content | 4 | u32 `layout_epoch` (see `layoutInfo` below) | no epoch |
+
+- Absent TLVs mean the defaults in the last column. A sender without temporal
+  layers or discardable frames simply omits `0x03` and `0x05`. A `0x05` with value
+  0 is valid and means the same as an absent one.
+- The canonical encoding writes TLVs in type order and omits every default, and a
+  frame with no TLVs is sent without `0x80`, byte for byte a v3 frame. A receiver
+  also accepts `0x80` with `ext_len` 0 (no TLVs), with the same meaning.
+- Unknown types (`0x00`, `0x07`–`0xFF`) are skipped by their `len`. A known type
+  with any other `len`, a known type repeated, an LTR token of 0, a TLV running
+  past `ext_len`, an `ext_len` past the payload, or no sample data after the block
+  is invalid.
+- `capture_us` keeps the frame's H0, including on recovery re-encodes;
+  `pts_micros` stays the strictly increasing submission time (recovery frames are
+  re-stamped with the current time). `timing` is sampled (every frame in
+  qualification).
+
+Fixtures: `crates/streamcore-media/tests/binary_contract.rs` (an every-TLV frame,
+a frame with no TLVs, an explicit-zero temporal id, unknown and malformed TLVs).
+
+## Lane-0 video kinds (`frames.v4`)
+
+Kinds `0x12`–`0x15` travel on lane 0. The envelope accepts them unconditionally
+(the codec cannot see negotiated capabilities), but a sender emits them only under
+`frames.v4`: `SecureChannel::enqueue_application_frame` refuses them, and video
+frames with flag `0x80`, without it, and refuses a malformed body with it. A peer
+that receives one on lane 0 without `frames.v4`, or with a malformed body, closes
+the channel. Bodies are little endian with an exact length for their contents;
+unknown flag bits are invalid. Times are µs of the sender's StreamCore monotonic
+clock (`clock::monotonic_now_us`); map them across peers with the `clock.v1`
+estimate. Rust: `streamcore_media::video_control`.
+
+**`0x12` videoFeedback** (client → host, about every 100 ms; every 20 ms in
+datagram mode), 38 bytes plus optional parts:
+
+| Field | Width |
+| --- | --- |
+| stream ID | u32 |
+| generation, nonzero | u64 |
+| highest sequence received complete in that generation (0 = none) | u64 |
+| video payload bytes consumed since the stream started on this channel | u64 |
+| decoder flushes since then | u32 |
+| decoded frames never presented since then | u32 |
+| flags: `0x01` loss bitmap follows, `0x02` LTR ack follows | u8 |
+| if `0x01`: base sequence (nonzero) u64, bitmap length u8 (1–128), bitmap; bit `i`, least significant first in each byte, set = sequence `base + i` missing | 9 + length |
+| if `0x02`: LTR token decoded on the current transport, nonzero | u32 |
+| frame count (0–32) | u8 |
+| per frame: sequence (nonzero) u64, C1 message complete u64, C3 decoded u64, C5 presented u64; 0 = stage not reached | 32 each |
+
+**`0x13` videoNack** (datagram mode only): stream ID u32, generation u64
+(nonzero), sequence u64 (nonzero), count u16 (1–1024), then `count` u16 fragment
+indices in strictly increasing order. 22 + 2 × count bytes.
+
+**`0x14` frameTiming** (host → client, sampled; every frame on USB): stream ID
+u32, generation u64 (nonzero), sequence u64 (nonzero), H5 `VideoSink` admit u64,
+H6 last fragment written u64 (not before H5), flags u8 (`0x01` the sink was
+backpressured). 37 bytes.
+
+**`0x15` layoutInfo** (host → client): stream ID u32, epoch u32, source rect (x
+i32, y i32, width u32, height u32; the captured region in the source's pixel
+space, origin may be negative), encoded frame width u32 and height u32, content
+rect (x, y, width, height, u32; where that region sits in the encoded picture,
+inside the frame), rotation u8 (clockwise quarter turns, 0–3, that show the content
+upright). Sizes are nonzero. 49 bytes. Frames name the epoch they follow in the
+`0x06 content` TLV.
+
+Only `MediaCaps` and the stream-started `features` stay in each consumer's control
+protocol.
+
 ## Continuity and ownership
 
 `VideoPacketizer` and `VideoReceiver` are shared Rust state machines exposed via
@@ -148,7 +243,9 @@ of up to 256 kept. One-way figures derived from it carry the same bound. Fixture
 ## Envelope and verification
 
 The outer type byte accepts control `0x01`, ping `0x02`, pong `0x03`, video `0x10`,
-audio `0x11`, input `0x20`, terminal `0x30` and file `0x40`. Its length is the sole
+audio `0x11`, videoFeedback `0x12`, videoNack `0x13`, frameTiming `0x14`,
+layoutInfo `0x15`, input `0x20`, terminal `0x30` and file `0x40` (the four video
+kinds are sent only under `frames.v4`). Its length is the sole
 big-endian integer in this contract. The envelope accepts empty payloads (an untyped
 keepalive without `clock.v1` uses them); each typed codec imposes its own body
 requirements. Unknown types and

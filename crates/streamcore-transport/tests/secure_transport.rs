@@ -5,7 +5,8 @@ use std::{
 use streamcore_transport::{
     identity::PeerIdentity,
     protocol::{Hello, PROTOCOL_MAJOR},
-    transport::{DialPath, SessionListener, TransportKind, dial},
+    transport::{DialPath, SessionListener, TransportKind, dial, dial_tuned},
+    tuning::{QuicCongestion, TransportTuning, candidate_transport_tuning},
 };
 
 fn hello() -> Hello {
@@ -591,5 +592,60 @@ async fn a_client_without_a_certificate_cannot_open_a_session() {
             );
         }
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn tuned_transports_still_exchange_large_frames() {
+    // The candidate tuning (small windows, LAN initial RTT, no datagrams, a
+    // TCP_NOTSENT_LOWAT) and BBR must keep both transports working end to end; how
+    // they perform is for the scheduling probe, not this test.
+    let candidate = candidate_transport_tuning();
+    let bbr = TransportTuning {
+        quic: streamcore_transport::tuning::QuicTuning {
+            congestion: QuicCongestion::Bbr,
+            ..candidate.quic
+        },
+        ..candidate
+    };
+    for tuning in [candidate, bbr] {
+        for kind in [TransportKind::Quic, TransportKind::TlsTcp] {
+            let host = PeerIdentity::generate().unwrap();
+            let client = PeerIdentity::generate().unwrap();
+            let listener = SessionListener::bind_tuned(
+                "127.0.0.1:0".parse().unwrap(),
+                &host,
+                vec![client.certificate()],
+                hello(),
+                tuning,
+            )
+            .await
+            .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let large = vec![7u8; 1_000_000];
+            let expected = large.clone();
+            let server = tokio::spawn(async move {
+                let mut session = listener.accept().await.unwrap();
+                assert_eq!(session.receive().await.unwrap(), expected);
+                session.send(b"ok").await.unwrap();
+                let _ = session.receive().await;
+            });
+            let mut session = dial_tuned(
+                &client,
+                host.certificate(),
+                vec![path(addr, kind)],
+                hello(),
+                tuning,
+            )
+            .await
+            .unwrap();
+            session.send(&large).await.unwrap();
+            assert_eq!(session.receive().await.unwrap(), b"ok");
+            drop(session);
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 }

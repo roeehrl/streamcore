@@ -3,7 +3,8 @@
 Native sessions negotiate the session ALPN (`SESSION_ALPN` in `identity.rs`; its
 value still carries the original product name, see the README) and Hello major 2
 (`protocol::PROTOCOL_MAJOR`). There is no major-1 fallback. Binary payloads use
-`frames.v3` (`media::FRAME_CAPABILITY`, see [BINARY.md](BINARY.md)). StreamCore does
+`frames.v3` (`media::FRAME_CAPABILITY`, see [BINARY.md](BINARY.md)), and optionally
+`frames.v4` (`media::FRAMES_V4_CAPABILITY`). StreamCore does
 not define an application control protocol: each product carries and versions its
 own control messages, and places them on lanes with its `multiplex::LanePolicy`.
 This document describes the implementation, not a qualified release or a measured
@@ -17,7 +18,7 @@ overtake one another. A caller must not assume global wire order.
 
 | ID | Lane | Default traffic (`binary_lanes`) | Receive byte window |
 | --- | --- | --- | --- |
-| 0 | Interactive | Every frame kind without another default: input (`0x20`), ping and pong (under `clock.v1` sent and answered by the core, [BINARY.md](BINARY.md#typed-ping-and-pong-clockv1)) and product control | 4 MiB |
+| 0 | Interactive | Every frame kind without another default: input (`0x20`), ping and pong (under `clock.v1` sent and answered by the core, [BINARY.md](BINARY.md#typed-ping-and-pong-clockv1)), the lane-0 video kinds `0x12`–`0x15` (under `frames.v4`) and product control | 4 MiB |
 | 1 | Video | Video frames (`0x10`) | 32 MiB + 5 bytes |
 | 2 | Audio | Audio packets (`0x11`) | 2 MiB |
 | 3 | Terminal | Terminal data (`0x30`) | 8 MiB |
@@ -68,6 +69,37 @@ of message data per turn. An already-writing fragment cannot be preempted. This
 provides bulk progress and frequent interactive opportunities, but cannot remove
 TCP's transport-level head-of-line blocking. Complete-message delivery uses the
 same weighted order on both transports.
+
+## Transport tuning (flags, all off by default)
+
+`tuning::TransportTuning` holds the video-oriented transport changes of
+docs/STREAMCORE-VIDEO.md 6.2, 6.4 and 7.2, each behind its own flag so each can be
+reverted alone. `tuning::set_transport_tuning` sets them for the process;
+listeners and dials started later read them (`SessionListener::bind_tuned` and
+`transport::dial_tuned` take them explicitly), and channels read the bucket flag
+when created. The default is the behaviour above. `candidate_transport_tuning`
+returns unmeasured starting values; each change ships only after the scheduling
+probe is re-run with it.
+
+- `tcp_notsent_lowat`: `TCP_NOTSENT_LOWAT` on TLS/TCP sockets, about one frame,
+  so unsent kernel data stays near that bound (macOS, iOS, Linux, Android). Windows
+  has no such option; its equivalent (a Rust-tracked unsent queue with
+  `SIO_TCP_INFO` and a small `SO_SNDBUF`) is future work and the flag is ignored.
+- `quic`: stream, connection and send windows (near the bandwidth-delay product
+  plus a few frames instead of quinn's 1.2 MB / unlimited / 10 MB), a lower initial
+  RTT when dialing a private, link-local or loopback address (quinn's is 333 ms),
+  no datagram buffer (`video.datagram.v1` needs it back), and the congestion
+  controller. BBR is available but not evaluated; it stays off without
+  measurement.
+- `bulk_token_bucket`: while video is active (a video message queued or enqueued
+  in the last second), lane 4 fragments are metered at (capacity − video rate) ×
+  0.8, at least 1 Mbit/s, with a 20 ms burst (at least two fragments). The rates
+  come from `SecureChannel::set_bulk_rate_inputs`; without them nothing changes.
+  It ships with `VideoSink`, which supplies them: a consumer's file pump may pace
+  on connection-wide backpressure that counts video, so once video bypasses that
+  path only the bucket protects it.
+
+The per-connection message and byte limits above stay as safety nets.
 
 ## Record format
 
