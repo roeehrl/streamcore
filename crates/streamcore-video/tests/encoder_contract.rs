@@ -246,7 +246,7 @@ fn a_session_failure_with_frames_in_flight_drops_them_with_the_rebuild() {
     // retained image on the new session, with no new capture.
     first.drop_output(1, DropReason::NoOutput);
     s.pump();
-    s.advance_ms(600);
+    // Host-detected loss recovers at once (6.5), with no 0.5 s wait.
     let second = s.encoder();
     assert_eq!(s.controller.stats().recoveries, 1);
     assert_eq!(second.pending_seqs().len(), 1);
@@ -435,8 +435,8 @@ fn recoverable_drops_then_session_failed_rebuild_once_with_one_loss() {
         vec![MediaError::EncoderFailed { recoverable: true }]
     );
     // The drop's loss runs one recovery: the retained image is re-encoded on
-    // the new session as a keyframe, without a new capture.
-    s.advance_ms(600);
+    // the new session as a keyframe, without a new capture, at once (6.5).
+    s.pump();
     let second = s.encoder();
     assert_eq!(s.controller.stats().recoveries, 1);
     assert_eq!(second.pending_seqs().len(), 1);

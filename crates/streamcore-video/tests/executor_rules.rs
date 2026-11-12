@@ -231,10 +231,16 @@ fn a_busy_or_failed_submit_consumes_no_sequence_and_leaves_no_gap() {
     assert_eq!(encoder.pending_seqs(), vec![1]);
     *lock(&encoder.fail_next) = Some(MediaError::EncoderFailed { recoverable: true });
     s.frame(3_000);
-    assert_eq!(encoder.pending_seqs(), vec![1]);
-    s.frame(4_000);
+    // The failed submit is a host-detected loss: recovered at once (6.5) by
+    // re-sending the retained frame as an IDR, which takes the next sequence.
     assert_eq!(encoder.pending_seqs(), vec![1, 2]);
+    assert!(lock(&encoder.submits)[1].force_keyframe);
+    s.frame(4_000);
+    assert_eq!(encoder.pending_seqs(), vec![1, 2, 3]);
     assert!(s.observer.failures().is_empty());
+    // Free a permit for the next submit.
+    encoder.complete(1);
+    s.pump();
     *lock(&encoder.fail_next) = Some(MediaError::Internal);
     s.frame(5_000);
     assert_eq!(s.observer.failures(), vec![codes::ENCODE.to_string()]);
