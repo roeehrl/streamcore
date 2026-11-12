@@ -1,4 +1,5 @@
-//! Portable input, audio, terminal, file and outer-frame codecs for frames.v3.
+//! Portable input, audio, terminal, file and outer-frame codecs for frames.v3
+//! and frames.v4.
 //! UUIDs use RFC/network byte order; integers in payloads use little endian.
 use crate::media::{MAX_FRAME_LENGTH, MediaError};
 
@@ -461,7 +462,10 @@ impl<'a> Frame<'a> {
         out.extend(self.payload);
         Ok(out)
     }
-    fn valid_kind(kind: u8) -> bool {
-        matches!(kind, 1 | 2 | 3 | 0x10 | 0x11 | 0x20 | 0x30 | 0x40)
+    /// The envelope's kinds. The lane-0 video kinds `0x12`–`0x15` are accepted
+    /// unconditionally (this check cannot see negotiated capabilities); senders emit
+    /// them only under `frames.v4`.
+    pub fn valid_kind(kind: u8) -> bool {
+        matches!(kind, 1 | 2 | 3 | 0x10..=0x15 | 0x20 | 0x30 | 0x40)
     }
 }
