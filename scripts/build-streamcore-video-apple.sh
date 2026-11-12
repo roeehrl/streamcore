@@ -2,7 +2,8 @@
 # Builds the video control plane for Apple platforms: StreamCoreVideo/Artifacts/StreamCoreVideoFFI.xcframework
 # (macOS arm64+x86_64, iOS arm64, iOS Simulator arm64+x86_64, static libraries, with the
 # `ffi-probe` binding smoke surface) and the UniFFI Swift bindings for streamcore-video and the
-# streamcore-media types it uses in StreamCoreVideo/Sources/StreamCoreVideo/Generated, then runs
+# streamcore-media and streamcore-transport types it uses (the sink sends on a SecureChannel) in
+# StreamCoreVideo/Sources/StreamCoreVideo/Generated, then runs
 # the Swift binding tests against the XCFramework and compiles the package for iOS. Deployment
 # targets: macOS 15, iOS 18; override with STREAMCORE_VIDEO_MACOS_TARGET /
 # STREAMCORE_VIDEO_IOS_TARGET. Set STREAMCORE_VIDEO_SKIP_TESTS=1 to only build.
@@ -30,18 +31,20 @@ rm -rf "$BINDINGS" "$GENERATED" && mkdir -p "$BINDINGS" "$GENERATED"
 cargo run --package streamcore-video --features "$FEATURES,bindgen" --locked --bin streamcore-video-bindgen -- \
     generate --library "$CORE_ROOT/target/debug/libstreamcore_video.dylib" \
     --language swift --no-format --out-dir "$BINDINGS"
-cp "$BINDINGS/streamcore_video.swift" "$BINDINGS/streamcore_media.swift" "$GENERATED/"
+cp "$BINDINGS/streamcore_video.swift" "$BINDINGS/streamcore_media.swift" "$BINDINGS/streamcore_transport.swift" "$GENERATED/"
 
 for TARGET in "${APPLE_TARGETS[@]}"; do
     cargo build --package streamcore-video --features "$FEATURES" --lib --release --locked --target "$TARGET"
 done
 STAGE="$(mktemp -d "$CORE_ROOT/target/streamcore-video-apple.XXXXXX")"
 mkdir -p "$STAGE/macos" "$STAGE/simulator" "$STAGE/headers"
-cp "$BINDINGS/streamcore_videoFFI.h" "$BINDINGS/streamcore_mediaFFI.h" \
+cp "$BINDINGS/streamcore_videoFFI.h" "$BINDINGS/streamcore_mediaFFI.h" "$BINDINGS/streamcore_transportFFI.h" \
     crates/streamcore-video/include/streamcore_video_native.h "$STAGE/headers/"
-# One module map declaring both C modules the generated Swift files import; the video
+# One module map declaring the C modules the generated Swift files import; the video
 # module also declares the per-frame C ABI (streamcore_video_native.h).
 cat "$BINDINGS/streamcore_mediaFFI.modulemap" > "$STAGE/headers/module.modulemap"
+printf '\n' >> "$STAGE/headers/module.modulemap"
+cat "$BINDINGS/streamcore_transportFFI.modulemap" >> "$STAGE/headers/module.modulemap"
 printf '\n' >> "$STAGE/headers/module.modulemap"
 sed 's|^\( *\)header "streamcore_videoFFI.h"|&\
 \1header "streamcore_video_native.h"|' "$BINDINGS/streamcore_videoFFI.modulemap" >> "$STAGE/headers/module.modulemap"

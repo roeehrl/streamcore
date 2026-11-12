@@ -19,20 +19,18 @@ import streamcore_videoFFI
 public enum StreamCoreNative {
     public typealias WakeFunction = @convention(c) (UnsafeMutableRawPointer?) -> Void
     public typealias ReleaseFunction = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Void
-    public typealias SendFunction = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<streamcore_video_packet>?) -> Void
     public typealias SubmitFunction = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt64, UInt64, UInt64, Bool) -> Int32
 
     /// Attaches the per-frame calls of the stream whose port has key `port`
-    /// (`StreamPort.nativeKey()`): `queue`, `capture` and `out` are the objects given as
-    /// `StreamParts.queue`, `.capture` and `.out`; a nil function keeps the UniFFI call.
+    /// (`StreamPort.nativeKey()`): `queue` and `capture` are the objects given as
+    /// `StreamParts.queue` and `.capture`; a nil function keeps the UniFFI call. Encoded video
+    /// leaves through the stream's `VideoSink` in Rust (`StreamParts.output`): there is no send.
     @discardableResult
     public static func attach(port: UInt64, queue: AnyObject, wake: WakeFunction?,
-                              capture: AnyObject, release: ReleaseFunction?,
-                              out: AnyObject, send: SendFunction?) -> Bool {
+                              capture: AnyObject, release: ReleaseFunction?) -> Bool {
         streamcore_video_attach_stream(port, streamcore_video_stream_callbacks(
             queue: Unmanaged.passUnretained(queue).toOpaque(), wake: wake,
-            capture: Unmanaged.passUnretained(capture).toOpaque(), release: release,
-            out: Unmanaged.passUnretained(out).toOpaque(), send: send))
+            capture: Unmanaged.passUnretained(capture).toOpaque(), release: release))
     }
 
     /// Attaches `submit` for the encoder being created (`spec.sink.nativeKey()`); call it in
@@ -70,9 +68,6 @@ public enum StreamCoreNative {
                              sourcePresentNs: UInt64) -> Bool {
         streamcore_video_frame(port, capture, surface, captureNs, sourcePresentNs)
     }
-
-    /// `SinkReceipt.complete` for packet `key` (`NativeVideoPacket.complete`).
-    public static func complete(packet key: UInt64, accepted: Bool) { streamcore_video_packet_complete(key, accepted) }
 
     /// `StreamPort.run`, on the stream's queue.
     public static func run(port: UInt64) { streamcore_video_run(port) }
@@ -117,55 +112,5 @@ public struct NativeEncodedOutput {
     public init(submitSeq: UInt64, ptsNs: UInt64, keyframe: Bool, inputNs: UInt64, outputNs: UInt64) {
         self.submitSeq = submitSeq; self.ptsNs = ptsNs; self.keyframe = keyframe
         self.inputNs = inputNs; self.outputNs = outputNs
-    }
-}
-
-/// A packet handed to the attached `send`: its metadata and its bytes, lent until
-/// `release()`. Complete it once (`complete(accepted:)`) and release it once, in either
-/// order: release directly, or by the `Data` from `adoptData()` when it is freed. Times are
-/// host-monotonic nanoseconds, nil when unknown.
-public struct NativeVideoPacket: @unchecked Sendable {
-    public let key: UInt64
-    public let streamId: UInt32
-    public let generation: UInt64
-    public let sequence: UInt64
-    /// The wire header's flags.
-    public let flags: UInt8
-    public let ptsMicros: UInt64
-    public let droppable: Bool
-    public let keyframe: Bool
-    public let config: Bool
-    /// H0, H1, H3 and H4.
-    public let sourcePresentNs: UInt64?
-    public let captureNs: UInt64
-    public let encodeInputNs: UInt64?
-    public let encodeOutputNs: UInt64?
-    /// Valid until the packet is released.
-    public let bytes: UnsafeRawBufferPointer
-
-    public init(_ packet: UnsafePointer<streamcore_video_packet>) {
-        let p = packet.pointee
-        func known(_ value: UInt64) -> UInt64? { value == 0 ? nil : value }
-        key = p.key; streamId = p.stream_id; generation = p.generation; sequence = p.sequence
-        flags = p.flags; ptsMicros = p.pts_micros
-        droppable = p.droppable != 0; keyframe = p.keyframe != 0; config = p.config != 0
-        sourcePresentNs = known(p.source_present_ns); captureNs = p.capture_ns
-        encodeInputNs = known(p.encode_input_ns); encodeOutputNs = known(p.encode_output_ns)
-        bytes = UnsafeRawBufferPointer(start: p.bytes, count: p.len)
-    }
-
-    /// The send's result (`SinkReceipt.complete`); only the first call counts.
-    public func complete(accepted: Bool) { streamcore_video_packet_complete(key, accepted) }
-
-    /// Ends the loan of the bytes (it does not complete the send).
-    public func release() { streamcore_video_packet_release(key) }
-
-    /// The bytes as `Data` without a copy; freeing the `Data` releases the packet, so do
-    /// not also call `release()`. The bytes are the `Data`'s until then.
-    public func adoptData() -> Data {
-        let key = self.key
-        guard let base = bytes.baseAddress, bytes.count > 0 else { release(); return Data() }
-        return Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base), count: bytes.count,
-                    deallocator: .custom { _, _ in streamcore_video_packet_release(key) })
     }
 }
