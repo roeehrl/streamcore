@@ -434,8 +434,10 @@ session hung: its frames are dropped and it is re-created.
   bitmap lists every sequence the client did not receive, including discardable frames the host's
   sink shed: the host ignores sequences its sink shed when it uses the bitmap for rate adaptation
   or recovery, and a missing discardable sequence does not break the chain (design 6.5). The
-  per-frame entry has no flags, so whether C5 was estimated is not on the wire; it is counted in
-  `ClientStats::presented_estimated` only.
+  report's `c5_estimated` flag (`0x04`) says every entry's C5 is the platform's estimate
+  (`DecoderEvents::presented(.., estimated)`); a report never mixes estimated and measured C5, so
+  ready entries of the other kind go in a second report sent right after it (without the loss
+  bitmap and the LTR ack). `ClientStats::presented_estimated` counts them too.
 
 **Close.** `begin_close` posts `Close` and returns; the async `close()` (Kotlin `closeStream()`)
 also waits without blocking. On `Close` the executor flushes the decoder, drops every waiting frame

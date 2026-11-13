@@ -106,6 +106,11 @@ pub struct VideoFeedback {
     pub loss: Option<LossBitmap>,
     /// A long-term reference token decoded on the current transport.
     pub ltr_ack: Option<u32>,
+    /// Every entry's C5 (`present_us`) in this report is the platform's
+    /// estimate, not a measured present time (flag `0x04`). A property of the
+    /// client's presenter; a sender never mixes estimated and measured C5 in
+    /// one report.
+    pub c5_estimated: bool,
     /// Recent frames' times, at most [`VideoFeedback::MAX_FRAMES`].
     pub frames: Vec<FramePresentation>,
 }
@@ -113,6 +118,7 @@ impl VideoFeedback {
     pub const MAX_FRAMES: usize = 32;
     const LOSS: u8 = 0x01;
     const LTR: u8 = 0x02;
+    const C5_ESTIMATED: u8 = 0x04;
     fn validate(&self) -> Result<(), MediaError> {
         check(
             self.generation != 0
@@ -133,7 +139,7 @@ impl VideoFeedback {
         let flushes = r.u32()?;
         let present_drops = r.u32()?;
         let flags = r.u8()?;
-        check(flags & !(Self::LOSS | Self::LTR) == 0)?;
+        check(flags & !(Self::LOSS | Self::LTR | Self::C5_ESTIMATED) == 0)?;
         let loss = if flags & Self::LOSS != 0 {
             let base_sequence = r.u64()?;
             let length = usize::from(r.u8()?);
@@ -170,6 +176,7 @@ impl VideoFeedback {
             present_drops,
             loss,
             ltr_ack,
+            c5_estimated: flags & Self::C5_ESTIMATED != 0,
             frames,
         };
         value.validate()?;
@@ -190,6 +197,9 @@ impl VideoFeedback {
         }
         if self.ltr_ack.is_some() {
             flags |= Self::LTR;
+        }
+        if self.c5_estimated {
+            flags |= Self::C5_ESTIMATED;
         }
         b.push(flags);
         if let Some(loss) = &self.loss {

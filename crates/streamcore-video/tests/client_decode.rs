@@ -757,6 +757,8 @@ fn feedback_carries_at_most_32_frames_each_once() {
             .iter()
             .all(|f| f.decode_us != 0 && f.present_us != 0)
     );
+    // Every C5 came from an estimating presenter.
+    assert!(reports[0].c5_estimated);
     c.delta(5, 41);
     c.advance_ms(100);
     let reports = c.feedback();
@@ -805,6 +807,52 @@ fn feedback_reports_flushes_present_drops_and_loss() {
     let report = c.feedback().pop().unwrap();
     assert_eq!(report.flushes, 3);
     assert_eq!(report.loss, None);
+}
+
+#[test]
+fn estimated_and_measured_present_times_never_share_a_report() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.decoder.decoded(1);
+    c.decoder.port().presented(1, c.decoder.native_now(), true);
+    c.queue.pump();
+    c.delta(5, 2);
+    c.decoder.decoded(2);
+    c.decoder.port().presented(2, c.decoder.native_now(), true);
+    c.queue.pump();
+    c.delta(5, 3);
+    c.output(3); // measured
+    c.delta(5, 4); // not presented yet: reported with the first kind
+    c.advance_ms(100);
+    let reports = c.feedback();
+    assert_eq!(reports.len(), 2);
+    let sequences =
+        |i: usize| -> Vec<u64> { reports[i].frames.iter().map(|f| f.sequence).collect() };
+    assert!(reports[0].c5_estimated);
+    assert_eq!(sequences(0), [1, 2, 4]);
+    assert!(!reports[1].c5_estimated);
+    assert_eq!(sequences(1), [3]);
+    // The split report carries no loss bitmap or LTR ack, the same counters.
+    assert!(reports[1].loss.is_none() && reports[1].ltr_ack.is_none());
+    assert_eq!(reports[1].highest_complete_sequence, 4);
+    assert_eq!(c.stats().presented_estimated, 2);
+    // Measured only: one report, flag clear (4 was reported already).
+    c.output(4);
+    c.delta(5, 5);
+    c.output(5);
+    c.advance_ms(100);
+    let reports = c.feedback();
+    assert_eq!(reports.len(), 3);
+    assert!(!reports[2].c5_estimated);
+    assert_eq!(
+        reports[2]
+            .frames
+            .iter()
+            .map(|f| f.sequence)
+            .collect::<Vec<_>>(),
+        [5]
+    );
 }
 
 #[test]
