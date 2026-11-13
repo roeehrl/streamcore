@@ -230,8 +230,8 @@ fn fence_main(
         surfaces.reap(completed);
         if let Some((rb, strip)) = w.readback {
             // The copy was recorded before the signal, so it is complete once the value is.
-            if reached
-                && let (Ok(Some(row)), Some(r)) = (rb.try_read_row(gpu), recorder)
+            let read = reached.then(|| rb.try_read_row(gpu));
+            if let (Some(Ok(Some(row))), Some(r)) = (read, recorder)
                 && let Some(counter) = decode_row(&row, strip)
             {
                 r.counter(w.value, counter);
