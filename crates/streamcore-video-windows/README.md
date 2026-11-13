@@ -78,8 +78,9 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   current mode's rate from `QueryDisplayConfig` as a fraction (59.94 Hz stays 60000/1001; the
   `EnumDisplaySettings` integer would say 59) for `StreamPlan::refresh_interval_ns`, and again for
   `StreamController::set_refresh_interval` after `WM_DISPLAYCHANGE`. `None` when unreadable. The
-  same path gives `DisplayLayout::rotation`. WGC frames arrive in desktop orientation, so the
-  converter never rotates.
+  same path gives `DisplayLayout::rotation` (Portrait reads 90, Portrait (flipped) 270). WGC frames
+  arrive in desktop orientation in every rotation (checked on a 4K monitor in both portrait
+  modes: 2160x3840, every barcode decoded), so the converter never rotates.
 - **H0 is the frame's display time.** `SystemRelativeTime` is when the composition reaches the
   screen, and DWM hands the frame to WGC before that refresh: under constant redraw at 60 Hz it
   arrives about 12 ms early (H1 → H0 p50 11.7 ms), on an idle desktop at about the same time.

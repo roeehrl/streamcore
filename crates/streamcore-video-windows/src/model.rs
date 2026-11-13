@@ -18,6 +18,10 @@ pub struct OutputInfo {
     pub bits_per_color: u32,
     pub color_space: String,
     pub refresh_hz: Option<f64>,
+    /// Clockwise rotation of the desktop against the panel, degrees.
+    pub rotation_deg: u16,
+    /// Effective DPI (96 = 100 %).
+    pub dpi: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
