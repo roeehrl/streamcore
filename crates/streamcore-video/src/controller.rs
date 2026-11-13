@@ -34,6 +34,19 @@ pub struct StreamParts {
     pub timings: Option<StreamTimings>,
 }
 
+/// What a combined canvas stream adds to [`StreamParts`] (3.9). The stream's
+/// `spec.target` is `CaptureTarget::Canvas` naming the layout's displays in
+/// order; `spec.pixel_width` × `spec.pixel_height` is the canvas (the plan's
+/// encode size, from [`crate::canvas_size`]); `spec.format`, `color`, `cursor`,
+/// `min_interval_ns` and `queue_depth` apply to every member capture (4–5 on a
+/// GPU path, 3.2). The plan's `convert` is `Identity` and its `encoder_input`
+/// the composite's format (NV12).
+#[derive(uniffi::Record)]
+pub struct CanvasParts {
+    pub layout: crate::canvas::CanvasLayout,
+    pub compositor: Arc<dyn Compositor>,
+}
+
 /// One stream: a serial executor over the backends in [`StreamParts`].
 /// Dropping it without closing posts a close; the executor then keeps itself
 /// alive until `Closed`.
@@ -45,9 +58,21 @@ pub struct StreamController {
 #[uniffi::export]
 impl StreamController {
     /// Validates the spec and plan before anything native is allocated.
+    /// A `CaptureTarget::Canvas` spec is `Unsupported` here: a canvas needs a
+    /// compositor ([`StreamController::new_canvas`]).
     #[uniffi::constructor]
     pub fn new(parts: StreamParts) -> Result<Arc<Self>, MediaError> {
         Self::with_clock(parts, Arc::new(MonotonicClock::default()))
+    }
+
+    /// A combined canvas stream (3.9): Rust opens one display capture per
+    /// member, starts and stops them as one group, waits for every member's
+    /// first image (5 s), re-observes the layout every 250 ms and composes the
+    /// latest image of each member through `canvas.compositor`. Validates the
+    /// layout, spec and plan before anything native is allocated.
+    #[uniffi::constructor]
+    pub fn new_canvas(parts: StreamParts, canvas: CanvasParts) -> Result<Arc<Self>, MediaError> {
+        Self::canvas_with_clock(parts, canvas, Arc::new(MonotonicClock::default()))
     }
 
     /// Start capture and encoding. The result is an `OpResult` for the returned
@@ -167,7 +192,24 @@ impl StreamController {
 impl StreamController {
     /// [`StreamController::new`] with an injected clock (tests, simulations).
     pub fn with_clock(parts: StreamParts, clock: Arc<dyn Clock>) -> Result<Arc<Self>, MediaError> {
-        validate(&parts.spec, &parts.plan)?;
+        Self::build(parts, None, clock)
+    }
+
+    /// [`StreamController::new_canvas`] with an injected clock.
+    pub fn canvas_with_clock(
+        parts: StreamParts,
+        canvas: CanvasParts,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Arc<Self>, MediaError> {
+        Self::build(parts, Some(canvas), clock)
+    }
+
+    fn build(
+        parts: StreamParts,
+        canvas: Option<CanvasParts>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Arc<Self>, MediaError> {
+        validate(&parts.spec, &parts.plan, canvas.as_ref().map(|c| &c.layout))?;
         if parts.plan.convert == ConvertPath::Convert && parts.converter.is_none() {
             return Err(MediaError::InvalidSettings);
         }
@@ -193,7 +235,15 @@ impl StreamController {
         };
         let sink = VideoSink::new(&output, clock.clone(), stream_id, &plan);
         let shared = Shared::new(queue, sink, clock, |weak| {
-            StreamState::new(weak.clone(), stream_id, spec, plan, timings, backends)
+            StreamState::new(
+                weak.clone(),
+                stream_id,
+                spec,
+                plan,
+                timings,
+                backends,
+                canvas,
+            )
         });
         shared.sink.bind(Arc::downgrade(&shared));
         port.bind(&shared)?;

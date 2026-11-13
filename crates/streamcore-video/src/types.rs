@@ -365,12 +365,18 @@ pub struct MemberSurface {
     pub surface: SurfaceId,
 }
 
+/// One member's tile in the canvas, in canvas pixels; `member` is the member's
+/// index in its layout (also [`MemberSurface::member`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct CanvasTile {
     pub member: u8,
     pub rect: Rect,
 }
 
+/// What [`crate::Compositor::configure`] prepares: an NV12 (the plan's encoder
+/// input) canvas of `width` × `height` with every gap black, tiles drawn from
+/// each member's latest surface (scaled to the tile), converted to `color`
+/// (gamut and matrix: the members' own tags in, these out).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct CanvasPlan {
     pub width: u32,
@@ -381,9 +387,15 @@ pub struct CanvasPlan {
     pub pool_size: u8,
 }
 
+/// A compose call's result, returned at once (3.5): the GPU work is recorded and
+/// the composite's `fence` says when it is complete; consumers of the surface
+/// wait on it.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum ComposeResult {
-    Composed { surface: SurfaceInfo },
+    Composed {
+        surface: SurfaceInfo,
+    },
+    /// Every pool surface is leased to Rust; Rust retries when it releases one.
     PoolExhausted,
 }
 
@@ -788,6 +800,24 @@ pub struct StatsSnapshot {
     /// Refresh-aligned admission has no refresh interval and uses the target
     /// interval instead.
     pub refresh_fallback: bool,
+    /// Canvas (3.9): composites drawn.
+    #[uniffi(default = 0)]
+    pub canvas_composed: u64,
+    /// Canvas: compose calls that found the composite pool exhausted; each is
+    /// retried when a composite surface is released, not on a member's next
+    /// image.
+    #[uniffi(default = 0)]
+    pub canvas_pool_exhausted: u64,
+    /// Canvas: complete member images received.
+    #[uniffi(default = 0)]
+    pub canvas_member_frames: u64,
+    /// Canvas: the member age spread of the last composite, the newest member
+    /// image's H0 minus the oldest's (H1 where a member has no H0), µs.
+    #[uniffi(default = 0)]
+    pub canvas_age_spread_us: u64,
+    /// Canvas: the largest member age spread so far, µs.
+    #[uniffi(default = 0)]
+    pub canvas_age_spread_max_us: u64,
 }
 
 /// Jobs for the consumer, posted to its [`crate::ObserverQueue`] and never run on

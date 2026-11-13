@@ -69,7 +69,8 @@ timer token. A stale event is discarded after its permit and lease are released.
 
 ## Outbound calls run only on the executor, during a drain
 
-`CaptureBackend` open, start, update and stop; `Converter::convert`; `EncoderFactory::create`
+`CaptureBackend` open, start, update, stop and `observe_layout`; `Converter::convert`;
+`Compositor` configure and compose; `EncoderFactory::create`
 (issued by the executor, run on its bounded helper thread);
 `Encoder` submit, `set_rate` and `invalidate`; `VideoSink::push`;
 `ObserverQueue::post`; `SerialQueue::wake_after`. Results of synchronous calls are values
@@ -246,9 +247,20 @@ calls (above).
   (H1, H3 and H4 as offsets from H0, sampled by `SinkPolicy::timing_every`) and H0 as `capture_us`
   on the transport clock, as the plan's `extensions` select; H5 (push) and H6 (written) go in the
   sampled `frameTiming` report on lane 0. A recovery re-encode keeps the image's H0 and H1.
+- **Composites.** `Compositor::compose` records GPU work and returns at once, like `convert`:
+  Rust's hold on the member surfaces it names ends when it returns, so a compositor whose GPU work
+  still reads a member keeps it valid itself (a retained `CVPixelBuffer`). The composite's `fence`
+  says when its GPU work is complete; the encoder adapter waits on it before its hardware reads the
+  surface (VideoToolbox cannot wait on a GPU fence: the macOS adapter defers that frame's encode
+  to the event's notification, in submit order, and its `invalidate` drains the deferred encodes
+  first). A composite lease's release is a leaf call (the compositor's `release`, then atomics and
+  at most one post): it ends a `PoolExhausted` wait. Rust holds each member's latest image and at
+  most one undelivered in the mailbox; a canvas member is identified by its capture id (its
+  `member` is `None`), so the per-frame C ABI's frame works per member capture.
 - `CaptureEvents::layout_changed` (a display mode, DPI, rotation or window size change) posts
   `ObserverJob::LayoutChanged { epoch, layout }`; the consumer re-plans, for example with a size
-  update. The executor does not resize by itself.
+  update. The executor does not resize by itself. On a canvas it fails the stream with `stream.layoutChanged` instead:
+  the reviewed arrangement is gone.
 
 ## Clocks
 

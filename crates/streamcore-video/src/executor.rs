@@ -11,7 +11,7 @@ use crate::types::*;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::task::Waker;
 use std::time::{Duration, Instant};
@@ -107,6 +107,8 @@ pub(crate) enum Releaser {
     /// The capture backend, and its attached C `release` if any.
     Capture(Weak<dyn CaptureBackend>, Option<(Context, ReleaseFn)>),
     Converter(Weak<dyn Converter>),
+    /// A composite (3.9): releasing it may end a `PoolExhausted` wait.
+    Compositor(Weak<dyn Compositor>, Weak<Shared>),
 }
 
 /// Rust's hold on a native surface. Dropping it calls the producer's
@@ -142,6 +144,14 @@ impl Drop for SurfaceLease {
             Releaser::Converter(converter) => {
                 if let Some(converter) = converter.upgrade() {
                     converter.release(self.id);
+                }
+            }
+            Releaser::Compositor(compositor, shared) => {
+                if let Some(compositor) = compositor.upgrade() {
+                    compositor.release(self.id);
+                }
+                if let Some(shared) = shared.upgrade() {
+                    shared.composite_released();
                 }
             }
         }
@@ -293,6 +303,11 @@ pub(crate) struct Shared {
     /// `submit_due` before it ends instead of posting `PermitReleased` to
     /// itself (which cost a wake and a second drain per frame).
     pub(crate) permit_released: AtomicBool,
+    /// Canvas: a compose found the pool exhausted; the next composite release
+    /// posts `PoolReleased` (3.9).
+    pub(crate) pool_waiting: AtomicBool,
+    /// Canvas: composite surfaces Rust holds (the latest and those in flight).
+    pub(crate) composites_out: AtomicUsize,
     /// The C ABI's per-frame callbacks ([`native`]); cleared at `Closed`.
     native: Mutex<NativeStream>,
     /// The open capture's event port, for the C ABI's frames.
@@ -338,6 +353,8 @@ impl Shared {
                 mailbox_replaced: AtomicU64::new(0),
                 capture_skipped: AtomicU64::new(0),
                 permit_released: AtomicBool::new(false),
+                pool_waiting: AtomicBool::new(false),
+                composites_out: AtomicUsize::new(0),
                 native: Mutex::default(),
                 capture_port: Mutex::new(Weak::new()),
             }
@@ -428,6 +445,16 @@ impl Shared {
     /// A per-frame C call panicked: fail the stream (`stream.output`).
     pub(crate) fn fail_from_native(&self) {
         self.post(Event::Internal(Internal::Fail(crate::error::codes::OUTPUT)));
+    }
+
+    /// A composite lease was dropped (a leaf: atomics, then a post).
+    fn composite_released(&self) {
+        let _ = self
+            .composites_out
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        if self.pool_waiting.swap(false, Ordering::AcqRel) {
+            self.post(Event::Internal(Internal::PoolReleased));
+        }
     }
 
     pub(crate) fn set_capture_port(&self, port: &Arc<CapturePort>) {
@@ -688,9 +715,10 @@ impl StreamPort {
 pub(crate) struct CapturePort {
     pub(crate) executor: Weak<Shared>,
     pub(crate) backend: Weak<dyn CaptureBackend>,
-    /// The shape of the last `Complete` single-source frame, which the C ABI's
-    /// `streamcore_video_frame` repeats.
-    pub(crate) shape: Mutex<Option<(CaptureId, SurfaceShape)>>,
+    /// The shape of the last `Complete` single-source frame of each capture
+    /// (one per canvas member), which the C ABI's `streamcore_video_frame`
+    /// repeats.
+    pub(crate) shape: Mutex<Vec<(CaptureId, SurfaceShape)>>,
 }
 
 /// The parts of a [`SurfaceInfo`] that the C ABI's frame does not carry.
@@ -742,10 +770,13 @@ impl CapturePort {
         capture_ns: u64,
         source_present_ns: u64,
     ) -> bool {
-        let shape = match *lock(&self.shape) {
-            Some((capture, shape)) if capture == id => shape,
-            // No full frame of this capture yet: not taken.
-            _ => return false,
+        let shape = lock(&self.shape)
+            .iter()
+            .find(|(capture, _)| *capture == id)
+            .map(|(_, shape)| *shape);
+        // No full frame of this capture yet: not taken.
+        let Some(shape) = shape else {
+            return false;
         };
         let info = SurfaceInfo {
             id: surface,
@@ -776,7 +807,18 @@ impl CaptureEvents for CapturePort {
                 color: surface.color,
                 rotation: surface.rotation,
             };
-            *lock(&self.shape) = Some((id, shape));
+            let mut shapes = lock(&self.shape);
+            match shapes.iter_mut().find(|(capture, _)| *capture == id) {
+                Some(entry) => entry.1 = shape,
+                None => {
+                    // A canvas has at most 8 member captures; a backend that
+                    // reuses ids replaces its entry above.
+                    if shapes.len() >= 16 {
+                        shapes.remove(0);
+                    }
+                    shapes.push((id, shape));
+                }
+            }
         }
         self.deliver(id, member, surface, status);
     }

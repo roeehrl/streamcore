@@ -576,6 +576,28 @@ a pool of three, an exhausted pool retrying one interval later) and VideoToolbox
 - Estimated 0.5–1.5 ms on Apple silicon for a 5K-wide canvas; the CPU path is benchmarked first, and
   canvas and colour qualification re-run.
 
+**As shipped (P2).** `StreamController::new_canvas(parts, CanvasParts { layout, compositor })`
+runs a `CaptureTarget::Canvas` stream; `StreamController::new` keeps answering such a spec with
+`Unsupported`, so a backend without a compositor keeps the consumer's own path. The layout
+(`CanvasLayout`, members in one global coordinate space with their scale) is validated with the
+consumer's limits (2–8 members, no overlap, ≤ 8192 px per edge, ≤ 7680×4320); `canvas_size`,
+`canvas_tiles`, `canvas_input_target` and `canvas_nearest_member_point` are exported for the
+consumer. Rust opens one `Display` capture per member at its tile size, starts and stops them
+as one group (a failed start stops only the members that started; a failed member stop keeps
+that member running, `StopFailed`), acknowledges the start only once every member delivered an
+image within 5 s (`stream.firstFrame`), observes the layout before allocating anything, when the
+first images are in and every 250 ms through `CaptureBackend::observe_layout`
+(`stream.layoutChanged`; a backend reports a mirrored display, or one whose rotation changed, as
+`None`), and fails on a blank, suspended or gone member (`stream.memberUnavailable`). A member
+image marks the canvas dirty; a composite is drawn at most once per frame interval and is due for
+submit at once. `Compositor::configure` gets a pool of 5 (the largest permit target + 2);
+`PoolExhausted` (or `OutOfResources`) waits for Rust to release a composite (a fallback timer of
+one interval when Rust holds none). The composite's H0 and H1 are the newest changed member's;
+`StatsSnapshot` counts composites, pool waits and member images and reports the member age
+spread. Under frames.v4 each canvas start sends `layoutInfo` (the members' union filling the
+picture) for a new layout epoch, which frames carry in the `content` TLV when the plan selects
+`Content`. The compose call itself is UniFFI (one per composite), not part of the per-frame C ABI.
+
 **Other consumer surfaces.** Consumer previews (one-shot stills, long edge ≤ 320 px) stay outside
 `streamcore-video` in v1. Audio keeps its own lane and path; only the handover (8.8) touches it.
 
