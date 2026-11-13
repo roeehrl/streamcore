@@ -31,10 +31,10 @@ fn any_encoder(fakes: &Fakes, rng: &mut StdRng) -> Option<Arc<FakeEncoder>> {
 fn random_update(rng: &mut StdRng) -> StreamUpdate {
     let size = rng.gen_bool(0.3).then(|| [32, 48, 64][rng.gen_range(0..3)]);
     StreamUpdate {
-        rate: Some(RateUpdate {
-            bitrate_bps: rng.gen_range(1_000_000..8_000_000),
-            fps: rng.gen_range(1..=120),
-        }),
+        rate: Some(RateUpdate::new(
+            rng.gen_range(1_000_000..8_000_000),
+            rng.gen_range(1..=120),
+        )),
         capture: CaptureUpdate {
             min_interval_ns: None,
             region: None,

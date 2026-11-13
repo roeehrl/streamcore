@@ -41,10 +41,7 @@ fn a_stop_or_update_arriving_during_an_inline_drain_waits_for_the_next_wake() {
                 controller.stop()
             } else {
                 controller.update(StreamUpdate {
-                    rate: Some(RateUpdate {
-                        bitrate_bps: 1_000_000,
-                        fps: 30,
-                    }),
+                    rate: Some(RateUpdate::new(1_000_000, 30)),
                     capture: no_capture_change(),
                     encode_width: None,
                     encode_height: None,

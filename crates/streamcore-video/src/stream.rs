@@ -29,6 +29,7 @@
 
 mod canvas_run;
 
+use crate::abr::{AbrConfig, AbrController, AbrSample};
 use crate::bounded::run_bounded_value;
 use crate::canvas::CanvasArrangement;
 use crate::controller::CanvasParts;
@@ -56,6 +57,8 @@ pub(crate) enum Command {
         generation: u64,
         token: u32,
     },
+    /// The client's `videoFeedback` times and loss (rate adaptation, 6.6).
+    ClientFeedback(ClientFeedback),
     /// The stream moved to another transport.
     TransportChanged,
     Revoked,
@@ -106,6 +109,8 @@ enum TimerKind {
     Observe,
     /// Canvas: the next composite is due (cadence).
     Compose,
+    /// Rate adaptation's tick (6.6).
+    Abr,
 }
 
 struct EncoderSlot {
@@ -220,6 +225,16 @@ pub(crate) struct StreamState {
     pace_timer: Option<TimerToken>,
     /// The adaptive permit target (6.2).
     permits: PermitGovernor,
+    /// Rate adaptation (6.6), while the stream runs with it switched on.
+    abr: Option<AbrController>,
+    abr_timer: Option<TimerToken>,
+    /// (bulk bytes sent, executor time it last grew).
+    bulk_seen: (u64, u64),
+    /// The highest (generation, sequence) the client reported missing.
+    client_loss_seen: (u64, u64),
+    /// A recovery waits for the sink to leave backpressure: it runs on the
+    /// sink's next report that finds it ready.
+    recovery_wait_ready: bool,
 
     timers: BTreeMap<TimerToken, (u64, TimerKind)>,
     next_timer: TimerToken,
@@ -239,6 +254,11 @@ pub(crate) struct StreamState {
     /// submit run; everything else is posted.
     inline: bool,
 }
+
+/// Rate adaptation's tick (6.6).
+const ABR_TICK_NS: u64 = 100_000_000;
+/// Bulk counts as competing this long after its last byte.
+const BULK_ACTIVE_NS: u64 = 1_000_000_000;
 
 /// How many marked LTR tokens of the current encoder are remembered (acks of
 /// older ones are ignored).
@@ -442,6 +462,11 @@ impl StreamState {
             pacer,
             pace_timer: None,
             permits,
+            abr: None,
+            abr_timer: None,
+            bulk_seen: (0, 0),
+            client_loss_seen: (0, 0),
+            recovery_wait_ready: false,
             timers: BTreeMap::new(),
             next_timer: 0,
             armed: None,
@@ -596,6 +621,15 @@ impl StreamState {
         stats.bulk_capacity_estimated = sink.capacity_estimated;
         stats.bulk_bucket_inactive = cx.sink.bucket_inactive();
         stats.encode_p95_us = self.permits.p95_ns().map_or(0, |ns| ns / 1_000);
+        stats.abr_active = self.abr.is_some();
+        stats.abr_target_bps = self.plan.bitrate_bps;
+        stats.abr_fps = self.plan.fps;
+        if let Some(abr) = &self.abr {
+            stats.abr_queueing_us = abr.queueing_ns() / 1_000;
+            stats.abr_decreases = abr.decreases();
+            stats.abr_tier_changes = abr.tier_changes();
+        }
+        stats.bulk_video_bps = sink.bulk_video_bps;
         if self.plan.pacing.refresh_aligned {
             stats.refresh_interval_ns = self.pacer.refresh_ns();
             stats.refresh_fallback = self.plan.refresh_interval_ns.is_none();
@@ -701,7 +735,11 @@ impl StreamState {
                 self.stats.client_flushed = self.stats.client_flushed.saturating_add(frames);
             }
             Command::LtrAck { generation, token } => self.on_ltr_ack(generation, token),
+            Command::ClientFeedback(feedback) => self.on_client_feedback(cx, feedback),
             Command::TransportChanged => {
+                if let Some(abr) = &mut self.abr {
+                    abr.reset_delay();
+                }
                 // Acks from the old transport no longer count (6.5).
                 self.ltr.acked = None;
                 self.ltr.pending_ack = None;
@@ -835,7 +873,28 @@ impl StreamState {
         }
         self.command = Some(op);
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
+        let mut update = update;
+        if let Some(abr) = &mut self.abr {
+            // The consumer's rate and size are the new ceiling; adaptation
+            // starts again from the full tier, keeping its bitrate where it fits.
+            let mut config = abr.config();
+            if let Some(rate) = update.rate {
+                config.fps = rate.fps;
+                config.bitrate_bps = rate.bitrate_bps;
+            }
+            if let Some((w, h)) = size {
+                (config.width, config.height) = (w, h);
+            }
+            abr.reconfigure(config);
+            if let Some(rate) = &mut update.rate {
+                let target = abr.target();
+                rate.bitrate_bps = target.bitrate_bps;
+                rate.fps = target.fps;
+            }
+        }
+        let update = update;
         if let Some(rate) = update.rate {
+            let rate = self.rate_update(rate.bitrate_bps, rate.fps, rate);
             self.plan.fps = rate.fps;
             cx.sink.set_fps(rate.fps);
             self.pacer.set_target(interval_ns(rate.fps));
@@ -902,6 +961,7 @@ impl StreamState {
             return;
         };
         self.cancel_pace();
+        self.stop_abr();
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -1009,6 +1069,7 @@ impl StreamState {
             );
         }
         self.finish_command(cx, OpOutcome::Completed);
+        self.start_abr(cx);
     }
 
     fn on_op_timeout(&mut self, cx: &Arc<Shared>, token: OpToken) {
@@ -1093,6 +1154,7 @@ impl StreamState {
         cx.work.close();
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
         self.cancel_pace();
+        self.stop_abr();
         self.clear_canvas(cx);
         self.latest = None;
         self.clear_recovery();
@@ -1161,6 +1223,12 @@ impl StreamState {
             TimerKind::FirstImage | TimerKind::Observe | TimerKind::Compose => {
                 self.on_canvas_timer(cx, token, kind);
             }
+            TimerKind::Abr => {
+                if self.abr_timer == Some(token) {
+                    self.abr_timer = None;
+                    self.abr_tick(cx);
+                }
+            }
         }
     }
 
@@ -1168,6 +1236,7 @@ impl StreamState {
     // Encoder sessions.
 
     fn reset_stream_state(&mut self) {
+        self.stop_abr();
         self.cancel_pace();
         self.canvas_reset();
         self.pacer.reset();
@@ -1253,6 +1322,16 @@ impl StreamState {
                     }
                     self.announced_codec = Some(info.codec);
                     self.stats.encoders_created += 1;
+                    if self.abr.is_some() {
+                        // The adapted rate, with the rate window and maximum QP
+                        // the spec cannot carry.
+                        let rate = self.rate_update(
+                            self.plan.bitrate_bps,
+                            self.plan.fps,
+                            RateUpdate::new(self.plan.bitrate_bps, self.plan.fps),
+                        );
+                        let _ = encoder.set_rate(rate);
+                    }
                     self.encoder = Some(EncoderSlot {
                         generation,
                         native_submit: sink.native_submit(),
@@ -2016,6 +2095,26 @@ impl StreamState {
                 self.submit_due(cx);
             }
             DropReason::Error { error } => self.on_encoder_error(cx, Some(seq), error),
+            DropReason::Skipped => {
+                self.stats.encoder_skipped += 1;
+                // Never encoded: nothing references it. A skipped recovery keyframe
+                // still leaves the loss it was for (sent again).
+                if seq == self.keyframe_submitted_seq {
+                    self.keyframe_submitted_seq = 0;
+                    self.record_loss(cx, seq);
+                } else if seq == self.submitted_seq
+                    && let Some(latest) = self.latest.as_mut().filter(|latest| !latest.pending)
+                {
+                    // The newest image was skipped: encode it again, so a still
+                    // screen still shows its last change (R2).
+                    latest.pending = true;
+                    latest.admitted = true;
+                    latest.restamp = self.time_anchor.map(|(host, local)| {
+                        host.saturating_add(cx.clock.now_ns().saturating_sub(local))
+                    });
+                }
+                self.submit_due(cx);
+            }
         }
     }
 
@@ -2069,6 +2168,23 @@ impl StreamState {
             }
             SinkEvent::Ready => {}
         }
+        if self.recovery_wait_ready && !self.closing {
+            if cx.sink.state().backpressured {
+                // Still pressured: the next report looks again.
+                cx.sink.notify_ready();
+            } else {
+                // Follow-up to 6.5: the recovery the backlog held back runs as
+                // soon as the sink admits again, not at the re-check timer.
+                self.recovery_wait_ready = false;
+                if self.recovery_needed {
+                    self.stats.recoveries_on_ready += 1;
+                    self.recovery_timer = None;
+                    self.cancel_timers(|kind| *kind == TimerKind::Recovery);
+                    self.recover(cx);
+                    return;
+                }
+            }
+        }
         if !self.closing {
             self.submit_due(cx);
         }
@@ -2078,6 +2194,7 @@ impl StreamState {
     // Recovery.
 
     fn clear_recovery(&mut self) {
+        self.recovery_wait_ready = false;
         self.recovery_posted = false;
         self.recovery_needed = false;
         self.force_keyframe = false;
@@ -2263,9 +2380,16 @@ impl StreamState {
         let in_flight = self.plan.pacing.immediate_recovery
             && self.keyframe_submitted_seq.max(self.ltr.refresh_seq) > self.lost_seq;
         if too_soon || pressured || in_flight {
+            if pressured && !too_soon && !in_flight && self.plan.pacing.immediate_recovery {
+                // Run it when the sink leaves backpressure; the timer stays as
+                // the fallback (a kernel-side signal reports no completion).
+                self.recovery_wait_ready = true;
+                cx.sink.notify_ready();
+            }
             self.schedule_recovery(cx);
             return;
         }
+        self.recovery_wait_ready = false;
         self.stats.recoveries += 1;
         if ltr {
             self.stats.ltr_refreshes += 1;
@@ -2285,5 +2409,191 @@ impl StreamState {
         }
         self.submit_due(cx);
         self.schedule_recovery(cx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Rate adaptation (6.6).
+
+    /// A rate update for the encoder: `bitrate_bps` and `fps`, with rate
+    /// adaptation's rate window and (planner-confirmed) maximum QP. `base`
+    /// carries a consumer's own optional fields.
+    fn rate_update(&self, bitrate_bps: u64, fps: u32, base: RateUpdate) -> RateUpdate {
+        let pacing = self.plan.pacing;
+        let adapting = self.abr.is_some();
+        RateUpdate {
+            bitrate_bps,
+            fps,
+            rate_window_ms: base
+                .rate_window_ms
+                .or((adapting && pacing.rate_window_ms != 0).then_some(pacing.rate_window_ms)),
+            max_frame_qp: base
+                .max_frame_qp
+                .or((adapting && pacing.max_frame_qp != 0).then_some(pacing.max_frame_qp)),
+        }
+    }
+
+    /// Switch rate adaptation on for a running stream (its plan's rate and
+    /// size are the ceiling) and give the encoder the rate window.
+    fn start_abr(&mut self, cx: &Arc<Shared>) {
+        if !self.plan.pacing.rate_adaptation || self.abr.is_some() || self.closing {
+            return;
+        }
+        self.abr = Some(AbrController::new(AbrConfig {
+            width: self.plan.encode_width,
+            height: self.plan.encode_height,
+            fps: self.plan.fps,
+            bitrate_bps: self.plan.bitrate_bps,
+            medium_cap_bps: self.plan.medium_cap_bps,
+            // A new size needs a converter to scale into it; a canvas is
+            // composed at its layout's size.
+            resolution_steps: self.plan.convert == ConvertPath::Convert && self.canvas.is_none(),
+        }));
+        self.bulk_seen = (0, cx.clock.now_ns());
+        if let Some(target) = self.abr.as_ref().map(AbrController::target) {
+            self.apply_abr(cx, target, true);
+        }
+        self.arm_abr(cx);
+    }
+
+    fn stop_abr(&mut self) {
+        if self.abr.take().is_some() {
+            self.abr_timer = None;
+            self.cancel_timers(|kind| *kind == TimerKind::Abr);
+        }
+    }
+
+    fn arm_abr(&mut self, cx: &Shared) {
+        if self.abr.is_some() && self.abr_timer.is_none() && !self.closing {
+            self.abr_timer = Some(self.set_timer(cx, ABR_TICK_NS, TimerKind::Abr));
+        }
+    }
+
+    fn abr_tick(&mut self, cx: &Arc<Shared>) {
+        if self.closing
+            || cx.revoked()
+            || !matches!(self.phase, StreamPhase::Running | StreamPhase::Updating)
+        {
+            return;
+        }
+        let now = cx.clock.now_ns();
+        let link = cx.sink.link_stats();
+        let bulk_bytes = link.map_or(0, |l| l.bulk_bytes_sent);
+        if bulk_bytes > self.bulk_seen.0 {
+            self.bulk_seen = (bulk_bytes, now);
+        }
+        let bulk_active = bulk_bytes > 0 && now.saturating_sub(self.bulk_seen.1) <= BULK_ACTIVE_NS;
+        let sink = cx.sink.counters();
+        self.stats.link_rtt_us = link.and_then(|l| l.rtt_us).unwrap_or(0);
+        self.stats.link_lost_packets = link.map_or(0, |l| l.lost_packets);
+        let sample = AbrSample {
+            now_ns: now,
+            unsent_age_ns: cx.sink.unsent_age_ns(),
+            credit_rtt_ns: cx.sink.recent_rtt_ns(),
+            link_rtt_ns: link
+                .and_then(|l| l.rtt_us)
+                .map(|us| us.saturating_mul(1_000)),
+            link_lost_packets: self.stats.link_lost_packets,
+            lost_frames: sink
+                .refused
+                .saturating_add(sink.aged_shed)
+                .saturating_add(self.stats.client_lost),
+            video_bps: sink.video_bps,
+            bulk_active,
+            capacity_bps: (!sink.capacity_estimated && sink.capacity_bps != 0)
+                .then_some(sink.capacity_bps),
+        };
+        let changed = self.abr.as_mut().and_then(|abr| abr.tick(&sample));
+        if let Some(target) = changed {
+            self.apply_abr(cx, target, false);
+        }
+        self.arm_abr(cx);
+    }
+
+    /// Give the encoder, the pacer and the sink rate adaptation's target; a
+    /// new size is a new encoder generation.
+    fn apply_abr(&mut self, cx: &Arc<Shared>, target: crate::abr::AbrTarget, force: bool) {
+        cx.sink.set_video_target(target.bitrate_bps);
+        let fps_changed = target.fps != self.plan.fps;
+        if fps_changed {
+            // The pacer admits fewer frames; the encoder is only told (6.6).
+            self.plan.fps = target.fps;
+            cx.sink.set_fps(target.fps);
+            self.pacer.set_target(interval_ns(target.fps));
+        }
+        let size = (target.width, target.height);
+        if size != (self.plan.encode_width, self.plan.encode_height) {
+            self.plan.encode_width = target.width;
+            self.plan.encode_height = target.height;
+            self.plan.bitrate_bps = target.bitrate_bps;
+            // The new session gets the rate at creation (and the window then).
+            self.schedule_recreate(cx);
+            return;
+        }
+        if !force && !fps_changed && target.bitrate_bps == self.plan.bitrate_bps {
+            return;
+        }
+        self.plan.bitrate_bps = target.bitrate_bps;
+        let rate = self.rate_update(
+            target.bitrate_bps,
+            target.fps,
+            RateUpdate::new(target.bitrate_bps, target.fps),
+        );
+        if let Some(slot) = &self.encoder {
+            let encoder = slot.encoder.clone();
+            debug_assert!(is_current(cx.id));
+            // A refusal leaves the encoder at its previous rate; the next
+            // change tries again.
+            let _ = encoder.set_rate(rate);
+        }
+    }
+
+    /// The client's `videoFeedback`: per-frame receive times matched to the
+    /// frames' H5 (the client delay inputs), and newly reported losses.
+    fn on_client_feedback(&mut self, cx: &Arc<Shared>, feedback: ClientFeedback) {
+        self.stats.client_feedback += 1;
+        let generation = feedback.generation;
+        let sequences: Vec<(u64, u64)> = feedback
+            .frames
+            .iter()
+            .filter(|f| f.receive_us != 0 && f.sequence != 0)
+            .map(|f| (f.sequence, f.receive_us))
+            .collect();
+        let samples = cx.sink.match_sent(generation, &sequences);
+        self.stats.client_delay_samples += samples.len() as u64;
+        if let Some(abr) = &mut self.abr {
+            abr.note_client_delay(cx.clock.now_ns(), &samples);
+        }
+        if feedback.loss_base_sequence != 0 {
+            let (seen_generation, seen) = self.client_loss_seen;
+            let mut highest = if seen_generation == generation {
+                seen
+            } else {
+                0
+            };
+            for (byte_index, byte) in feedback.loss_bits.iter().enumerate() {
+                for bit in 0..8 {
+                    if byte & (1 << bit) == 0 {
+                        continue;
+                    }
+                    let sequence = feedback
+                        .loss_base_sequence
+                        .saturating_add((byte_index * 8 + bit) as u64);
+                    if sequence > highest {
+                        highest = sequence;
+                        self.stats.client_lost += 1;
+                    }
+                }
+            }
+            if generation >= seen_generation {
+                self.client_loss_seen = (
+                    generation,
+                    highest.max(if seen_generation == generation {
+                        seen
+                    } else {
+                        0
+                    }),
+                );
+            }
+        }
     }
 }

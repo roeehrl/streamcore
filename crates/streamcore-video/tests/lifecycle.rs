@@ -14,10 +14,7 @@ fn rejected(code: &str) -> OpOutcome {
 
 fn rate_update() -> StreamUpdate {
     StreamUpdate {
-        rate: Some(RateUpdate {
-            bitrate_bps: 1_000_000,
-            fps: 30,
-        }),
+        rate: Some(RateUpdate::new(1_000_000, 30)),
         capture: CaptureUpdate {
             min_interval_ns: Some(SECOND / 30),
             region: None,

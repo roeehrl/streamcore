@@ -35,7 +35,7 @@ use crate::executor::{Clock, Event, Shared, lock};
 use crate::types::{FrameExtension, RecoveryStep, StreamPlan};
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use streamcore_media::media::{
     FrameTiming as WireTiming, LtrInfo as WireLtr, MAX_FRAME_LENGTH, VIDEO_FLAG_EXTENSION,
@@ -44,7 +44,7 @@ use streamcore_media::media::{
 use streamcore_media::video_control::{
     FrameTimingReport, KIND_FRAME_TIMING, KIND_LAYOUT_INFO, LayoutInfo,
 };
-use streamcore_transport::channel::SecureChannel;
+use streamcore_transport::channel::{LinkStats, SecureChannel};
 
 /// The sink's backlog, published after every change; read anywhere as a leaf
 /// call ([`crate::StreamController::sink_state`]). The pacer admits a frame to
@@ -136,6 +136,11 @@ pub trait SinkTransport: Send + Sync {
     fn backpressured(&self) -> bool {
         false
     }
+    /// The link's statistics for rate adaptation (6.6): quinn's path
+    /// statistics on QUIC, the bulk byte count. A leaf call.
+    fn link_stats(&self) -> Option<LinkStats> {
+        None
+    }
 }
 
 /// One enqueued message's completions. Dropping it before [`Self::written`]
@@ -217,6 +222,9 @@ impl SinkTransport for ChannelTransport {
     }
     fn now_us(&self) -> u64 {
         streamcore_transport::clock::monotonic_now_us()
+    }
+    fn link_stats(&self) -> Option<LinkStats> {
+        Some(self.0.link_stats())
     }
     fn enqueue(&self, frame: Vec<u8>, ticket: SendTicket) -> Result<(), SendTicket> {
         let pending = match self.0.enqueue_application_frame(frame) {
@@ -526,6 +534,11 @@ struct Unconsumed {
 }
 
 const RTT_WINDOW_NS: u64 = 2_000_000_000;
+/// The recent credit RTT (rate adaptation's input) is the smallest sample of
+/// this span: queueing raises even the smallest, consumer jitter does not.
+const RTT_RECENT_NS: u64 = 300_000_000;
+/// H5 of this many recent frames is kept to match client feedback.
+const SENT_KEPT: usize = 512;
 const RATE_WINDOW_NS: u64 = 1_000_000_000;
 const CAPACITY_WINDOW_NS: u64 = 2_000_000_000;
 const RATE_UPDATE_NS: u64 = 250_000_000;
@@ -545,6 +558,8 @@ struct Core {
     rtt: VecDeque<(u64, u64)>,
     pushed: VecDeque<(u64, usize)>,
     capacity: VecDeque<(u64, u64)>,
+    /// (generation, sequence, H5 µs) of recent frames, oldest first.
+    sent: VecDeque<(u64, u64, u64)>,
     written_frames: u64,
     events: Vec<SinkEvent>,
     stats: SinkCounters,
@@ -561,6 +576,8 @@ pub(crate) struct SinkCounters {
     pub(crate) unsent_max: u32,
     pub(crate) frame_timing_sent: u64,
     pub(crate) video_bps: u64,
+    /// The video rate given to the bulk bucket.
+    pub(crate) bulk_video_bps: u64,
     pub(crate) capacity_bps: u64,
     pub(crate) capacity_estimated: bool,
 }
@@ -571,6 +588,7 @@ struct Snapshot {
     oldest_h5_ns: Option<u64>,
     unconsumed: u32,
     rtt_ns: Option<u64>,
+    rtt_recent_ns: Option<u64>,
 }
 
 struct Inner {
@@ -592,6 +610,9 @@ struct Inner {
     deferred: Mutex<Vec<(u64, Completion)>>,
     snapshot: Mutex<Snapshot>,
     rates: Mutex<Option<(u64, u64, u64)>>,
+    /// Rate adaptation's target (bit/s; 0: none): the bulk bucket's video
+    /// rate while video is active, instead of the measured rate.
+    video_target_bps: AtomicU64,
     /// This sink, for its tickets. Frame messages have even ids; configuration
     /// and `frameTiming` messages odd ones.
     me: Weak<Inner>,
@@ -628,6 +649,7 @@ impl VideoSink {
                 deferred: Mutex::default(),
                 snapshot: Mutex::default(),
                 rates: Mutex::new(None),
+                video_target_bps: AtomicU64::new(0),
                 me: me.clone(),
             }),
         }
@@ -661,6 +683,53 @@ impl VideoSink {
 
     pub(crate) fn set_fps(&self, fps: u32) {
         self.inner.fps.store(fps.max(1), Ordering::Relaxed);
+    }
+
+    /// Rate adaptation's target for the bulk bucket's video rate (0: use the
+    /// measured rate).
+    pub(crate) fn set_video_target(&self, bps: u64) {
+        self.inner.video_target_bps.store(bps, Ordering::Relaxed);
+    }
+
+    /// The smallest credit RTT of the last 300 ms. A leaf call.
+    pub(crate) fn recent_rtt_ns(&self) -> Option<u64> {
+        lock(&self.inner.snapshot).rtt_recent_ns
+    }
+
+    /// The transport's link statistics. A leaf call.
+    pub(crate) fn link_stats(&self) -> Option<LinkStats> {
+        self.inner.transport.link_stats()
+    }
+
+    /// Pairs each `(sequence, value)` of wire generation `generation` with
+    /// the frame's H5 (transport µs): `(h5_us, value)`, for the recent frames
+    /// the sink still remembers.
+    pub(crate) fn match_sent(&self, generation: u64, frames: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let core = lock(&self.inner.core);
+        frames
+            .iter()
+            .filter_map(|(sequence, value)| {
+                core.sent
+                    .iter()
+                    .rev()
+                    .find(|(g, s, _)| *g == generation && s == sequence)
+                    .map(|(_, _, h5)| (*h5, *value))
+            })
+            .collect()
+    }
+
+    /// Age of the oldest frame not yet written, ns (0 when none). A leaf call.
+    pub(crate) fn unsent_age_ns(&self) -> u64 {
+        let snapshot = *lock(&self.inner.snapshot);
+        snapshot
+            .oldest_h5_ns
+            .map_or(0, |h5| self.inner.clock.now_ns().saturating_sub(h5))
+    }
+
+    /// Post `Ready` on the next write or consumption (a recovery waits for
+    /// the sink to leave backpressure).
+    pub(crate) fn notify_ready(&self) {
+        self.inner.waiting.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn counters(&self) -> SinkCounters {
@@ -707,6 +776,10 @@ impl VideoSink {
             }
             let bytes = unit.messages.iter().map(Vec::len).sum();
             core.pushed.push_back((now, bytes));
+            if core.sent.len() == SENT_KEPT {
+                core.sent.pop_front();
+            }
+            core.sent.push_back((unit.generation, unit.sequence, h5_us));
             core.next_id += 2;
             let id = core.next_id;
             if inner.policy.bounds {
@@ -831,6 +904,12 @@ impl Inner {
                     .min(),
                 unconsumed: u32::try_from(core.unconsumed.len()).unwrap_or(u32::MAX),
                 rtt_ns: core.rtt.iter().map(|(_, rtt)| *rtt).min(),
+                rtt_recent_ns: core
+                    .rtt
+                    .iter()
+                    .filter(|(at, _)| now.saturating_sub(*at) <= RTT_RECENT_NS)
+                    .map(|(_, rtt)| *rtt)
+                    .min(),
             };
             core.stats.unsent_max = core.stats.unsent_max.max(snapshot.unsent);
             let rates = self.rates(&mut core, now);
@@ -1101,12 +1180,22 @@ impl Inner {
         {
             core.capacity.pop_front();
         }
-        let video = core
+        let measured = core
             .pushed
             .iter()
             .map(|(_, bytes)| *bytes as u64)
             .sum::<u64>()
             * 8;
+        // While video is active, rate adaptation's target is the rate video
+        // is about to use; the measured rate trails it by a second and drops
+        // to nothing between bursts. Without a target (or without video),
+        // the measured rate.
+        let target = self.video_target_bps.load(Ordering::Relaxed);
+        let video = if target != 0 && !core.pushed.is_empty() {
+            target.max(measured)
+        } else {
+            measured
+        };
         let (capacity, estimated) = match self.capacity_hint {
             Some(hint) => (hint, false),
             None => (
@@ -1121,7 +1210,8 @@ impl Inner {
         } else {
             capacity
         };
-        core.stats.video_bps = video;
+        core.stats.video_bps = measured;
+        core.stats.bulk_video_bps = video;
         core.stats.capacity_bps = capacity;
         core.stats.capacity_estimated = estimated;
         if !self.policy.bulk_bucket || !self.bucket_enabled || core.revoked || capacity == 0 {

@@ -132,6 +132,17 @@ impl StreamController {
             .post(Event::Command(Command::LtrAck { generation, token }));
     }
 
+    /// The client's `videoFeedback` (9.4) for rate adaptation (6.6): pass
+    /// every report's generation, loss bitmap and per-frame times, alongside
+    /// [`StreamController::note_client_flush`]. Each frame's receive time (C1)
+    /// is paired with the frame's H5; the one-way delay above its windowed
+    /// minimum and its gradient are the client delay inputs (the clock offset
+    /// cancels). Missing frames count as loss once each.
+    pub fn note_client_feedback(&self, feedback: ClientFeedback) {
+        self.shared
+            .post(Event::Command(Command::ClientFeedback(feedback)));
+    }
+
     /// The stream's frames now reach the client over another transport (a
     /// path change or handover): LTR acknowledgements from the old one no
     /// longer count, so the held one is cleared and recovery falls back to an

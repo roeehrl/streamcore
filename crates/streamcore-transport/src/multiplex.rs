@@ -294,6 +294,8 @@ struct Sender {
     /// Set by `next` when the bucket held back a bulk fragment: retry after this
     /// many microseconds even without a wake-up.
     bulk_retry_us: Option<u64>,
+    /// Bulk payload bytes handed to the writer so far.
+    bulk_bytes: u64,
 }
 impl Default for Sender {
     fn default() -> Self {
@@ -309,6 +311,7 @@ impl Default for Sender {
             cursor: 0,
             bulk: BulkBucket::default(),
             bulk_retry_us: None,
+            bulk_bytes: 0,
         }
     }
 }
@@ -477,6 +480,10 @@ impl Multiplexer {
         let rate = s.bulk.rate_bytes_per_second();
         (self.features.bulk_token_bucket && rate != 0).then_some(rate)
     }
+    /// Bulk payload bytes handed to the writer so far.
+    pub(crate) fn bulk_bytes(&self) -> u64 {
+        self.sender.lock().map_or(0, |s| s.bulk_bytes)
+    }
     /// Sends a typed ping on lane 0; its send time is stamped as it is written.
     pub(crate) fn ping(&self) -> Result<(), ChannelError> {
         let clock = self
@@ -604,6 +611,9 @@ impl Multiplexer {
                     .sequence = sequence;
             }
             let end = (offset + CHUNK).min(data.len());
+            if lane == BULK_LANE {
+                s.bulk_bytes = s.bulk_bytes.saturating_add((end - offset) as u64);
+            }
             s.queues[lane]
                 .front_mut()
                 .ok_or(ChannelError::Closed)?

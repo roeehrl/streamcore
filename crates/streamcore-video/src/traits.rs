@@ -154,6 +154,14 @@ pub trait StreamEncoder: Send + Sync {
         opts: SubmitOpts,
         permit: Arc<VideoWorkPermit>,
     ) -> SubmitResult;
+    /// A live rate change (a consumer update, or rate adaptation, 6.6): never
+    /// replaces the session. Apply `bitrate_bps`. `fps` is a hint: an adapter
+    /// may ignore it, because the pacer enforces the frame rate by admitting
+    /// fewer frames, and rate adaptation never depends on the encoder for it.
+    /// `rate_window_ms` and `max_frame_qp` are optional (`None`: leave as is);
+    /// an encoder without them ignores them, and `max_frame_qp` is sent only
+    /// when [`EncoderCaps::max_frame_qp`] confirms it. A resolution change is
+    /// never a rate update: it creates a new session (a new generation).
     fn set_rate(&self, update: RateUpdate) -> Result<(), MediaError>;
     /// The one allowed wait (3.5): completes or discards pending output and
     /// returns within the stream's invalidate bound (500 ms). An adapter whose

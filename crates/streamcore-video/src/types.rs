@@ -447,6 +447,10 @@ pub struct EncoderCaps {
     pub dynamic_rate: bool,
     pub min_inputs_before_output: u8,
     pub vui_checked: bool,
+    /// The encoder honours [`RateUpdate::max_frame_qp`] (a frame-level maximum
+    /// QP, 6.6), confirmed by a probe. `false` until tested on that encoder.
+    #[uniffi(default = false)]
+    pub max_frame_qp: bool,
 }
 
 /// What [`crate::EncoderFactory::create`] builds. `sink` is where the encoder's
@@ -542,10 +546,36 @@ pub enum InvalidateOutcome {
     TimedOut,
 }
 
+/// A rate change for [`crate::StreamEncoder::set_rate`] (a consumer update or
+/// rate adaptation, 6.6). `fps` is a hint: an adapter may ignore it, since the
+/// pacer enforces the frame rate by admitting fewer frames. The optional
+/// fields are `None` when not requested; an adapter applies what its encoder
+/// supports and ignores the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct RateUpdate {
     pub bitrate_bps: u64,
     pub fps: u32,
+    /// The window over which `bitrate_bps` is enforced, in milliseconds (6.6:
+    /// 100–200 ms keeps an IDR from blocking the link). VideoToolbox:
+    /// `DataRateLimits` of `bitrate_bps × window` bytes per window.
+    #[uniffi(default = None)]
+    pub rate_window_ms: Option<u32>,
+    /// A frame-level maximum QP. Sent only when the encoder's caps confirm
+    /// it ([`EncoderCaps::max_frame_qp`]).
+    #[uniffi(default = None)]
+    pub max_frame_qp: Option<u8>,
+}
+
+impl RateUpdate {
+    /// A bitrate and frame rate only.
+    pub fn new(bitrate_bps: u64, fps: u32) -> Self {
+        Self {
+            bitrate_bps,
+            fps,
+            rate_window_ms: None,
+            max_frame_qp: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -607,6 +637,13 @@ pub enum DropReason {
     NoOutput,
     /// The encoder reported an error for this frame.
     Error { error: MediaError },
+    /// The encoder's rate control skipped the frame (VideoToolbox's
+    /// `kVTEncodeInfo_FrameDropped`): it was never encoded, so no later frame
+    /// references it and the chain is intact. Not a loss, unless it was a
+    /// recovery keyframe or LTR refresh (which is then sent again). Counted in
+    /// `encoder_drops` and `encoder_skipped`. Rate adaptation makes these more
+    /// likely on hard content at a low target (6.6).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
@@ -681,8 +718,10 @@ pub struct StreamPlan {
     pub pacing: PacingPolicy,
 }
 
-/// The P2 pacing behaviours (6.2, 6.3, 6.5). Each can be switched off to fall
-/// back to P1's admission and recovery (11.1); [`Default`] switches all on.
+/// The P2 pacing behaviours (6.2, 6.3, 6.5, 6.6). Each can be switched off to
+/// fall back to P1's admission and recovery (11.1); [`Default`] switches all
+/// on except rate adaptation, which a consumer turns on (with
+/// [`PacingPolicy::with_rate_adaptation`]) until it is qualified on hardware.
 ///
 /// Drop before encode (D7) has no switch: since P1 a frame that cannot be
 /// submitted only replaces the latest slot (skip cause b), and nothing queues.
@@ -705,6 +744,24 @@ pub struct PacingPolicy {
     /// `recovery_interval_ns` apart (at most 2 IDRs per second). Off: P1's
     /// delayed recovery.
     pub immediate_recovery: bool,
+    /// Rate adaptation (6.6, [`crate::abr`]): every 100 ms the executor moves
+    /// the encoder's bitrate, then the pacer's frame rate, then (on the
+    /// convert path) the encode size between the plan's values and the
+    /// link's, from the sink's unsent age, the consumed-credit RTT, the
+    /// client's delay ([`crate::StreamController::note_client_feedback`]),
+    /// loss and, on QUIC, quinn's path statistics. The plan's `fps`,
+    /// `bitrate_bps` and encode size are the ceiling. Off: the plan's rate
+    /// as is (P1).
+    #[uniffi(default = false)]
+    pub rate_adaptation: bool,
+    /// With rate adaptation: the window `RateUpdate::rate_window_ms` asks for
+    /// (0: none).
+    #[uniffi(default = 150)]
+    pub rate_window_ms: u32,
+    /// With rate adaptation: the frame-level maximum QP passed to an encoder
+    /// whose caps confirm it (0: none).
+    #[uniffi(default = 0)]
+    pub max_frame_qp: u8,
 }
 
 impl Default for PacingPolicy {
@@ -713,17 +770,31 @@ impl Default for PacingPolicy {
             refresh_aligned: true,
             adaptive_permits: true,
             immediate_recovery: true,
+            rate_adaptation: false,
+            rate_window_ms: 150,
+            max_frame_qp: 0,
         }
     }
 }
 
 impl PacingPolicy {
+    /// [`Default`] with rate adaptation on.
+    pub fn with_rate_adaptation() -> Self {
+        Self {
+            rate_adaptation: true,
+            ..Self::default()
+        }
+    }
+
     /// Every P2 behaviour off: P1's admission and recovery.
     pub fn p1() -> Self {
         Self {
             refresh_aligned: false,
             adaptive_permits: false,
             immediate_recovery: false,
+            rate_adaptation: false,
+            rate_window_ms: 0,
+            max_frame_qp: 0,
         }
     }
 }
@@ -834,6 +905,11 @@ pub struct StatsSnapshot {
     /// The video rate the sink measured over the last second, bit/s.
     #[uniffi(default = 0)]
     pub video_bps: u64,
+    /// The video rate given to the bulk bucket, bit/s: rate adaptation's
+    /// target while video is active (at least the measured rate), else the
+    /// measured rate.
+    #[uniffi(default = 0)]
+    pub bulk_video_bps: u64,
     /// The link capacity given to the bulk bucket, bit/s.
     #[uniffi(default = 0)]
     pub bulk_capacity_bps: u64,
@@ -886,10 +962,85 @@ pub struct StatsSnapshot {
     /// Canvas: the largest member age spread so far, µs.
     #[uniffi(default = 0)]
     pub canvas_age_spread_max_us: u64,
+    /// Frames the encoder's rate control skipped ([`DropReason::Skipped`]; also
+    /// in `encoder_drops`).
+    #[uniffi(default = 0)]
+    pub encoder_skipped: u64,
+    /// Rate adaptation (6.6) is running.
+    #[uniffi(default = false)]
+    pub abr_active: bool,
+    /// The bitrate rate adaptation gave the encoder, bit/s (the plan's while
+    /// it is off).
+    #[uniffi(default = 0)]
+    pub abr_target_bps: u64,
+    /// The frame rate in effect (the pacer's target).
+    #[uniffi(default = 0)]
+    pub abr_fps: u32,
+    /// The queueing delay the last tick saw (the largest of the unsent age,
+    /// the credit RTT and client delay over their minima, and the QUIC RTT
+    /// over its minimum), µs.
+    #[uniffi(default = 0)]
+    pub abr_queueing_us: u64,
+    /// Multiplicative decreases so far.
+    #[uniffi(default = 0)]
+    pub abr_decreases: u64,
+    /// Frame rate and resolution steps so far.
+    #[uniffi(default = 0)]
+    pub abr_tier_changes: u64,
+    /// Client feedback reports taken (`note_client_feedback`).
+    #[uniffi(default = 0)]
+    pub client_feedback: u64,
+    /// Client frame times matched to a sent frame (for the delay inputs).
+    #[uniffi(default = 0)]
+    pub client_delay_samples: u64,
+    /// Frames the client reported missing.
+    #[uniffi(default = 0)]
+    pub client_lost: u64,
+    /// The QUIC path's RTT (quinn), µs; 0 on TLS/TCP.
+    #[uniffi(default = 0)]
+    pub link_rtt_us: u64,
+    /// QUIC packets lost (quinn).
+    #[uniffi(default = 0)]
+    pub link_lost_packets: u64,
+    /// Recoveries run when the sink left backpressure, instead of at the
+    /// re-check timer.
+    #[uniffi(default = 0)]
+    pub recoveries_on_ready: u64,
+}
+
+/// One frame's client-side times in [`ClientFeedback`] (`videoFeedback`,
+/// 9.4), µs on the client's clock; 0 = the stage was not reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ClientFrameTimes {
+    /// The frame's wire sequence.
+    pub sequence: u64,
+    /// C1: message complete.
+    pub receive_us: u64,
+    /// C3: decoded.
+    pub decode_us: u64,
+    /// C5: presented.
+    pub present_us: u64,
+}
+
+/// The parts of a client's `videoFeedback` (9.4) rate adaptation uses.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ClientFeedback {
+    /// The wire generation the sequences belong to.
+    pub generation: u64,
+    /// The loss bitmap's base sequence (0: no bitmap).
+    pub loss_base_sequence: u64,
+    /// The loss bitmap: bit `i`, least significant first in each byte, set =
+    /// sequence `loss_base_sequence + i` missing.
+    pub loss_bits: Vec<u8>,
+    /// Recent frames' times.
+    pub frames: Vec<ClientFrameTimes>,
 }
 
 /// Jobs for the consumer, posted to its [`crate::ObserverQueue`] and never run on
 /// an executor.
+// `Stats` carries the whole snapshot by value: UniFFI enums cannot box a
+// variant, and observer jobs are rare (not per frame).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum ObserverJob {
     /// The capture runs; `info.codec` is the codec actually created.

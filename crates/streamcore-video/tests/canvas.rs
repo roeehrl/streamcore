@@ -867,10 +867,7 @@ fn rate_updates_reach_every_member_and_a_size_change_is_refused() {
         }]
     );
     let rate = s.controller.update(StreamUpdate {
-        rate: Some(RateUpdate {
-            bitrate_bps: 1_000_000,
-            fps: 30,
-        }),
+        rate: Some(RateUpdate::new(1_000_000, 30)),
         capture: CaptureUpdate {
             min_interval_ns: Some(SECOND / 30),
             region: None,

@@ -145,6 +145,22 @@ impl Drop for CloseOnInterruptedFrame {
     }
 }
 
+/// What [`SecureChannel::link_stats`] reports. The QUIC fields are `None` or
+/// zero on TLS/TCP. Counters are cumulative for the channel.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, uniffi::Record)]
+pub struct LinkStats {
+    /// quinn's smoothed RTT.
+    pub rtt_us: Option<u64>,
+    /// quinn's minimum RTT.
+    pub min_rtt_us: Option<u64>,
+    pub lost_packets: u64,
+    pub sent_packets: u64,
+    pub congestion_events: u64,
+    pub cwnd_bytes: u64,
+    /// Bulk-lane payload bytes handed to the writer.
+    pub bulk_bytes_sent: u64,
+}
+
 #[uniffi::export]
 impl SecureChannel {
     pub fn transport(&self) -> ChannelTransport {
@@ -197,6 +213,21 @@ impl SecureChannel {
     }
     pub fn close(&self) {
         self.io.close();
+    }
+
+    /// The link's statistics for rate adaptation (STREAMCORE-VIDEO.md 6.6): on
+    /// QUIC, quinn's path statistics; on TLS/TCP only the bulk byte count.
+    pub fn link_stats(&self) -> LinkStats {
+        let path = self.io.quic.as_ref().map(|quic| quic.stats().path);
+        LinkStats {
+            rtt_us: path.map(|p| u64::try_from(p.rtt.as_micros()).unwrap_or(u64::MAX)),
+            min_rtt_us: path.map(|p| u64::try_from(p.min_rtt.as_micros()).unwrap_or(u64::MAX)),
+            lost_packets: path.map_or(0, |p| p.lost_packets),
+            sent_packets: path.map_or(0, |p| p.sent_packets),
+            congestion_events: path.map_or(0, |p| p.congestion_events),
+            cwnd_bytes: path.map_or(0, |p| p.cwnd),
+            bulk_bytes_sent: self.io.bulk_bytes(),
+        }
     }
 
     /// Synchronous admission preserves native caller order without racing Tasks.

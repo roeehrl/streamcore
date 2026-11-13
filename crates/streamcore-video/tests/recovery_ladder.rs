@@ -31,6 +31,7 @@ fn confirmed_caps() -> EncoderCaps {
         dynamic_rate: true,
         min_inputs_before_output: 1,
         vui_checked: true,
+        max_frame_qp: false,
     }
 }
 
@@ -607,11 +608,13 @@ fn an_aged_layer_0_delta_is_recovered_by_an_ltr_refresh() {
     assert_eq!(stats.sink_aged_shed, 1, "frame 3 aged out");
     assert_eq!(stats.sender_shed, 1);
     // The shed delta is a loss. Recovery waits while the sink is
-    // backpressured (6.5), then re-checks: an LTR refresh, not an IDR.
+    // backpressured (6.5) and runs as soon as the sink is ready again, not at
+    // the 500 ms re-check: an LTR refresh, not an IDR.
+    assert_eq!(s.controller.stats().recoveries, 0);
     while s.out.finish_any(0, true) {}
     s.pump();
-    assert_eq!(s.controller.stats().recoveries, 0);
-    s.advance_ms(510);
+    let stats = s.controller.stats();
+    assert_eq!((stats.recoveries, stats.recoveries_on_ready), (1, 1));
     let refresh = *encoder.pending_seqs().last().expect("recovery submitted");
     let opts = submit(&s, refresh);
     assert!(opts.ltr_refresh && !opts.force_keyframe);
