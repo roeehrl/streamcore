@@ -94,6 +94,7 @@ fn layout_of(display: u32, o: &OutputDesc, size: Option<SizeInt32>) -> DisplayLa
         scale: 1.0,
         origin_x: o.desktop[0],
         origin_y: o.desktop[1],
+        rotation: streamcore_video::DisplayRotation::Identity, // TODO(P5): fill from QueryDisplayConfig targetInfo.rotation
     }
 }
 

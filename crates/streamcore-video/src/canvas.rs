@@ -9,7 +9,7 @@
 //! the union of the members, so mixed densities keep their relative sizes.
 
 use crate::error::MediaError;
-use crate::types::{CanvasTile, DisplayLayout, Rect, Rotation};
+use crate::types::{CanvasTile, DisplayLayout, DisplayRotation, Rect, Rotation};
 
 /// The limits every consumer applies before a canvas exists (2.5.7). A
 /// consumer's own validator mirrors these values.
@@ -44,6 +44,8 @@ pub struct CanvasDisplay {
     pub height: f64,
     /// Pixels per global unit.
     pub scale: f64,
+    /// The display's clockwise rotation when reviewed (its
+    /// [`DisplayLayout::rotation`]); the bounds above are already rotated.
     pub rotation: Rotation,
 }
 
@@ -297,12 +299,18 @@ pub fn canvas_nearest_member_point(layout: CanvasArrangement, x: f64, y: f64) ->
 }
 
 /// True while the observed display is exactly where and how it was reviewed:
-/// the same origin, size (pixels over scale) and scale. A rotation that changes
-/// the size is caught here; a backend reports a mirrored display, or one whose
-/// rotation changed since its capture opened, as gone (`observe_layout` →
-/// `None`).
+/// the same origin, size (pixels over scale), scale and rotation. A rotation is
+/// a layout change like any other; only a mirrored (or gone) display is
+/// `observe_layout` → `None`.
 pub(crate) fn observed_matches(member: &CanvasDisplay, observed: &DisplayLayout) -> bool {
+    let rotation = match member.rotation {
+        Rotation::None => DisplayRotation::Identity,
+        Rotation::Rotate90 => DisplayRotation::Rotate90,
+        Rotation::Rotate180 => DisplayRotation::Rotate180,
+        Rotation::Rotate270 => DisplayRotation::Rotate270,
+    };
     if observed.display_id != member.display_id
+        || observed.rotation != rotation
         || !observed.scale.is_finite()
         || observed.scale <= 0.0
     {

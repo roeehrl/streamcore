@@ -15,8 +15,10 @@
 //!   `stream.memberUnavailable`.
 //! - **Re-observation.** The layout is observed before anything native is
 //!   allocated, when the first images are in, and every 250 ms
-//!   (`CaptureBackend::observe_layout`); any difference, a member's layout
-//!   event or a gone member fails the stream with `stream.layoutChanged`.
+//!   (`CaptureBackend::observe_layout`); any difference (a rotation included:
+//!   it is a new layout, not a gone member), a member's layout event or a gone
+//!   member fails the stream with `stream.layoutChanged`, so the consumer
+//!   starts the new arrangement as a new canvas and layout epoch.
 //! - **Cadence.** A member image marks the canvas dirty; a composite is drawn at
 //!   most once per frame interval (a timer covers the rest) and only while
 //!   dirty, so a still screen composes nothing. The composite is due for
@@ -449,6 +451,10 @@ impl StreamState {
                 width,
                 height,
             },
+            // The quarter turns that show the picture upright. The
+            // compositor draws every member upright in desktop orientation
+            // (a member's own `SurfaceInfo::rotation` included), so the
+            // canvas needs none, whatever the displays' `DisplayRotation`.
             rotation: 0,
         };
         if cx.revoked() {

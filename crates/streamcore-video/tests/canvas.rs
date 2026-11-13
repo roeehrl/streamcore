@@ -26,6 +26,17 @@ struct FakeMembers {
     /// What `observe_layout` reports per display; absent = as reviewed.
     observed: Mutex<HashMap<u32, Option<DisplayLayout>>>,
     fail_open: Mutex<Option<u32>>,
+    /// The arrangement `observe_layout` reports by default (as reviewed).
+    layout: Mutex<CanvasArrangement>,
+}
+
+fn display_rotation(rotation: Rotation) -> DisplayRotation {
+    match rotation {
+        Rotation::None => DisplayRotation::Identity,
+        Rotation::Rotate90 => DisplayRotation::Rotate90,
+        Rotation::Rotate180 => DisplayRotation::Rotate180,
+        Rotation::Rotate270 => DisplayRotation::Rotate270,
+    }
 }
 
 fn capture_of(display: u32) -> CaptureId {
@@ -45,6 +56,7 @@ impl FakeMembers {
             next_surface: AtomicU64::new(1),
             observed: Mutex::new(HashMap::new()),
             fail_open: Mutex::new(None),
+            layout: Mutex::new(layout3()),
         })
     }
 
@@ -145,7 +157,7 @@ impl CaptureBackend for FakeMembers {
         if let Some(observed) = lock(&self.observed).get(&display) {
             return observed.clone();
         }
-        layout3()
+        lock(&self.layout)
             .members
             .iter()
             .find(|m| m.display_id == display)
@@ -156,6 +168,7 @@ impl CaptureBackend for FakeMembers {
                 scale: m.scale,
                 origin_x: m.x as i32,
                 origin_y: m.y as i32,
+                rotation: display_rotation(m.rotation),
             })
     }
     fn open(
@@ -345,6 +358,7 @@ impl Canvas {
     fn with(layout: CanvasArrangement, adjust: impl FnOnce(&mut StreamParts)) -> Self {
         let fakes = Fakes::new();
         let members = FakeMembers::new(fakes.log.clone());
+        *lock(&members.layout) = layout.clone();
         let compositor = FakeCompositor::new(fakes.log.clone());
         let clock = Arc::new(ManualClock(AtomicU64::new(SECOND)));
         let port = StreamPort::new();
@@ -922,6 +936,7 @@ fn the_layout_is_re_observed_every_250_ms() {
             scale: 1.0,
             origin_x: 900,
             origin_y: 0,
+            rotation: DisplayRotation::Identity,
         }),
     );
     s.advance_ms(240);
@@ -996,6 +1011,7 @@ fn a_blank_member_a_gone_member_and_a_member_layout_event_fail_the_canvas() {
             scale: 2.0,
             origin_x: 0,
             origin_y: 0,
+            rotation: DisplayRotation::Identity,
         },
     );
     s.pump();
@@ -1220,6 +1236,7 @@ fn layout_info_and_the_content_epoch_go_out_under_frames_v4() {
     assert_eq!((info.frame_width, info.frame_height), (1600, 1200));
     assert_eq!((info.source.width, info.source.height), (1600, 1200));
     assert_eq!((info.content.width, info.content.height), (1600, 1200));
+    assert_eq!(info.rotation, 0, "the compositor draws the canvas upright");
     let frame = s
         .fakes
         .out
@@ -1249,4 +1266,88 @@ fn closing_releases_every_member_image_and_composite() {
     assert_eq!(s.compositor.composes(), composes);
     let _ = &s.clock;
     assert_eq!(s.members.leases(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Rotation.
+
+/// Display 2 turned 90°: its desktop bounds are 600 × 800, already rotated.
+fn rotated_layout() -> CanvasArrangement {
+    CanvasArrangement {
+        members: vec![
+            member(1, 0.0, 0.0, 800.0, 600.0, 1.0),
+            CanvasDisplay {
+                rotation: Rotation::Rotate90,
+                ..member(2, 800.0, 0.0, 600.0, 800.0, 1.0)
+            },
+        ],
+    }
+}
+
+#[test]
+fn a_rotated_member_runs_and_its_canvas_needs_no_turn() {
+    let s = Canvas::with(rotated_layout(), |_| {});
+    s.running();
+    assert!(s.fakes.observer.failures().is_empty());
+    s.advance_ms(600);
+    assert!(
+        s.fakes.observer.failures().is_empty(),
+        "observed as reviewed"
+    );
+    let opened = lock(&s.members.opened).clone();
+    assert_eq!(
+        (opened[1].1.pixel_width, opened[1].1.pixel_height),
+        (600, 800),
+        "the member captures at its rotated tile"
+    );
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_rotation_change_is_a_new_layout_not_a_gone_member() {
+    let s = Canvas::new();
+    s.running();
+    // Display 3 turned 180°: same bounds, another rotation.
+    lock(&s.members.observed).insert(
+        3,
+        Some(DisplayLayout {
+            display_id: 3,
+            pixel_width: 800,
+            pixel_height: 600,
+            scale: 1.0,
+            origin_x: 0,
+            origin_y: 600,
+            rotation: DisplayRotation::Rotate180,
+        }),
+    );
+    s.advance_ms(260);
+    assert_eq!(
+        s.fakes.observer.failures(),
+        vec!["stream.layoutChanged".to_string()]
+    );
+    assert!(
+        !s.fakes
+            .observer
+            .jobs()
+            .iter()
+            .any(|j| matches!(j, ObserverJob::SourceGone { .. })),
+        "a rotation is no gone source"
+    );
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_mirrored_member_is_still_gone() {
+    let s = Canvas::new();
+    s.running();
+    lock(&s.members.observed).insert(2, None);
+    s.advance_ms(260);
+    assert_eq!(
+        s.fakes.observer.failures(),
+        vec!["stream.layoutChanged".to_string()]
+    );
+    s.close();
+    s.assert_clean();
 }

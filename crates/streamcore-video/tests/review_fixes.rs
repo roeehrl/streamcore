@@ -290,6 +290,7 @@ fn a_layout_change_is_reported_with_an_epoch() {
         scale: 2.0,
         origin_x: 0,
         origin_y: 0,
+        rotation: DisplayRotation::Identity,
     };
     events.layout_changed(CAPTURE + 1, layout.clone());
     events.layout_changed(CAPTURE, layout.clone());
@@ -310,4 +311,52 @@ fn a_layout_change_is_reported_with_an_epoch() {
     assert_eq!(epochs, vec![1, 2], "another capture's change is stale");
     s.close();
     s.assert_clean();
+}
+
+/// A single display turned 90° reports a new layout (size swapped, its
+/// rotation): a new epoch for the consumer to re-plan with, never a gone
+/// source.
+#[test]
+fn a_rotation_is_a_layout_change_with_a_new_epoch() {
+    let s = Manual::new();
+    s.start_running();
+    let events = lock(&s.capture.events).clone().expect("open");
+    let upright = DisplayLayout {
+        display_id: 1,
+        pixel_width: 2560,
+        pixel_height: 1440,
+        scale: 2.0,
+        origin_x: 0,
+        origin_y: 0,
+        rotation: DisplayRotation::Identity,
+    };
+    let turned = DisplayLayout {
+        pixel_width: 1440,
+        pixel_height: 2560,
+        rotation: DisplayRotation::Rotate90,
+        ..upright.clone()
+    };
+    events.layout_changed(CAPTURE, upright);
+    events.layout_changed(CAPTURE, turned.clone());
+    s.pump();
+    let changes: Vec<_> = s
+        .observer
+        .jobs()
+        .into_iter()
+        .filter_map(|j| match j {
+            ObserverJob::LayoutChanged { epoch, layout } => Some((epoch, layout)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(changes[1], (2, turned));
+    assert!(s.observer.failures().is_empty());
+    assert!(
+        !s.observer
+            .jobs()
+            .iter()
+            .any(|j| matches!(j, ObserverJob::SourceGone { .. }))
+    );
+    s.close();
+    s.fakes.assert_clean();
 }

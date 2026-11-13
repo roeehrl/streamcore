@@ -305,6 +305,21 @@ pub struct CaptureCaps {
     pub region_in_surface: bool,
 }
 
+/// How a display's desktop is turned relative to its panel's native scan-out,
+/// clockwise (macOS `CGDisplayRotation`; Windows `DISPLAYCONFIG_ROTATION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DisplayRotation {
+    Identity,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+}
+
+/// A display as the desktop places it. `pixel_width` × `pixel_height`, the
+/// origin and `scale` are in desktop coordinates, already rotated: a 2560 × 1440
+/// panel turned 90° is 1440 × 2560 here, and `rotation` says how it is turned.
+/// A display that mirrors or clones another is no layout at all
+/// (`CaptureBackend::observe_layout` returns `None`).
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct DisplayLayout {
     pub display_id: u32,
@@ -313,6 +328,7 @@ pub struct DisplayLayout {
     pub scale: f64,
     pub origin_x: i32,
     pub origin_y: i32,
+    pub rotation: DisplayRotation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
