@@ -83,8 +83,9 @@ pub struct DecoderInfo {
     /// for a low-latency decoder). Rust also learns the real depth from the
     /// session's first output (`ClientStats::learned_depth`), so an adapter
     /// that cannot know it reports its best guess. The decoder queue bound
-    /// is `max(2, max_queued, learned depth)` (6.2), and at least 4 until the
-    /// first output. A depth above 2 is a latency cost on every frame (R2
+    /// is `max(2, depth + 1)` with the larger of the two depths (6.2): one
+    /// frame of slack beyond the pipeline; at least 4 until the first
+    /// output. A depth above 2 is a latency cost on every frame (R2
     /// wants zero reorder and no pipeline): adapters should prefer a decoder
     /// with a depth of 2 or less, and Rust counts such sessions
     /// (`ClientStats::deep_decoder_sessions`).
@@ -127,8 +128,8 @@ pub enum DecodeResult {
     /// retires it).
     Accepted,
     /// No input buffer now. Call [`DecoderEvents::input_ready`] once the
-    /// decoder can take input again: Rust then submits the newest waiting
-    /// sample.
+    /// decoder can take input again: Rust then submits the waiting samples
+    /// in order until the decoder is busy again.
     Busy,
     /// Not accepted. `DeviceLost` re-creates the decoder; any other error
     /// drops the frame and requests a keyframe.
@@ -146,7 +147,8 @@ pub enum KeyframeReason {
     /// More frames waited for the decoder than its queue bound (6.2): they
     /// were flushed.
     QueueBound,
-    /// The decoder was busy and a reference frame waiting for it was replaced.
+    /// Reserved: no longer issued. A busy decoder's samples now wait in order
+    /// (a full wait is a `QueueBound` flush).
     Busy,
     /// The decoder refused a frame ([`DecodeResult::Failed`]).
     DecodeFailed,
@@ -209,10 +211,10 @@ pub struct ClientStats {
     pub ltr_acks: u64,
     /// Decoder sessions configured.
     pub sessions: u64,
-    /// The current session's decoder queue bound:
-    /// `max(ClientTimings::queue_bound, DecoderInfo::max_queued, learned_depth)`,
-    /// or the provisional bound (at least 4) until the session's first
-    /// output (0 before the first session).
+    /// The current session's decoder queue bound: `max(2, depth + 1)` with
+    /// the depth the larger of `DecoderInfo::max_queued` and
+    /// `learned_depth`, or the provisional bound (at least 4) until the
+    /// session's first output (0 before the first session).
     pub queue_bound: u32,
     /// The current session's pipeline depth as learned from its first
     /// output: the samples it accepted, from its first keyframe, up to and
@@ -301,7 +303,9 @@ pub enum ClientJob {
 pub struct ClientTimings {
     /// Frames waiting for the decoder (accepted and not decoded, or held while
     /// it is busy) before a flush and a keyframe request (6.2: 2). The bound
-    /// is `max(queue_bound, DecoderInfo::max_queued)`.
+    /// is `max(queue_bound, depth + 1)`, with the depth the larger of
+    /// `DecoderInfo::max_queued` and the learned one (at least 4 until the
+    /// session's first output).
     pub queue_bound: u8,
     /// No decoder output for this long while frames wait re-creates the
     /// decoder (500 ms).
@@ -1086,8 +1090,8 @@ struct ClientState {
     /// The current session's learned depth (`None` until its first output).
     learned_depth: Option<u8>,
     in_flight: VecDeque<InFlight>,
-    /// The newest sample waiting while the decoder is busy.
-    held: Option<Sample>,
+    /// Samples waiting, in order, while the decoder is busy.
+    held: VecDeque<Sample>,
     /// `decode` returned `Busy` and no `input_ready` followed yet.
     busy: bool,
     /// Decoded frames waiting for `presented` (wire generation, sequence).
@@ -1165,7 +1169,7 @@ impl ClientState {
             counters: Arc::default(),
             learned_depth: None,
             in_flight: VecDeque::new(),
-            held: None,
+            held: VecDeque::new(),
             busy: false,
             decoded: VecDeque::new(),
             last_progress_ns: 0,
@@ -1545,17 +1549,26 @@ impl ClientState {
     /// session's sequences increase, and it outputs in decode order).
     fn waiting(&self) -> usize {
         let output = self.counters.output.load(Ordering::Acquire);
-        self.in_flight.iter().filter(|f| f.seq > output).count() + usize::from(self.held.is_some())
+        self.in_flight.iter().filter(|f| f.seq > output).count() + self.held.len()
     }
 
-    /// `max(2, max_queued, learned depth)` once the session output a frame;
-    /// before that, at least [`PROVISIONAL_QUEUE_BOUND`].
+    /// `max(2, depth + 1)` once the session output a frame, with the depth
+    /// the larger of `max_queued` and the learned one: one frame of slack
+    /// beyond the decoder's pipeline, so one frame of arrival jitter does
+    /// not flush it. Before the first output, at least
+    /// [`PROVISIONAL_QUEUE_BOUND`].
     fn queue_bound(&self) -> usize {
         let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
-        let bound = self.timings.queue_bound.max(declared);
         let bound = match self.learned_depth {
-            Some(depth) => bound.max(depth),
-            None => bound.max(PROVISIONAL_QUEUE_BOUND),
+            Some(depth) => self
+                .timings
+                .queue_bound
+                .max(declared.max(depth).saturating_add(1)),
+            None => self
+                .timings
+                .queue_bound
+                .max(declared.saturating_add(1))
+                .max(PROVISIONAL_QUEUE_BOUND),
         };
         usize::from(bound)
     }
@@ -1607,25 +1620,18 @@ impl ClientState {
             // flushed session holds none of the LTR frames it decoded.
             self.receiver.forget_ltr();
         }
-        if self.busy || self.held.is_some() {
-            // The decoder is busy: the newest sample waits for input_ready.
+        if self.busy || !self.held.is_empty() {
+            // The decoder is busy: samples wait in order for input_ready, as
+            // many as the queue bound leaves room for (the bound above
+            // flushes beyond it), so the chain stays intact. A keyframe
+            // makes the ones before it unnecessary.
             self.note_waiting(cx);
-            match self.held.take() {
-                Some(old) if !old.meta.discardable && !sample.meta.keyframe => {
-                    // Replacing a reference frame breaks the chain: drop both.
+            if sample.meta.keyframe {
+                for old in std::mem::take(&mut self.held) {
                     self.drop_sample(&old);
-                    self.drop_sample(&sample);
-                    self.receiver.require_keyframe();
-                    self.ltr_in_use = false;
-                    self.on_break(cx, KeyframeReason::Busy);
-                }
-                old => {
-                    if let Some(old) = old {
-                        self.drop_sample(&old);
-                    }
-                    self.held = Some(sample);
                 }
             }
+            self.held.push_back(sample);
             return;
         }
         self.decode(cx, sample);
@@ -1671,7 +1677,7 @@ impl ClientState {
                 self.stats.busy += 1;
                 self.busy = true;
                 self.note_waiting(cx);
-                self.held = Some(Sample { data, meta });
+                self.held.push_front(Sample { data, meta });
             }
             DecodeResult::Failed { error } => {
                 self.stats.decode_failures += 1;
@@ -1739,7 +1745,7 @@ impl ClientState {
         for entry in std::mem::take(&mut self.in_flight) {
             self.finish(entry.generation, entry.seq);
         }
-        if let Some(held) = self.held.take() {
+        for held in std::mem::take(&mut self.held) {
             self.finish(held.meta.generation, held.meta.seq);
         }
         if dropped > 0 {
@@ -1971,7 +1977,11 @@ impl ClientState {
             return;
         }
         self.busy = false;
-        if let Some(sample) = self.held.take() {
+        // In order, until the decoder is busy again.
+        while !self.busy && self.session == session {
+            let Some(sample) = self.held.pop_front() else {
+                break;
+            };
             self.decode(cx, sample);
         }
     }
