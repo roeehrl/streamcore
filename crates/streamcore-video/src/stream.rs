@@ -398,6 +398,11 @@ pub(crate) fn valid_refresh(refresh_ns: Option<u64>) -> Option<u64> {
 }
 
 /// One frame interval at `fps`.
+/// `at_us` moved by `delta_ns` (rounded toward zero to µs), saturating.
+fn shift_us(at_us: u64, delta_ns: i128) -> u64 {
+    u64::try_from((i128::from(at_us) + delta_ns / 1_000).max(0)).unwrap_or(u64::MAX)
+}
+
 fn interval_ns(fps: u32) -> u64 {
     1_000_000_000 / u64::from(fps.max(1))
 }
@@ -1832,12 +1837,23 @@ impl StreamState {
             return true;
         }
         if self.pace_timer.is_none() {
-            let delay = self.pacer.hold_delay_ns(h0);
+            // The deadline is absolute on the host clock, armed from the host's
+            // now (this frame's H1): H0 may come after it (Windows: the display
+            // time), and a delay from H0 would fire one H1 → H0 early.
+            let now_host = self.host_now(cx).unwrap_or(info.capture_ns);
+            let delay = self.pacer.hold_delay_ns(h0, now_host);
             self.pace_timer = Some(self.set_timer(cx, delay, TimerKind::Pace));
             // An inline frame drain arms no timer: the next wake does.
             self.post_internal(cx, Internal::Arm);
         }
         false
+    }
+
+    /// The host clock now: the latest image's H1 plus the executor time since
+    /// it arrived. H0 is not a "now": it may lie ahead of it.
+    fn host_now(&self, cx: &Shared) -> Option<u64> {
+        self.time_anchor
+            .map(|(host, local)| host.saturating_add(cx.clock.now_ns().saturating_sub(local)))
     }
 
     fn cancel_pace(&mut self) {
@@ -1854,10 +1870,7 @@ impl StreamState {
         latest.admitted = true;
         self.stats.pacer_timer_admits += 1;
         // The executor clock mapped to the host clock (H1 of the latest frame).
-        let now_host = self
-            .time_anchor
-            .map(|(host, local)| host.saturating_add(cx.clock.now_ns().saturating_sub(local)));
-        if let Some(now_host) = now_host {
+        if let Some(now_host) = self.host_now(cx) {
             self.pacer.admit_held(now_host);
         }
         self.submit_due(cx);
@@ -2055,12 +2068,15 @@ impl StreamState {
         timing: &FrameTiming,
     ) -> crate::sink::FrameFields {
         // H0 on the transport clock: the host time now (from the latest frame's
-        // anchor) and the transport's clock now, read together.
+        // anchor) and the transport's clock now, read together. The age is
+        // signed: H0 may still be ahead of now (Windows: the display time), and
+        // clamping it to 0 would move capture_us back by that lead.
         let capture_us = timing.source_present_ns.and_then(|h0| {
-            let (host, local) = self.time_anchor?;
-            let host_now = host.saturating_add(cx.clock.now_ns().saturating_sub(local));
-            let age_us = host_now.saturating_sub(h0) / 1_000;
-            Some(cx.sink.now_us().saturating_sub(age_us))
+            let host_now = self.host_now(cx)?;
+            Some(shift_us(
+                cx.sink.now_us(),
+                i128::from(h0) - i128::from(host_now),
+            ))
         });
         crate::sink::FrameFields {
             h0_ns: timing.source_present_ns,

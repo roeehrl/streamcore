@@ -282,3 +282,48 @@ fn the_sink_carries_the_frames_stage_times_under_frames_v4() {
     s.close();
     s.assert_clean();
 }
+
+#[test]
+fn frames_v4_timing_stays_measured_when_h0_comes_after_capture_and_encode() {
+    // Windows: H0 is the composition's display time, which WGC delivers the
+    // frame before. H0 = H1 + 12 ms, and the encoder's H3 and H4 come before
+    // H0 too: every offset is negative, none is "not measured".
+    let s = Manual::with(|fakes, parts| {
+        fakes.out.frames_v4.store(true, Ordering::SeqCst);
+        parts.plan.extensions = vec![FrameExtension::Timing, FrameExtension::CaptureUs];
+        parts.output = VideoOutput::with_transport(
+            fakes.out.clone(),
+            SinkPolicy {
+                timing_every: 1,
+                ..fakes.policy()
+            },
+            None,
+        );
+    });
+    s.start_running();
+    let mut info = s.capture.surface(srgb(), 5_000_000);
+    info.source_present_ns = Some(17_000_000);
+    s.capture.emit_info(info);
+    s.pump();
+    // H3 = H0 − 9 ms, H4 = H0 − 9 ms + 10 ns.
+    s.encoder()
+        .timing_shift_ns
+        .store(-9_000_010, Ordering::SeqCst);
+    s.encoder().complete_all();
+    s.pump();
+    let packets = s.out.packets();
+    assert_eq!(packets.len(), 2, "config and keyframe");
+    let ext = packets[1].meta.extensions;
+    let timing = ext.timing.expect("timing TLV");
+    let not_measured = streamcore_media::media::FrameTiming::NOT_MEASURED;
+    assert_eq!(timing.h1_minus_h0_us, -12_000);
+    assert_eq!(timing.h3_us, -9_000);
+    assert_eq!(timing.h4_us, -8_999);
+    assert_eq!(timing.h2_us, not_measured, "an NV12 path has no H2");
+    assert_ne!(timing.h3_us, not_measured);
+    assert_ne!(timing.h4_us, not_measured);
+    // H0 on the transport clock lies 12 ms after the transport's now (H1).
+    assert_eq!(ext.capture_us, Some(1_000_000 + 12_000));
+    s.close();
+    s.assert_clean();
+}

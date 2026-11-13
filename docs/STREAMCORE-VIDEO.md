@@ -702,6 +702,11 @@ fps stream then gets 60 frames per second, each within half a refresh of its due
 from the last accepted H0 instead accepts at ≥ 16.667 − 3.472 ≈ 13.19 ms, so every second refresh
 (13.89 ms) qualifies: 72 fps, above the 60 fps target.
 
+A frame admitted early is held, and its timer fires at `due + refresh_interval / 2 + 1 ms` (at most
+one target interval plus one refresh after it arrived) if nothing newer is admitted first. That
+deadline is absolute on the host clock and armed as `deadline − now`: H0 may come after the frame's
+arrival (9.2), so a delay measured from H0 would fire one H1 → H0 early.
+
 ### 6.4 Post-encoder shedding in `VideoSink`
 
 Per stream, before fragmentation:
@@ -1113,6 +1118,17 @@ Keyed by `(stream, generation, sequence)`; host and client values each on their 
 | H6 | last fragment written | multiplexer |
 | C0–C5 | first byte, message complete, decode submit, decoded, present request, presented | Rust receiver; VT output handler / `onOutputBufferAvailable`; `addPresentedHandler` / `setOnFrameRenderedListener` (calibrated) |
 
+**H0 may come after H1.** H0 is the source's display or present time, not its capture time. Where
+capture precedes display it comes after H1, and sometimes after H3 or H4: on Windows,
+`SystemRelativeTime` is the composition's display time and WGC delivers the frame before that
+refresh (on a 60 Hz Windows host under constant redraw, H1 → H0 measured p50 +11.7 ms; on an idle
+desktop H0 ≈ H1). H0 stays the honest display time, and every consumer of H0 tolerates H0 > H1:
+stage offsets from H0 are signed (frames.v4 `timing`, 9.4), and nothing treats H0 as "now" or as
+earlier than now. The pacer's due times are on the H0 timeline, but its hold timer is an absolute
+deadline on the host clock armed from the host's now (6.3); `capture_us` maps H0 to the transport
+clock with a signed age; a canvas's member age spread compares H0s only when every member has one
+(H1s otherwise).
+
 ### 9.3 Budget
 
 2560×1440, 60 fps source, p50 / p95 in ms, estimates. The end-to-end figure is **derived from P0's
@@ -1142,7 +1158,8 @@ never by adding stage p95s.
 
 frames.v4 is a transport Hello capability. The 29-byte v3 header is unchanged; flag bit `0x80`
 ("extension follows", v4 only) adds `ext_len u16 LE` and TLVs `[type u8][len u8][value]`: `0x01
-timing` (u32 µs offsets from H0 for H2, H3, H4, plus i32 H1 − H0), `0x02 capture_us` (u64 H0), `0x03
+timing` (signed i32 µs offsets from H0 for H2, H3, H4 and H1, `i32::MIN` = not measured; any of them
+may be negative, 9.2), `0x02 capture_us` (u64 H0), `0x03
 discardable`, `0x04 ltr` (u32 token + u8 flags), `0x05 temporal_id` (u8) and `0x06 content` (u32
 `layout_epoch`).
 

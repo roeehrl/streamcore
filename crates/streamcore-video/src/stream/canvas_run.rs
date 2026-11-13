@@ -29,7 +29,8 @@
 //!   frame interval.
 //! - **Time.** A composite's H0 is the newest changed member's H0 (H1 as its
 //!   H1): an idle member's image can be seconds old. The spread between the
-//!   newest and oldest member image is a metric.
+//!   newest and oldest member image (by H0 when every member has one, else by
+//!   H1; H0 may come after H1) is a metric.
 //! - **Leases.** Rust holds each member's latest image and at most one more
 //!   undelivered in the mailbox (≤ 2, 3.2); composites are the latest plus
 //!   those in flight (≤ 1 + 3), from a pool of at least permits + 2 (5).
@@ -684,6 +685,16 @@ impl StreamState {
         let mut surfaces = Vec::with_capacity(run.members.len());
         let mut h0: Option<u64> = None;
         let mut h1: u64 = 0;
+        // The age spread compares like with like: H0s when every member has
+        // one, H1s otherwise. H0 may come after H1 (Windows: the display
+        // time), so mixing an H0 with another member's H1 inflates the spread
+        // by that lead.
+        let all_h0 = run.members.iter().all(|member| {
+            member
+                .image
+                .as_ref()
+                .is_none_or(|image| image.info.source_present_ns.is_some())
+        });
         let (mut oldest, mut newest) = (u64::MAX, 0u64);
         for (index, member) in run.members.iter().enumerate() {
             let Some(image) = &member.image else {
@@ -694,10 +705,10 @@ impl StreamState {
                 member: index as u8,
                 surface: image.info.id,
             });
-            let time = image
-                .info
-                .source_present_ns
-                .unwrap_or(image.info.capture_ns);
+            let time = match image.info.source_present_ns {
+                Some(h0) if all_h0 => h0,
+                _ => image.info.capture_ns,
+            };
             oldest = oldest.min(time);
             newest = newest.max(time);
             if member.changed {
