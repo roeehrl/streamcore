@@ -95,7 +95,7 @@ datagram mode), 38 bytes plus optional parts:
 | generation, nonzero | u64 |
 | highest sequence received complete in that generation (0 = none) | u64 |
 | video payload bytes consumed since the stream started on this channel | u64 |
-| decoder flushes since then | u32 |
+| frames flushed unshown since then (skip cause e; `StreamController::note_client_flush`) | u32 |
 | decoded frames never presented since then | u32 |
 | flags: `0x01` loss bitmap follows, `0x02` LTR ack follows | u8 |
 | if `0x01`: base sequence (nonzero) u64, bitmap length u8 (1–128), bitmap; bit `i`, least significant first in each byte, set = sequence `base + i` missing | 9 + length |

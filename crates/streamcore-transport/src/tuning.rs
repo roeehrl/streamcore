@@ -206,7 +206,8 @@ mod tests {
     fn default_tuning_is_quinn_default_plus_the_fixed_lane_settings() {
         let tuned = candidate_transport_tuning();
         assert_ne!(tuned, TransportTuning::default());
-        assert!(!tuned.bulk_token_bucket);
+        // VideoSink ships: the candidate runs the bulk bucket; the default does not.
+        assert!(tuned.bulk_token_bucket && !TransportTuning::default().bulk_token_bucket);
         assert_eq!(tuned.quic.congestion, QuicCongestion::Cubic);
         // Building either configuration, with and without a LAN peer, succeeds.
         for quic in [QuicTuning::default(), tuned.quic] {
