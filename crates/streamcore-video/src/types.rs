@@ -1038,6 +1038,9 @@ pub struct ClientFeedback {
 
 /// Jobs for the consumer, posted to its [`crate::ObserverQueue`] and never run on
 /// an executor.
+// `Stats` carries the whole snapshot by value: UniFFI enums cannot box a
+// variant, and observer jobs are rare (not per frame).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum ObserverJob {
     /// The capture runs; `info.codec` is the codec actually created.
