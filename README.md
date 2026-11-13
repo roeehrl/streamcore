@@ -73,6 +73,13 @@ Input model builds (see [docs/INPUT-MODEL.md](docs/INPUT-MODEL.md) for wiring th
 | Android | `bash scripts/build-streamcore-input-android.sh [abi…]` | An Android NDK (`ANDROID_NDK_HOME` or the newest in the SDK); installs `cargo-ndk` if missing | `target/streamcore-input-android/` (`jniLibs/<abi>/libstreamcore_input.so`, Kotlin bindings) |
 | Windows | `STREAMCORE_WINDOWS_HOST=<ssh host> bash scripts/build-streamcore-input-windows.sh` | A Windows PC over SSH with Git Bash, rustup and the Visual Studio C++ tools; or `STREAMCORE_INPUT_WINDOWS_CROSS=1` to cross-compile with `cargo-xwin` (no tests) | `target/streamcore-input-windows/{x64,arm64}/streamcore_input_ffi.dll` and `streamcore_input.h` |
 
+Video builds (see [docs/VIDEO-THREADING.md](docs/VIDEO-THREADING.md#builds-and-wiring) for wiring the client into an app):
+
+| Target | Command | Needs | Output |
+|---|---|---|---|
+| Apple | `bash scripts/build-streamcore-video-apple.sh` | macOS with Xcode; the script adds the five Apple Rust targets | `StreamCoreVideo/Artifacts/StreamCoreVideoFFI.xcframework` and Swift bindings; runs the Swift binding tests, compiles for iOS |
+| Android | `bash scripts/build-streamcore-video-android.sh [abi…]` | An Android NDK (`ANDROID_NDK_HOME` or the newest in the SDK); installs `cargo-ndk` if missing | `target/streamcore-video-android/` (`jniLibs/<abi>/libstreamcore_video.so`, Kotlin bindings for the video, media and transport crates); checks the bindings declare the client API |
+
 `python3 scripts/check-input-changes.py` fails a change to the input model that
 doesn't add an entry to `crates/streamcore-input/CHANGES.md`.
 `scripts/scrub-check.sh` fails on private host names, addresses, personal data and

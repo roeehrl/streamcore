@@ -447,6 +447,30 @@ thread. Dropping a `ClientStream` without closing posts a close and keeps the ex
 it is `Closed`. A panic in a drain posts `Failed` and `Closed` (`StopUnknown`) and abandons the
 stream.
 
+### Builds and wiring
+
+| Platform | Script | Output |
+| --- | --- | --- |
+| Apple | `scripts/build-streamcore-video-apple.sh` | `StreamCoreVideo/Artifacts/StreamCoreVideoFFI.xcframework` and the Swift bindings in `StreamCoreVideo/Sources/StreamCoreVideo/Generated` |
+| Android | `scripts/build-streamcore-video-android.sh [abi…]` | `target/streamcore-video-android/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libstreamcore_video.so` (API 28; 16 KB pages on the 64-bit ABIs), `target/streamcore-video-android/kotlin/uniffi/{streamcore_video,streamcore_media,streamcore_transport}/*.kt` |
+
+One library carries the scaffolding of all three crates (the video API uses `SecureChannel`,
+`TimedMessage` and `VideoWorkPermit`), and every generated Kotlin file loads it through JNA as
+`streamcore_video`. In an Android app: copy `jniLibs/*` to `src/main/jniLibs/` and
+`kotlin/uniffi/` to `src/main/kotlin/`; add JNA (`net.java.dev.jna:jna:5.19.1@aar`, as for the
+input model) and `org.jetbrains.kotlinx:kotlinx-coroutines-core` (the async calls:
+`ClientStream.nextMessage`, `closeStream`); keep `com.sun.jna.**` and `uniffi.**` in R8. The
+`.so` files are not stripped; the Android Gradle plugin strips them when it packages the app.
+The script checks that the bindings exist, load that library and declare `StreamDecoder`,
+`DecoderEvents`, `ClientEvents`, `ClientStream`, `SerialQueue` and `StreamPort`; it does not
+compile them (the repository has no Kotlin toolchain or Gradle project).
+
+The Android adapter implements `SerialQueue` on the decode stream's `HandlerThread` (`wake` is
+`handler.post { port.run() }`, `wake_after` is `postDelayed` calling `port.runTimer(token)`) and
+`StreamDecoder` over an async `MediaCodec` on that thread's Looper; `decoded` is called from
+`onOutputBufferAvailable`, `presented` from the frame-rendered listener (measured C5, so
+`estimated` is false), and `now_ns` returns `System.nanoTime()`.
+
 ## Tests
 
 `crates/streamcore-video/tests/`: `single_queue.rs` ports the reference host's single-queue
