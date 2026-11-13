@@ -53,7 +53,13 @@ class MediaCodecDecoder(
     private val lock = Any()
     private var codec: MediaCodec? = null
     private var events: DecoderEvents? = null
-    private val freeInputs = ArrayDeque<Int>()
+    /** Free input indexes, each with the codec epoch it was announced in (epoch << 32 | index). */
+    private val freeInputs = ArrayDeque<Long>()
+
+    /** Bumped by every flush and configure: an index from an older epoch is not used. */
+    private var epoch = 0
+
+    private fun entry(index: Int): Long = (epoch.toLong() shl 32) or (index.toLong() and 0xffffffffL)
     private var busy = false
     private var mode = PresentMode.RESPONSIVE
 
@@ -91,6 +97,7 @@ class MediaCodecDecoder(
         val handler = (queue as? HandlerSerialQueue)?.handler ?: Handler(Looper.getMainLooper())
         synchronized(lock) {
             this.events = events
+            epoch++
             freeInputs.clear()
             submitted.clear()
             busy = false
@@ -124,7 +131,10 @@ class MediaCodecDecoder(
                 }
                 synchronized(lock) { this.codec = created }
                 decoderName = candidate.name
+                val enabled = enableVendorLowLatency(created, keys)
+                val accepted = acceptedKeys(created)
                 val confirmed = lowLatencyConfirmed(created, keys)
+                // A guess until the first output; ClientStream learns the real depth.
                 val depth = if (confirmed || candidate.lowLatency) 1 else 2
                 Log.i(
                     tag,
@@ -132,6 +142,7 @@ class MediaCodecDecoder(
                         "${candidate.lowLatency}, keys ${keys.name}, low latency confirmed $confirmed, " +
                         "${parameters.width}x${parameters.height}, $color",
                 )
+                Log.i(tag, "decoder ${candidate.name}: low-latency keys read back: ${accepted.ifEmpty { listOf("none") }}")
                 return DecoderInfo(
                     lowLatencyConfirmed = confirmed,
                     hardware = candidate.hardware,
@@ -140,6 +151,8 @@ class MediaCodecDecoder(
                         "decoder ${candidate.name}",
                         "keys ${keys.name}",
                         "feature low latency ${candidate.lowLatency}",
+                        "vendor parameters set ${enabled.ifEmpty { listOf("none") }}",
+                        "keys read back ${accepted.ifEmpty { listOf("none") }}",
                     ),
                 )
             }
@@ -149,54 +162,63 @@ class MediaCodecDecoder(
 
     override fun decode(sample: ByteArray, meta: SampleMeta): DecodeResult {
         val codec = synchronized(lock) { codec } ?: return DecodeResult.Failed(MediaException.DeviceLost())
-        return try {
-            // An index announced before a flush is no longer valid: skip it.
-            var index: Int
-            var buffer: java.nio.ByteBuffer?
-            do {
-                index = synchronized(lock) {
-                    freeInputs.pollFirst() ?: run {
-                        busy = true
-                        null
-                    }
-                } ?: return DecodeResult.Busy
-                buffer = codec.getInputBuffer(index)
-            } while (buffer == null)
-            if (sample.size > buffer.capacity()) {
-                synchronized(lock) { freeInputs.addFirst(index) }
-                return DecodeResult.Failed(MediaException.OutOfResources())
+        // Try the free inputs of the current epoch in turn. An index the codec no longer
+        // owns (announced before a flush) is dropped, not a failure; with none left the
+        // sample is Busy until the next onInputBufferAvailable (input_ready).
+        while (true) {
+            val index = synchronized(lock) {
+                var next: Int? = null
+                while (next == null) {
+                    val entry = freeInputs.pollFirst() ?: break
+                    if ((entry ushr 32).toInt() == epoch) next = entry.toInt()
+                }
+                if (next == null) busy = true
+                next
+            } ?: return DecodeResult.Busy
+            try {
+                val buffer = codec.getInputBuffer(index) ?: continue
+                if (sample.size > buffer.capacity()) {
+                    synchronized(lock) { freeInputs.addFirst(entry(index)) }
+                    return DecodeResult.Failed(MediaException.OutOfResources())
+                }
+                buffer.clear()
+                buffer.put(sample)
+                // Length prefixes (Avcc4) to start codes, in place: both are 4 bytes.
+                var at = 0
+                while (at + 4 <= sample.size) {
+                    val length = ((sample[at].toInt() and 0xff) shl 24) or
+                        ((sample[at + 1].toInt() and 0xff) shl 16) or
+                        ((sample[at + 2].toInt() and 0xff) shl 8) or
+                        (sample[at + 3].toInt() and 0xff)
+                    buffer.put(at, 0); buffer.put(at + 1, 0); buffer.put(at + 2, 0); buffer.put(at + 3, 1)
+                    if (length <= 0) break
+                    at += 4 + length
+                }
+                val flags = if (meta.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+                codec.queueInputBuffer(index, 0, sample.size, meta.seq.toLong(), flags)
+                synchronized(lock) {
+                    submitted[meta.seq.toLong()] = System.nanoTime()
+                    if (!firstOutput) inputsBeforeFirstOutput++
+                }
+                return DecodeResult.Accepted
+            } catch (e: MediaCodec.CodecException) {
+                if (e.isTransient) {
+                    Log.w(tag, "input $index: transient $e; dropping the index")
+                    continue
+                }
+                Log.w(tag, "queueInputBuffer: $e")
+                return DecodeResult.Failed(MediaException.EncoderFailed(e.isRecoverable))
+            } catch (e: IllegalStateException) {
+                // "index N is not owned by client": a stale index. Drop it.
+                Log.w(tag, "input $index: $e; dropping the index")
+                continue
             }
-            buffer.clear()
-            buffer.put(sample)
-            // Length prefixes (Avcc4) to start codes, in place: both are 4 bytes.
-            var at = 0
-            while (at + 4 <= sample.size) {
-                val length = ((sample[at].toInt() and 0xff) shl 24) or
-                    ((sample[at + 1].toInt() and 0xff) shl 16) or
-                    ((sample[at + 2].toInt() and 0xff) shl 8) or
-                    (sample[at + 3].toInt() and 0xff)
-                buffer.put(at, 0); buffer.put(at + 1, 0); buffer.put(at + 2, 0); buffer.put(at + 3, 1)
-                if (length <= 0) break
-                at += 4 + length
-            }
-            val flags = if (meta.keyframe) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-            synchronized(lock) {
-                submitted[meta.seq.toLong()] = System.nanoTime()
-                if (!firstOutput) inputsBeforeFirstOutput++
-            }
-            codec.queueInputBuffer(index, 0, sample.size, meta.seq.toLong(), flags)
-            DecodeResult.Accepted
-        } catch (e: MediaCodec.CodecException) {
-            Log.w(tag, "queueInputBuffer: $e")
-            DecodeResult.Failed(MediaException.EncoderFailed(e.isRecoverable || e.isTransient))
-        } catch (e: IllegalStateException) {
-            Log.w(tag, "queueInputBuffer: $e")
-            DecodeResult.Failed(MediaException.DeviceLost())
         }
     }
 
     override fun flush(): InvalidateOutcome {
         val codec = synchronized(lock) {
+            epoch++
             freeInputs.clear()
             submitted.clear()
             busy = false
@@ -275,7 +297,7 @@ class MediaCodecDecoder(
         override fun onInputBufferAvailable(codec: MediaCodec, index: Int) {
             val wake = synchronized(lock) {
                 if (!isCurrent(owner)) return
-                freeInputs.addLast(index)
+                freeInputs.addLast(entry(index))
                 val wasBusy = busy
                 busy = false
                 wasBusy
@@ -302,6 +324,9 @@ class MediaCodecDecoder(
             if (!frame) return
             val seq = info.presentationTimeUs
             synchronized(lock) {
+                if (!firstOutput) {
+                    Log.i(tag, "first output after $inputsBeforeFirstOutput input(s): depth $inputsBeforeFirstOutput")
+                }
                 firstOutput = true
                 submitted.remove(seq)?.let {
                     decodeNs[decodeCount % decodeNs.size] = now - it
@@ -379,28 +404,85 @@ class MediaCodecDecoder(
         )
     }
 
-    private fun lowLatencyConfirmed(codec: MediaCodec, keys: KeySet): Boolean {
-        if (!keys.lowLatency && !keys.vendor) return false
-        return try {
-            val format = codec.inputFormat
-            (Build.VERSION.SDK_INT >= 30 && format.containsKey(MediaFormat.KEY_LOW_LATENCY) &&
-                format.getInteger(MediaFormat.KEY_LOW_LATENCY) == 1) ||
-                VENDOR_LOW_LATENCY_KEYS.keys.any { format.containsKey(it) && format.getInteger(it) == 1 }
+    /**
+     * Android 12+: the codec lists the vendor parameters it really has. Logs them all, and sets
+     * every integer one whose name says low latency to 1 (how a MediaTek C2 decoder, whose
+     * key names differ between releases, is switched over). Returns the names set.
+     */
+    private fun enableVendorLowLatency(codec: MediaCodec, keys: KeySet): List<String> {
+        if (Build.VERSION.SDK_INT < 31) return emptyList()
+        val names = try {
+            codec.supportedVendorParameters
         } catch (e: Exception) {
-            false
+            Log.w(tag, "supportedVendorParameters: $e")
+            return emptyList()
         }
+        Log.i(tag, "vendor parameters of $decoderName: ${names.sorted()}")
+        if (!keys.vendor) return emptyList()
+        val wanted = names.filter { LOW_LATENCY_NAME.containsMatchIn(it) }
+        val set = wanted.filter { name ->
+            try {
+                val descriptor = codec.getParameterDescriptor(name)
+                if (descriptor?.type != MediaFormat.TYPE_INTEGER) return@filter false
+                codec.setParameters(android.os.Bundle().apply { putInt(name, 1) })
+                true
+            } catch (e: Exception) {
+                Log.w(tag, "setting $name: $e")
+                false
+            }
+        }
+        if (set.isNotEmpty()) Log.i(tag, "set vendor low-latency parameters: $set")
+        return set
     }
+
+    /** The low-latency keys the codec's input or output format reads back as 1. */
+    private fun acceptedKeys(codec: MediaCodec): List<String> = try {
+        val formats = listOf(codec.inputFormat, codec.outputFormat)
+        val keys = buildSet {
+            if (Build.VERSION.SDK_INT >= 30) add(MediaFormat.KEY_LOW_LATENCY)
+            addAll(VENDOR_LOW_LATENCY_KEYS.keys)
+            if (Build.VERSION.SDK_INT >= 29) {
+                formats.forEach { f -> addAll(f.keys.filter { LOW_LATENCY_NAME.containsMatchIn(it) }) }
+            }
+        }
+        keys.filter { key ->
+            formats.any { f ->
+                f.containsKey(key) && try {
+                    f.getInteger(key) == 1
+                } catch (e: Exception) {
+                    false
+                }
+            }
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun lowLatencyConfirmed(codec: MediaCodec, keys: KeySet): Boolean =
+        (keys.lowLatency || keys.vendor) && acceptedKeys(codec).isNotEmpty()
 
     private companion object {
         const val FLUSH_BOUND_MS = 450L
 
-        /** Vendor low-latency switches (Qualcomm, Samsung Exynos, HiSilicon, and others). */
+        /**
+         * Vendor low-latency switches set in the format: Qualcomm, Samsung Exynos, HiSilicon,
+         * Amlogic and others, and MediaTek. The MediaTek names are unverified candidates (the
+         * C2 names differ between releases): on Android 12+ [enableVendorLowLatency] also
+         * sets whatever low-latency parameter the codec itself lists, and the log names the
+         * keys that were read back.
+         */
         val VENDOR_LOW_LATENCY_KEYS = mapOf(
             "vendor.qti-ext-dec-low-latency.enable" to 1,
             "vendor.rtc-ext-dec-low-latency.enable" to 1,
             "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req" to 1,
             "vendor.low-latency.enable" to 1,
+            "vendor.mtk.vdec.lowlatency.mode" to 1,
+            "vendor.mtk.ext.vdec.low-latency.enable" to 1,
+            "vendor.mtk.vdec.low-latency.mode" to 1,
         )
+
+        /** A vendor parameter name that switches low latency. */
+        val LOW_LATENCY_NAME = Regex("low[-_.]?latency", RegexOption.IGNORE_CASE)
 
         /** Configure attempts per decoder, most keys first. */
         val KEY_SETS = listOf(
