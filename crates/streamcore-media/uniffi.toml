@@ -7,3 +7,8 @@ ffi_module_filename = "streamcore_mediaFFI"
 
 [bindings.kotlin]
 package_name = "uniffi.streamcore_media"
+
+# UniFFI Kotlin objects are AutoCloseable: `close()` frees the Rust object, so an
+# exported `close` is renamed in Kotlin.
+[bindings.kotlin.rename]
+"VideoWorkQueue.close" = "closeQueue"

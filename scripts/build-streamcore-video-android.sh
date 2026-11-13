@@ -72,8 +72,8 @@ esac
 cargo run --package streamcore-video --features bindgen --locked --bin streamcore-video-bindgen -- \
     generate --library "$HOST_LIBRARY" --language kotlin --no-format --out-dir "$OUT/kotlin"
 
-# Smoke check of the bindings (nothing here compiles Kotlin: no kotlinc or Gradle project in
-# the repository): the files exist, load the one library, and declare the client API.
+# Smoke check of the bindings: the files exist, load the one library, and declare the client
+# API. scripts/build-streamcore-video-android-app.sh compiles them (android/, Gradle).
 KOTLIN="$OUT/kotlin/uniffi"
 for CRATE in streamcore_video streamcore_media streamcore_transport; do
     FILE="$KOTLIN/$CRATE/$CRATE.kt"

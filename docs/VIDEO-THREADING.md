@@ -462,8 +462,18 @@ input model) and `org.jetbrains.kotlinx:kotlinx-coroutines-core` (the async call
 `ClientStream.nextMessage`, `closeStream`); keep `com.sun.jna.**` and `uniffi.**` in R8. The
 `.so` files are not stripped; the Android Gradle plugin strips them when it packages the app.
 The script checks that the bindings exist, load that library and declare `StreamDecoder`,
-`DecoderEvents`, `ClientEvents`, `ClientStream`, `SerialQueue` and `StreamPort`; it does not
-compile them (the repository has no Kotlin toolchain or Gradle project).
+`DecoderEvents`, `ClientEvents`, `ClientStream`, `SerialQueue` and `StreamPort`;
+`scripts/build-streamcore-video-android-app.sh` then compiles them in the Gradle project in
+`android/`. UniFFI's Kotlin objects are `AutoCloseable`, so exported `close` methods are renamed
+in Kotlin: `SecureChannel.closeChannel`, `SecureListener.closeListener`,
+`PairingService.closeService`, `VideoWorkQueue.closeQueue` (and `closeStream` as before).
+
+`android/` is the Android side (Gradle, minSdk 28): the library module `streamcore-video` bundles
+the script's output (its `syncStreamCoreVideo` task copies `target/streamcore-video-android` into
+`build/` before every build; nothing built is committed) with `MediaCodecDecoder`, the
+`StreamDecoder` below, and `HandlerSerialQueue`; the app module `harness` pairs with the example
+`video_host`'s connect line, decodes onto a full-screen `SurfaceView` and overlays the client's
+counters (logcat tag `StreamCoreVideo`). See the README's "Example video host".
 
 The Android adapter implements `SerialQueue` on the decode stream's `HandlerThread` (`wake` is
 `handler.post { port.run() }`, `wake_after` is `postDelayed` calling `port.runTimer(token)`) and
