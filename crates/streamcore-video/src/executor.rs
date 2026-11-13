@@ -36,6 +36,12 @@ thread_local! {
 
 static NEXT_EXECUTOR: AtomicU64 = AtomicU64::new(1);
 
+/// A new executor id for the drain markers (host and client streams share the
+/// id space).
+pub(crate) fn next_executor_id() -> u64 {
+    NEXT_EXECUTOR.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The name of the transport runtime's worker threads.
 pub const NETWORK_THREAD_NAME: &str = "streamcore-network";
 
@@ -232,7 +238,7 @@ pub(crate) struct CloseSlot {
 }
 
 impl CloseSlot {
-    fn complete(&self, outcome: CloseOutcome) {
+    pub(crate) fn complete(&self, outcome: CloseOutcome) {
         let wakers = {
             let mut state = lock(&self.state);
             if state.outcome.is_some() {
@@ -333,7 +339,7 @@ impl Shared {
                 }
             }));
             Shared {
-                id: NEXT_EXECUTOR.fetch_add(1, Ordering::Relaxed),
+                id: next_executor_id(),
                 mailbox: Mutex::default(),
                 wake_pending: AtomicBool::new(false),
                 draining: AtomicBool::new(false),
@@ -647,11 +653,12 @@ impl Shared {
 
 /// What a native [`SerialQueue`] calls: `run()` for a wake, `run_timer(token)`
 /// when a `wake_after` deadline passes. Create it first, give it to the queue,
-/// then pass both to [`crate::StreamController::new`], which binds it.
+/// then pass both to [`crate::StreamController::new`] (or
+/// [`crate::ClientStream::new`]), which binds it.
 #[derive(uniffi::Object)]
 pub struct StreamPort {
     /// Set once by `bind`; read without a lock on every drain.
-    executor: OnceLock<Weak<Shared>>,
+    executor: OnceLock<PortTarget>,
     bound: AtomicBool,
     key: u64,
 }
@@ -676,19 +683,19 @@ impl StreamPort {
 
     /// Drain the stream's mailbox. Call only on the stream's queue.
     pub fn run(&self) {
-        let executor = self.executor.get().and_then(Weak::upgrade);
-        if let Some(executor) = executor {
-            executor.run(None);
-        }
+        self.drain(None);
     }
 
     /// A `wake_after` deadline passed. Call only on the stream's queue.
     pub fn run_timer(&self, timer: TimerToken) {
-        let executor = self.executor.get().and_then(Weak::upgrade);
-        if let Some(executor) = executor {
-            executor.run(Some(timer));
-        }
+        self.drain(Some(timer));
     }
+}
+
+/// The executor a port is bound to: a host stream's or a client stream's.
+enum PortTarget {
+    Stream(Weak<Shared>),
+    Client(Weak<crate::client::ClientShared>),
 }
 
 impl Drop for StreamPort {
@@ -698,15 +705,46 @@ impl Drop for StreamPort {
 }
 
 impl StreamPort {
+    /// The host stream's executor (the C ABI names only host streams).
     pub(crate) fn executor(&self) -> Option<Arc<Shared>> {
-        self.executor.get().and_then(Weak::upgrade)
+        match self.executor.get() {
+            Some(PortTarget::Stream(executor)) => executor.upgrade(),
+            _ => None,
+        }
+    }
+
+    fn drain(&self, timer: Option<TimerToken>) {
+        match self.executor.get() {
+            Some(PortTarget::Stream(executor)) => {
+                if let Some(executor) = executor.upgrade() {
+                    executor.run(timer);
+                }
+            }
+            Some(PortTarget::Client(executor)) => {
+                if let Some(executor) = executor.upgrade() {
+                    executor.run(timer);
+                }
+            }
+            None => {}
+        }
     }
 
     pub(crate) fn bind(&self, shared: &Arc<Shared>) -> Result<(), MediaError> {
+        self.bind_target(PortTarget::Stream(Arc::downgrade(shared)))
+    }
+
+    pub(crate) fn bind_client(
+        &self,
+        shared: &Arc<crate::client::ClientShared>,
+    ) -> Result<(), MediaError> {
+        self.bind_target(PortTarget::Client(Arc::downgrade(shared)))
+    }
+
+    fn bind_target(&self, target: PortTarget) -> Result<(), MediaError> {
         if self.bound.swap(true, Ordering::AcqRel) {
             return Err(MediaError::InvalidSettings);
         }
-        let _ = self.executor.set(Arc::downgrade(shared));
+        let _ = self.executor.set(target);
         Ok(())
     }
 }
