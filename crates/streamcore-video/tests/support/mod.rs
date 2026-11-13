@@ -507,6 +507,11 @@ pub struct FakeEncoder {
     pub ignore_refresh: AtomicBool,
     /// The newest `ltr_acknowledged` seen.
     pub acked: Mutex<Option<u32>>,
+    /// Size each output like a rate-controlled encoder: the current bitrate
+    /// (the spec's, then the last `set_rate`) over the time since the previous
+    /// frame, a keyframe four times that.
+    pub honour_rate: AtomicBool,
+    last_pts: AtomicU64,
 }
 
 impl FakeEncoder {
@@ -580,6 +585,23 @@ impl FakeEncoder {
         let payload_token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let mut payload = seq.to_le_bytes().to_vec();
         payload.push(u8::from(keyframe));
+        if self.honour_rate.load(Ordering::SeqCst) {
+            let bitrate = lock(&self.rates)
+                .last()
+                .map_or(self.spec.bitrate_bps, |rate| rate.bitrate_bps);
+            let previous = self.last_pts.swap(pending.opts.pts_ns, Ordering::SeqCst);
+            let dt = if previous == 0 {
+                1_000_000_000 / u64::from(self.spec.fps.max(1))
+            } else {
+                pending.opts.pts_ns.saturating_sub(previous)
+            }
+            .clamp(8_000_000, 100_000_000);
+            let mut bytes = (u128::from(bitrate) * u128::from(dt) / 8_000_000_000) as usize;
+            if keyframe {
+                bytes *= 4;
+            }
+            payload.resize(bytes.max(payload.len()), 0);
+        }
         self.spec.sink.submit_encoded(payload_token, payload);
         let config_token = keyframe.then(|| {
             let token = self.next_token.fetch_add(1, Ordering::SeqCst);
@@ -739,6 +761,8 @@ pub struct FakeFactory {
     pub create_on_executor: AtomicUsize,
     /// Attach each encoder's C submit (the per-frame C ABI).
     pub native: AtomicBool,
+    /// New encoders size outputs by their rate (`FakeEncoder::honour_rate`).
+    pub honour_rate: AtomicBool,
 }
 
 impl FakeFactory {
@@ -753,6 +777,7 @@ impl FakeFactory {
             create_delay: Mutex::new(Duration::ZERO),
             create_on_executor: AtomicUsize::new(0),
             native: AtomicBool::new(false),
+            honour_rate: AtomicBool::new(false),
         })
     }
     pub fn encoder(&self, index: usize) -> Arc<FakeEncoder> {
@@ -811,6 +836,8 @@ impl EncoderFactory for FakeFactory {
             ltr: AtomicBool::new(ltr),
             ignore_refresh: AtomicBool::new(false),
             acked: Mutex::new(None),
+            honour_rate: AtomicBool::new(self.honour_rate.load(Ordering::SeqCst)),
+            last_pts: AtomicU64::new(0),
         });
         encoders.push(encoder.clone());
         if self.native.load(Ordering::SeqCst) {
@@ -1350,8 +1377,15 @@ impl Manual {
     }
 
     pub fn with(adjust: impl FnOnce(&Fakes, &mut StreamParts)) -> Self {
+        Self::with_clock(Arc::new(ManualClock(AtomicU64::new(SECOND))), adjust)
+    }
+
+    /// [`Manual::with`] on a given clock (shared with a simulated transport).
+    pub fn with_clock(
+        clock: Arc<ManualClock>,
+        adjust: impl FnOnce(&Fakes, &mut StreamParts),
+    ) -> Self {
         let fakes = Fakes::new();
-        let clock = Arc::new(ManualClock(AtomicU64::new(SECOND)));
         let port = StreamPort::new();
         let queue = ManualQueue::new(port.clone(), clock.clone());
         let mut parts = fakes.parts(port, queue.clone(), plan());

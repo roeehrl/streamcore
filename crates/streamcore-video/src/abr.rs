@@ -76,6 +76,8 @@ const FPS_UP_QUIET_NS: u64 = 2_000_000_000;
 const RESOLUTION_UP_QUIET_NS: u64 = 5_000_000_000;
 /// Below this share of the target the encoder is application-limited.
 const APP_LIMITED: f64 = 0.5;
+/// The measured video rate is a one-second window: it means nothing earlier.
+const RATE_WARMUP_NS: u64 = 1_000_000_000;
 
 /// What the controller adapts: the plan's encode size, frame rate and bitrate
 /// (the full tier), and whether resolution steps are possible (the stream
@@ -190,6 +192,9 @@ pub struct AbrController {
     lost_frames: u64,
     link_lost: u64,
     bulk_floor: Option<f64>,
+    first_tick_ns: Option<u64>,
+    /// The previous tick saw queueing above one frame.
+    queued: bool,
     state: AbrState,
     queueing_ns: u64,
     decreases: u64,
@@ -218,6 +223,8 @@ impl AbrController {
             lost_frames: 0,
             link_lost: 0,
             bulk_floor: None,
+            first_tick_ns: None,
+            queued: false,
             state: AbrState::Increase,
             queueing_ns: 0,
             decreases: 0,
@@ -338,6 +345,14 @@ impl AbrController {
             .map_or(0, |last| now.saturating_sub(last))
             .min(500_000_000);
         self.last_tick_ns = Some(now);
+        let first = *self.first_tick_ns.get_or_insert(now);
+        // Before the measured rate has a full window, it says nothing about
+        // the encoder's output: take the target.
+        let video_bps = if now.saturating_sub(first) < RATE_WARMUP_NS {
+            self.target as u64
+        } else {
+            sample.video_bps
+        };
         let interval = 1_000_000_000 / u64::from(self.fps_levels[self.fps_index].max(1));
 
         // Delay inputs above their windowed minima.
@@ -389,18 +404,23 @@ impl AbrController {
             .unwrap_or(0)
             .min(1_000_000_000);
         let gap = DECREASE_GAP_NS.max(rtt.saturating_mul(2));
-        if queueing > interval || loss {
+        // Queueing must persist over two ticks: a single IDR crossing the link
+        // queues briefly and is not a link change. Loss acts at once.
+        let over = queueing > interval;
+        let persistent = over && self.queued;
+        self.queued = over;
+        if persistent || loss {
             let due = self
                 .last_decrease_ns
                 .is_none_or(|last| now.saturating_sub(last) >= gap);
             if due {
-                self.decrease(now, sample.video_bps);
+                self.decrease(now, video_bps);
             } else {
                 self.state = AbrState::Hold;
             }
-        } else if queueing > interval / 2 || growing {
+        } else if over || queueing > interval / 2 || growing {
             self.state = AbrState::Hold;
-        } else if (sample.video_bps as f64) < self.target * APP_LIMITED {
+        } else if (video_bps as f64) < self.target * APP_LIMITED {
             self.state = AbrState::AppLimited;
         } else {
             self.state = AbrState::Increase;
@@ -569,45 +589,93 @@ mod tests {
         assert_eq!(abr.tier_changes(), 0);
     }
 
+    /// Ticks a steady link for 1.2 s (past the rate warm-up); returns the time.
+    fn warm(abr: &mut AbrController, video_bps: u64) -> u64 {
+        let mut now = 0;
+        for _ in 0..12 {
+            now += 100 * MS;
+            abr.tick(&idle(now, video_bps));
+        }
+        now
+    }
+
+    /// Two ticks 100 ms apart that both see `sample`'s queue (it must
+    /// persist); returns the time of the second.
+    fn queued(abr: &mut AbrController, mut sample: AbrSample) -> u64 {
+        abr.tick(&sample);
+        assert_ne!(abr.state(), AbrState::Decrease, "one tick is not enough");
+        sample.now_ns += 100 * MS;
+        abr.tick(&sample);
+        sample.now_ns
+    }
+
     #[test]
     fn queueing_above_one_frame_multiplies_by_0_85() {
         let mut abr = AbrController::new(hd());
-        abr.tick(&idle(100 * MS, 13_700_000));
+        let now = warm(&mut abr, 13_700_000);
         let before = abr.target().bitrate_bps as f64;
-        let mut sample = idle(200 * MS, 13_700_000);
+        let mut sample = idle(now + 100 * MS, 13_700_000);
         sample.unsent_age_ns = 17 * MS; // one 60 fps frame is 16.7 ms
-        abr.tick(&sample);
+        queued(&mut abr, sample);
         assert_eq!(abr.state(), AbrState::Decrease);
         let after = abr.target().bitrate_bps as f64;
         assert!((after / before - 0.85).abs() < 0.001, "{after} / {before}");
         // A queue of less than one frame does not decrease.
         let mut abr = AbrController::new(hd());
-        let mut sample = idle(100 * MS, 13_700_000);
+        let now = warm(&mut abr, 13_700_000);
+        let mut sample = idle(now + 100 * MS, 13_700_000);
         sample.unsent_age_ns = 16 * MS;
+        abr.tick(&sample);
+        sample.now_ns += 100 * MS;
         abr.tick(&sample);
         assert_ne!(abr.state(), AbrState::Decrease);
         assert_eq!(abr.target().bitrate_bps, 13_700_000);
     }
 
     #[test]
-    fn decreases_follow_the_measured_rate_and_keep_a_gap() {
+    fn a_single_queued_tick_is_not_a_link_change() {
+        // An IDR crossing the link: one tick sees a queue, the next does not.
         let mut abr = AbrController::new(hd());
-        let mut sample = idle(100 * MS, 8 * MBPS);
+        let now = warm(&mut abr, 13 * MBPS);
+        let mut sample = idle(now + 100 * MS, 13 * MBPS);
         sample.unsent_age_ns = 40 * MS;
         abr.tick(&sample);
+        assert_eq!(abr.state(), AbrState::Hold);
+        abr.tick(&idle(now + 200 * MS, 13 * MBPS));
+        assert_eq!(abr.decreases(), 0);
+    }
+
+    #[test]
+    fn decreases_follow_the_measured_rate_and_keep_a_gap() {
+        let mut abr = AbrController::new(hd());
+        let now = warm(&mut abr, 13 * MBPS);
+        let mut sample = idle(now + 100 * MS, 8 * MBPS);
+        sample.unsent_age_ns = 40 * MS;
+        let now = queued(&mut abr, sample);
         assert_eq!(
             abr.target().bitrate_bps,
             6_800_000,
             "0.85 × the measured 8 Mbit/s"
         );
         // 100 ms later the queue is still there: within the gap it holds.
-        sample.now_ns = 200 * MS;
+        sample.now_ns = now + 100 * MS;
         abr.tick(&sample);
         assert_eq!(abr.state(), AbrState::Hold);
         assert_eq!(abr.decreases(), 1);
-        sample.now_ns = 400 * MS;
+        sample.now_ns = now + 300 * MS;
         abr.tick(&sample);
         assert_eq!(abr.decreases(), 2);
+    }
+
+    #[test]
+    fn the_measured_rate_counts_only_after_its_window() {
+        // At start the one-second window is nearly empty: the decrease takes
+        // the target, not a tenth of the rate.
+        let mut abr = AbrController::new(hd());
+        let mut sample = idle(100 * MS, MBPS);
+        sample.unsent_age_ns = 40 * MS;
+        queued(&mut abr, sample);
+        assert_eq!(abr.target().bitrate_bps, 11_645_000);
     }
 
     #[test]
@@ -615,12 +683,12 @@ mod tests {
         let mut config = hd();
         config.bitrate_bps = 80 * MBPS;
         let mut abr = AbrController::new(config);
+        let now = warm(&mut abr, 80 * MBPS);
         // Bring it down first.
-        let mut sample = idle(100 * MS, 10 * MBPS);
+        let mut sample = idle(now + 100 * MS, 10 * MBPS);
         sample.unsent_age_ns = 40 * MS;
-        abr.tick(&sample);
+        let mut now = queued(&mut abr, sample);
         let start = abr.target().bitrate_bps as f64;
-        let mut now = 100 * MS;
         for _ in 0..10 {
             now += 100 * MS;
             abr.tick(&idle(now, abr.target().bitrate_bps));
@@ -633,11 +701,11 @@ mod tests {
     #[test]
     fn an_application_limited_encoder_does_not_ramp() {
         let mut abr = AbrController::new(hd());
-        let mut sample = idle(100 * MS, 10 * MBPS);
+        let now = warm(&mut abr, 13 * MBPS);
+        let mut sample = idle(now + 100 * MS, 10 * MBPS);
         sample.unsent_age_ns = 40 * MS;
-        abr.tick(&sample);
+        let mut now = queued(&mut abr, sample);
         let low = abr.target().bitrate_bps;
-        let mut now = 100 * MS;
         for _ in 0..50 {
             now += 100 * MS;
             abr.tick(&idle(now, MBPS));
@@ -649,20 +717,18 @@ mod tests {
     #[test]
     fn credit_rtt_above_its_minimum_is_queueing() {
         let mut abr = AbrController::new(hd());
-        let mut now = 0;
-        for _ in 0..10 {
-            now += 100 * MS;
-            abr.tick(&idle(now, 13 * MBPS));
-        }
+        let now = warm(&mut abr, 13 * MBPS);
         let mut sample = idle(now + 100 * MS, 13 * MBPS);
         // 2 ms is the minimum; 30 ms is 28 ms of queue, more than a frame.
         sample.credit_rtt_ns = Some(30 * MS);
-        abr.tick(&sample);
+        queued(&mut abr, sample);
         assert_eq!(abr.state(), AbrState::Decrease);
         // A high RTT from the start is no queue: it is the minimum.
         let mut abr = AbrController::new(hd());
         let mut sample = idle(100 * MS, 13 * MBPS);
         sample.credit_rtt_ns = Some(30 * MS);
+        abr.tick(&sample);
+        sample.now_ns += 100 * MS;
         abr.tick(&sample);
         assert_ne!(abr.state(), AbrState::Decrease);
     }
@@ -680,22 +746,26 @@ mod tests {
                 })
                 .collect()
         };
-        abr.note_client_delay(100 * MS, &frames(100_000, &|_| 3_000));
-        abr.tick(&idle(100 * MS, 13 * MBPS));
+        let now = warm(&mut abr, 13 * MBPS);
+        abr.note_client_delay(now, &frames(100_000, &|_| 3_000));
+        abr.tick(&idle(now + 100 * MS, 13 * MBPS));
         assert_eq!(abr.state(), AbrState::Increase);
         // Rising by 1.5 ms per frame (0.09 µs/µs) but still below half a frame
         // of excess: hold.
-        abr.note_client_delay(200 * MS, &frames(200_000, &|i| 3_000 + 1_500 * i));
-        abr.tick(&idle(200 * MS, 13 * MBPS));
+        abr.note_client_delay(now + 200 * MS, &frames(200_000, &|i| 3_000 + 1_500 * i));
+        abr.tick(&idle(now + 200 * MS, 13 * MBPS));
         assert!(abr.client_gradient().unwrap() > GRADIENT_HOLD);
         assert_eq!(abr.state(), AbrState::Hold);
-        // 25 ms over the minimum: decrease.
-        abr.note_client_delay(300 * MS, &frames(300_000, &|_| 28_000));
-        abr.tick(&idle(300 * MS, 13 * MBPS));
+        // 25 ms over the minimum, in two reports: decrease.
+        abr.note_client_delay(now + 300 * MS, &frames(300_000, &|_| 28_000));
+        abr.tick(&idle(now + 300 * MS, 13 * MBPS));
+        abr.note_client_delay(now + 400 * MS, &frames(400_000, &|_| 28_000));
+        abr.tick(&idle(now + 400 * MS, 13 * MBPS));
         assert_eq!(abr.state(), AbrState::Decrease);
         // A stale report counts no more.
         let mut abr2 = abr.clone();
-        abr2.tick(&idle(2_000 * MS, 13 * MBPS));
+        abr2.tick(&idle(now + 2_000 * MS, 13 * MBPS));
+        abr2.tick(&idle(now + 2_100 * MS, 13 * MBPS));
         assert_ne!(abr2.state(), AbrState::Decrease);
     }
 
@@ -708,33 +778,33 @@ mod tests {
         samples[3].1 += 30_000;
         abr.note_client_delay(100 * MS, &samples);
         abr.tick(&idle(100 * MS, 13 * MBPS));
+        abr.tick(&idle(200 * MS, 13 * MBPS));
         assert_ne!(abr.state(), AbrState::Decrease);
     }
 
     #[test]
-    fn loss_decreases() {
+    fn loss_decreases_at_once() {
         let mut abr = AbrController::new(hd());
-        let mut sample = idle(100 * MS, 13 * MBPS);
-        abr.tick(&sample);
-        sample.now_ns = 200 * MS;
+        let now = warm(&mut abr, 13 * MBPS);
+        let mut sample = idle(now + 100 * MS, 13 * MBPS);
         sample.lost_frames = 1;
         abr.tick(&sample);
         assert_eq!(abr.state(), AbrState::Decrease);
         // The same count again is no new loss.
-        sample.now_ns = 600 * MS;
+        sample.now_ns += 400 * MS;
         abr.tick(&sample);
         assert_ne!(abr.state(), AbrState::Decrease);
         // QUIC loss, and the QUIC RTT above its minimum.
-        sample.now_ns = 1_000 * MS;
+        sample.now_ns += 400 * MS;
         sample.link_lost_packets = 3;
         abr.tick(&sample);
         assert_eq!(abr.state(), AbrState::Decrease);
-        sample.now_ns = 1_400 * MS;
+        sample.now_ns += 400 * MS;
         sample.link_rtt_ns = Some(5 * MS);
         abr.tick(&sample);
-        sample.now_ns = 1_800 * MS;
+        sample.now_ns += 400 * MS;
         sample.link_rtt_ns = Some(40 * MS);
-        abr.tick(&sample);
+        queued(&mut abr, sample);
         assert_eq!(abr.state(), AbrState::Decrease);
     }
 
