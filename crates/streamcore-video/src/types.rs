@@ -721,8 +721,8 @@ pub struct StatsSnapshot {
     /// Skip cause (a): frames the capture backend dropped unseen
     /// ([`crate::CaptureEvents::skipped`]).
     pub capture_skipped: u64,
-    /// Skip cause (d): delta frames the sender refused or shed (a refused
-    /// receipt for a frame that is neither a keyframe nor a configuration).
+    /// Skip cause (d): delta frames the sink shed by the delta age bound, or
+    /// the transport refused (not keyframes, not discardable frames).
     pub sender_shed: u64,
     /// Skip cause (e): frames the client flushed, as reported to
     /// [`crate::StreamController::note_client_flush`].
@@ -736,6 +736,52 @@ pub struct StatsSnapshot {
     pub permit_target: u32,
     /// Encode time p95 (submit to output, executor clock) over the recent window, µs.
     pub encode_p95_us: u64,
+    /// `VideoSink` (6.4): discardable frames dropped by rule 1.
+    #[uniffi(default = 0)]
+    pub sink_discardable_shed: u64,
+    /// `VideoSink`: queued frames a newer keyframe superseded (rule 3).
+    #[uniffi(default = 0)]
+    pub sink_superseded: u64,
+    /// `VideoSink`: deltas shed by the delta age bound (rule 2; also in
+    /// `sender_shed`).
+    #[uniffi(default = 0)]
+    pub sink_aged_shed: u64,
+    /// Admissions the sink held back (6.2: a frame unsent or too many
+    /// unconsumed); the frame waited in the latest slot.
+    #[uniffi(default = 0)]
+    pub sink_held: u64,
+    /// The most frames ever unsent at once.
+    #[uniffi(default = 0)]
+    pub sink_unsent_max: u32,
+    /// The consumed-credit RTT (windowed minimum), ms; 0 without a sample.
+    #[uniffi(default = 0)]
+    pub credit_rtt_ms: u32,
+    /// The delta age bound (6.4 rule 2) is in effect: switched on and the plan
+    /// confirms LTR or temporal layers.
+    #[uniffi(default = false)]
+    pub sink_age_bound: bool,
+    /// `frameTiming` reports sent (frames.v4 only).
+    #[uniffi(default = 0)]
+    pub frame_timing_sent: u64,
+    /// frames.v4 was negotiated on the sink's channel.
+    #[uniffi(default = false)]
+    pub frames_v4: bool,
+    /// The video rate the sink measured over the last second, bit/s.
+    #[uniffi(default = 0)]
+    pub video_bps: u64,
+    /// The link capacity given to the bulk bucket, bit/s.
+    #[uniffi(default = 0)]
+    pub bulk_capacity_bps: u64,
+    /// `bulk_capacity_bps` is the sink's own estimate (the largest write rate
+    /// of a frame into an idle lane over 2 s, at least twice the video rate).
+    /// It is **not measured** against the link and not qualified.
+    #[uniffi(default = false)]
+    pub bulk_capacity_estimated: bool,
+    /// `SinkPolicy::bulk_bucket` is on but the channel does not run the bucket
+    /// (`TransportTuning::bulk_token_bucket` was off when it was created): bulk
+    /// may starve video (6.4 rule 5).
+    #[uniffi(default = false)]
+    pub bulk_bucket_inactive: bool,
     /// The refresh interval admission aligns to (ns); 0 while refresh-aligned
     /// admission is off.
     pub refresh_interval_ns: u64,
@@ -796,19 +842,6 @@ pub struct FrameTiming {
     pub capture_ns: u64,
     /// H3 and H4.
     pub encode: EncodeTimings,
-}
-
-/// Metadata for one packet handed to [`crate::VideoOut::send`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
-pub struct VideoOutMeta {
-    pub header: streamcore_media::media::VideoMetadata,
-    /// The sender may drop this under pressure (a delta, never config or keyframe).
-    pub droppable: bool,
-    pub keyframe: bool,
-    pub config: bool,
-    /// The frame's stage times, for the consumer's trace (P1; frames.v4 carries
-    /// them on the wire from P2).
-    pub timing: FrameTiming,
 }
 
 /// Time bounds of the executor. Defaults are the reference host's values.

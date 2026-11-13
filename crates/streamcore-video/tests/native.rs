@@ -22,15 +22,8 @@ fn c_layouts_match_the_header() {
     assert_eq!(offset_of!(EncodedOutput, ltr_token), 68);
     assert_eq!(offset_of!(EncodedOutput, temporal_id), 72);
     assert_eq!(offset_of!(EncodedOutput, ltr_flags), 74);
-    assert_eq!(size_of::<native::Packet>(), 88);
-    assert_eq!(offset_of!(native::Packet, key), 0);
-    assert_eq!(offset_of!(native::Packet, bytes), 64);
-    assert_eq!(offset_of!(native::Packet, len), 72);
-    assert_eq!(offset_of!(native::Packet, stream_id), 80);
-    assert_eq!(offset_of!(native::Packet, flags), 84);
-    assert_eq!(offset_of!(native::Packet, config), 87);
-    assert_eq!(size_of::<StreamCallbacks>(), 48);
-    assert_eq!(offset_of!(StreamCallbacks, send), 40);
+    assert_eq!(size_of::<StreamCallbacks>(), 32);
+    assert_eq!(offset_of!(StreamCallbacks, release), 24);
 }
 
 /// What a native encoder's output thread does: one C call per output.
@@ -86,9 +79,6 @@ fn every_per_frame_call_can_go_through_the_c_abi() {
     assert_eq!(packets[0].bytes, b"avcC-config");
     assert!(packets[1].meta.keyframe);
     assert_eq!(packets[1].bytes, b"idr-frame");
-    assert_eq!(packets[1].meta.timing.encode.input_ns, Some(1_010));
-    assert_eq!(packets[1].meta.timing.encode.output_ns, None);
-    assert_eq!(packets[1].meta.timing.capture_ns, 1_000);
 
     // A C output, then a UniFFI one: one wire sequence, one generation.
     s.frame_native(2_000);
@@ -196,8 +186,6 @@ fn refused_bytes_count_as_a_drop_and_unknown_keys_name_nothing() {
     assert!(!null);
     assert!(!streamcore_video_frame(u64::MAX, CAPTURE, 99, 1, 0));
     streamcore_video_run(u64::MAX);
-    streamcore_video_packet_complete(u64::MAX, true);
-    streamcore_video_packet_release(u64::MAX);
     s.advance_ms(600);
     s.factory.last().complete_all();
     s.pump();
@@ -224,8 +212,6 @@ fn a_closed_streams_keys_name_nothing() {
             wake: None,
             capture: std::ptr::null_mut(),
             release: None,
-            out: std::ptr::null_mut(),
-            send: None,
         }
     ));
     let late = s.capture.surface(srgb(), 2_000).id;
@@ -329,70 +315,6 @@ fn a_delivered_frame_costs_one_wake() {
     one_wake_per_delivered_frame(&Manual::native(), true);
 }
 
-/// The consumer's connection copies the bytes at once and completes later: the
-/// release comes first and must not count as a refusal.
-#[test]
-fn a_packet_released_before_its_completion_is_accepted() {
-    let s = Manual::native();
-    s.start_running();
-    s.frame(1_000);
-    let encoder = s.encoder();
-    encoder.complete(1);
-    s.pump();
-    let key = {
-        let mut state = lock(&s.out.state);
-        let (_, receipt) = state.receipts.pop().expect("sample receipt");
-        match receipt {
-            Receipt::Native(key) => key,
-            Receipt::Uniffi(_) => panic!("sent through UniFFI"),
-        }
-    };
-    streamcore_video_packet_release(key);
-    s.pump();
-    assert_eq!(s.queue.wakes.load(Ordering::SeqCst), 0);
-    streamcore_video_packet_complete(key, true);
-    s.pump();
-    // A second completion and release are no-ops.
-    streamcore_video_packet_complete(key, false);
-    streamcore_video_packet_release(key);
-    s.pump();
-    let stats = s.controller.stats();
-    assert_eq!(stats.packets_refused, 0);
-    assert_eq!(stats.recoveries, 0);
-    // Steady state continues without a recovery keyframe.
-    s.frame_native(2_000);
-    assert!(!lock(&encoder.submits)[1].force_keyframe);
-    encoder.complete(2);
-    s.pump();
-    finish_all(&s);
-    s.close();
-    s.assert_clean();
-}
-
-#[test]
-fn a_released_packet_refused_later_is_a_loss() {
-    let s = Manual::native();
-    s.start_running();
-    s.frame(1_000);
-    let encoder = s.encoder();
-    encoder.complete(1);
-    s.pump();
-    let key = match lock(&s.out.state).receipts.pop().expect("receipt").1 {
-        Receipt::Native(key) => key,
-        Receipt::Uniffi(_) => panic!("sent through UniFFI"),
-    };
-    streamcore_video_packet_release(key);
-    streamcore_video_packet_complete(key, false);
-    s.pump();
-    assert_eq!(s.controller.stats().packets_refused, 1);
-    s.advance_ms(600);
-    encoder.complete_all();
-    s.pump();
-    finish_all(&s);
-    s.close();
-    s.assert_clean();
-}
-
 /// A restart opens a new capture: the C frame is not taken until a full frame
 /// gives the new capture its shape.
 #[test]
@@ -466,40 +388,4 @@ fn a_panic_in_an_inline_drain_closes_the_stream() {
 #[test]
 fn a_panic_in_a_queued_drain_closes_the_stream() {
     panicking_submit_closes_the_stream(false);
-}
-
-/// Released packets waiting for a completion are bounded per stream: past the
-/// cap the oldest counts as refused.
-#[test]
-fn released_packets_never_completed_are_bounded() {
-    let s = Manual::native();
-    s.start_running();
-    s.frame(1_000);
-    let encoder = s.encoder();
-    let mut released = 0;
-    for n in 1..=(RELEASED_CAP as u64 + 2) {
-        if n > 1 {
-            s.frame_native(n * 1_000);
-        }
-        encoder.complete_all();
-        s.pump();
-        // Config packets complete at once; the sample's bytes are released only.
-        let keys: Vec<u64> = lock(&s.out.state)
-            .receipts
-            .drain(..)
-            .filter_map(|(_, receipt)| match receipt {
-                Receipt::Native(key) => Some(key),
-                Receipt::Uniffi(_) => None,
-            })
-            .collect();
-        for key in keys {
-            streamcore_video_packet_release(key);
-            released += 1;
-        }
-        s.pump();
-    }
-    assert!(released > RELEASED_CAP);
-    assert!(s.controller.stats().packets_refused >= 1);
-    s.close();
-    s.assert_clean();
 }

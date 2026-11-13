@@ -3,6 +3,7 @@
 
 use crate::error::MediaError;
 use crate::executor::*;
+use crate::sink::{SinkState, VideoOutput, VideoSink};
 use crate::stream::{Backends, Command, StreamState, validate};
 use crate::traits::*;
 use crate::types::*;
@@ -26,7 +27,9 @@ pub struct StreamParts {
     /// Required when `plan.convert` is `Convert`.
     pub converter: Option<Arc<dyn Converter>>,
     pub encoders: Arc<dyn EncoderFactory>,
-    pub out: Arc<dyn VideoOut>,
+    /// Where encoded video goes: the stream's `VideoSink` sends it on this
+    /// output's channel (3.4).
+    pub output: Arc<VideoOutput>,
     pub observer: Arc<dyn ObserverQueue>,
     pub timings: Option<StreamTimings>,
 }
@@ -154,6 +157,11 @@ impl StreamController {
     pub fn stats(&self) -> StatsSnapshot {
         lock(&self.shared.published).stats
     }
+
+    /// The sink's current backlog (6.2). A leaf call, any thread.
+    pub fn sink_state(&self) -> SinkState {
+        self.shared.sink.state()
+    }
 }
 
 impl StreamController {
@@ -173,7 +181,7 @@ impl StreamController {
             capture,
             converter,
             encoders,
-            out,
+            output,
             observer,
             ..
         } = parts;
@@ -181,12 +189,13 @@ impl StreamController {
             capture,
             converter,
             encoders,
-            out: out.clone(),
             observer,
         };
-        let shared = Shared::new(queue, out, clock, |weak| {
+        let sink = VideoSink::new(&output, clock.clone(), stream_id, &plan);
+        let shared = Shared::new(queue, sink, clock, |weak| {
             StreamState::new(weak.clone(), stream_id, spec, plan, timings, backends)
         });
+        shared.sink.bind(Arc::downgrade(&shared));
         port.bind(&shared)?;
         Ok(Arc::new(Self { shared }))
     }

@@ -7,7 +7,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
-use streamcore_media::media::VideoMetadata;
+use streamcore_media::media::{ExtendedVideoPacket, FrameVersion, VideoExtensions, VideoMetadata};
 use streamcore_media::stream::VideoWorkPermit;
 use streamcore_video::native;
 use streamcore_video::*;
@@ -529,6 +529,21 @@ impl FakeEncoder {
     }
 
     pub fn complete_as(&self, seq: u64, form: BitstreamForm) -> bool {
+        self.complete_with(seq, form, false, None)
+    }
+
+    /// A discardable (temporal layer) output, as a layered encoder makes.
+    pub fn complete_discardable(&self, seq: u64) -> bool {
+        self.complete_with(seq, BitstreamForm::Avcc4, true, Some(1))
+    }
+
+    pub fn complete_with(
+        &self,
+        seq: u64,
+        form: BitstreamForm,
+        discardable: bool,
+        temporal_id: Option<u8>,
+    ) -> bool {
         let Some(pending) = self.take(seq) else {
             return false;
         };
@@ -553,8 +568,8 @@ impl FakeEncoder {
             config_token,
             payload_token,
             form,
-            discardable: false,
-            temporal_id: None,
+            discardable,
+            temporal_id,
             ltr: None,
             timings: EncodeTimings {
                 input_ns: Some(pending.opts.capture_ns + 10),
@@ -827,46 +842,59 @@ impl Converter for FakeConverter {
 // ---------------------------------------------------------------------------
 // Sink and observer.
 
+/// What the sink sent for one packet, decoded from its wire message.
+#[derive(Clone, Copy, Debug)]
+pub struct PacketMeta {
+    pub header: VideoMetadata,
+    pub keyframe: bool,
+    pub config: bool,
+    /// Not a keyframe, not a configuration.
+    pub droppable: bool,
+    /// The frames.v4 extension block (empty under v3).
+    pub extensions: VideoExtensions,
+}
+
 #[derive(Clone, Debug)]
 pub struct Packet {
-    pub meta: VideoOutMeta,
+    pub meta: PacketMeta,
+    /// The packet's data (payload or avcC).
     pub bytes: Vec<u8>,
-}
-
-/// A send's completion: a UniFFI receipt, or a packet lent through the C ABI.
-#[derive(Clone)]
-pub enum Receipt {
-    Uniffi(Arc<SinkReceipt>),
-    Native(u64),
-}
-
-impl Receipt {
-    pub fn complete(&self, ok: bool) {
-        match self {
-            Receipt::Uniffi(receipt) => receipt.complete(ok),
-            Receipt::Native(key) => {
-                native::streamcore_video_packet_complete(*key, ok);
-                native::streamcore_video_packet_release(*key);
-            }
-        }
-    }
+    /// The whole enveloped message as enqueued.
+    pub message: Vec<u8>,
+    /// Enqueued on the stream's executor (inside `push`), not by a write
+    /// completion.
+    pub on_executor: bool,
 }
 
 #[derive(Default)]
 pub struct OutState {
-    pub revoked: bool,
     pub packets: Vec<Packet>,
-    pub receipts: Vec<(VideoMetadata, Receipt)>,
+    /// Payload messages' tickets, held for the test; configuration tickets
+    /// are completed at once.
+    pub receipts: Vec<(VideoMetadata, SendTicket)>,
+    /// Other lane-0 messages (frameTiming).
+    pub control: Vec<Vec<u8>>,
+    pub rates: Vec<(u64, u64)>,
 }
 
-/// The consumer's send path behind `VideoOut`: a sink lock that `revoke` also
-/// takes, config completed at once, sample receipts held for the test.
+/// The sink's transport (lane 1 of a channel) as a fake: it decodes every
+/// message, completes configuration at once and holds payload tickets until
+/// the test finishes them (written, then consumed unless `hold_consumed`).
 pub struct FakeOut {
     pub log: Arc<Log>,
     pub state: Mutex<OutState>,
+    /// The transport-side backpressure signal.
     pub pressured: AtomicBool,
+    /// Complete payload tickets at once (written and consumed).
     pub sync_receipts: AtomicBool,
-    pub revokes: AtomicUsize,
+    /// `finish(_, true)` writes but does not consume; `consume_all` does.
+    pub hold_consumed: AtomicBool,
+    pub held_consumed: Mutex<Vec<SendTicket>>,
+    /// Refuse every enqueue.
+    pub refuse: AtomicBool,
+    pub frames_v4: AtomicBool,
+    pub bucket: AtomicBool,
+    pub now_us: AtomicU64,
 }
 
 impl FakeOut {
@@ -876,7 +904,12 @@ impl FakeOut {
             state: Mutex::new(OutState::default()),
             pressured: AtomicBool::new(false),
             sync_receipts: AtomicBool::new(false),
-            revokes: AtomicUsize::new(0),
+            hold_consumed: AtomicBool::new(false),
+            held_consumed: Mutex::new(Vec::new()),
+            refuse: AtomicBool::new(false),
+            frames_v4: AtomicBool::new(false),
+            bucket: AtomicBool::new(false),
+            now_us: AtomicU64::new(1_000_000),
         })
     }
     pub fn samples(&self) -> Vec<VideoMetadata> {
@@ -890,8 +923,31 @@ impl FakeOut {
     pub fn packets(&self) -> Vec<Packet> {
         lock(&self.state).packets.clone()
     }
+    /// Payload tickets still held.
+    pub fn held(&self) -> Vec<VideoMetadata> {
+        lock(&self.state).receipts.iter().map(|(h, _)| *h).collect()
+    }
+    fn complete(&self, ticket: SendTicket, ok: bool) {
+        if !ok {
+            drop(ticket);
+            return;
+        }
+        ticket.written(Some(self.now_us.load(Ordering::SeqCst)));
+        if self.hold_consumed.load(Ordering::SeqCst) {
+            lock(&self.held_consumed).push(ticket);
+        } else {
+            ticket.consumed();
+        }
+    }
+    /// The peer consumes every written message held so far.
+    pub fn consume_all(&self) {
+        let held = std::mem::take(&mut *lock(&self.held_consumed));
+        for ticket in held {
+            ticket.consumed();
+        }
+    }
     pub fn finish(&self, header: VideoMetadata, ok: bool) {
-        let receipt = {
+        let ticket = {
             let mut state = lock(&self.state);
             let index = state
                 .receipts
@@ -902,10 +958,10 @@ impl FakeOut {
                 .expect("no such receipt");
             state.receipts.remove(index).1
         };
-        receipt.complete(ok);
+        self.complete(ticket, ok);
     }
     pub fn finish_any(&self, index: usize, ok: bool) -> bool {
-        let receipt = {
+        let ticket = {
             let mut state = lock(&self.state);
             if state.receipts.is_empty() {
                 return false;
@@ -913,44 +969,78 @@ impl FakeOut {
             let index = index % state.receipts.len();
             state.receipts.remove(index).1
         };
-        receipt.complete(ok);
+        self.complete(ticket, ok);
         true
     }
 }
 
-impl VideoOut for FakeOut {
-    fn send(&self, meta: VideoOutMeta, bytes: Vec<u8>, receipt: Arc<SinkReceipt>) {
-        self.accept(meta, bytes, Receipt::Uniffi(receipt));
+impl SinkTransport for FakeOut {
+    fn frames_v4(&self) -> bool {
+        self.frames_v4.load(Ordering::SeqCst)
+    }
+    fn bulk_bucket_enabled(&self) -> bool {
+        self.bucket.load(Ordering::SeqCst)
+    }
+    fn set_bulk_rate_inputs(&self, capacity_bps: u64, video_bps: u64) {
+        lock(&self.state).rates.push((capacity_bps, video_bps));
+    }
+    fn now_us(&self) -> u64 {
+        self.now_us.load(Ordering::SeqCst)
     }
     fn backpressured(&self) -> bool {
         self.pressured.load(Ordering::SeqCst)
     }
-    fn revoke(&self) {
-        self.revokes.fetch_add(1, Ordering::SeqCst);
-        lock(&self.state).revoked = true;
-    }
-}
-
-impl FakeOut {
-    fn accept(&self, meta: VideoOutMeta, bytes: Vec<u8>, receipt: Receipt) {
-        let _call = self.log.outbound();
-        let refused;
+    fn enqueue(&self, message: Vec<u8>, ticket: SendTicket) -> Result<(), SendTicket> {
+        // A leaf call: any thread (the sink enqueues from write completions),
+        // never after Closed.
+        if self.log.closed.load(Ordering::SeqCst) {
+            self.log.after_close.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(ticket);
+        }
+        assert!(message.len() > 5);
+        let kind = message[0];
+        let length = u32::from_be_bytes(message[1..5].try_into().unwrap()) as usize;
+        assert_eq!(length, message.len() - 5, "envelope length");
+        if kind != 0x10 {
+            lock(&self.state).control.push(message);
+            ticket.written(Some(self.now_us.load(Ordering::SeqCst)));
+            ticket.consumed();
+            return Ok(());
+        }
+        let version = if self.frames_v4() {
+            FrameVersion::V4
+        } else {
+            FrameVersion::V3
+        };
+        let decoded =
+            ExtendedVideoPacket::decode(&message[5..], version).expect("a valid video message");
+        let header = decoded.metadata;
+        let config = header.flags == 2;
+        let packet = Packet {
+            meta: PacketMeta {
+                header,
+                keyframe: header.flags == 1,
+                config,
+                droppable: header.flags == 0,
+                extensions: decoded.extensions,
+            },
+            bytes: decoded.data.to_vec(),
+            message: message.clone(),
+            on_executor: on_executor(),
+        };
+        let sync = config || self.sync_receipts.load(Ordering::SeqCst);
         {
             let mut state = lock(&self.state);
-            refused = state.revoked;
-            if !refused {
-                state.packets.push(Packet { meta, bytes });
-                if !meta.config && !self.sync_receipts.load(Ordering::SeqCst) {
-                    state.receipts.push((meta.header, receipt.clone()));
-                }
+            state.packets.push(packet);
+            if !sync {
+                state.receipts.push((header, ticket));
+                return Ok(());
             }
         }
-        // Completions run with the sink lock dropped (rule 2).
-        if refused {
-            receipt.complete(false);
-        } else if meta.config || self.sync_receipts.load(Ordering::SeqCst) {
-            receipt.complete(true);
-        }
+        self.complete(ticket, true);
+        Ok(())
     }
 }
 
@@ -1115,9 +1205,19 @@ impl Fakes {
             capture: self.capture.clone(),
             converter: None,
             encoders: self.factory.clone(),
-            out: self.out.clone(),
+            output: VideoOutput::with_transport(self.out.clone(), self.policy(), None),
             observer: self.observer.clone(),
             timings: None,
+        }
+    }
+
+    /// The executor tests run the sink without its bounds (P1's enqueue-all,
+    /// still through the sink) so they see every packet at once; the sink's
+    /// own tests (`sink.rs`) turn them on.
+    pub fn policy(&self) -> SinkPolicy {
+        SinkPolicy {
+            bounds: false,
+            ..SinkPolicy::default()
         }
     }
 
@@ -1248,7 +1348,7 @@ impl Manual {
         op
     }
 
-    /// A stream whose queue, capture backend, encoders and `VideoOut` make
+    /// A stream whose queue, capture backend and encoders make
     /// the per-frame calls through the C ABI.
     pub fn native() -> Self {
         let s = Self::new();
@@ -1258,8 +1358,6 @@ impl Manual {
             wake: Some(glue::wake),
             capture: Arc::as_ptr(&s.capture).cast_mut().cast(),
             release: Some(glue::release),
-            out: Arc::as_ptr(&s.out).cast_mut().cast(),
-            send: Some(glue::send),
         };
         assert!(native::streamcore_video_attach_stream(
             s.queue.port.native_key(),
@@ -1292,6 +1390,13 @@ impl Manual {
 
     pub fn encoder(&self) -> Arc<FakeEncoder> {
         self.factory.last()
+    }
+
+    /// Run `f` (which creates the encoder, e.g. the first frame), then return
+    /// the encoder.
+    pub fn encoder_after(&self, f: impl FnOnce(&Self)) -> Arc<FakeEncoder> {
+        f(self);
+        self.encoder()
     }
 
     /// Close: begin, answer the capture stop, check the outcome.
@@ -1336,42 +1441,6 @@ pub mod glue {
         // SAFETY: the context is the stream's `FakeCapture`, alive for the call.
         let capture = unsafe { &*capture.cast::<FakeCapture>() };
         CaptureBackend::release(capture, surface);
-    }
-
-    pub extern "C" fn send(out: *mut c_void, packet: *const native::Packet) {
-        // SAFETY: the context is the stream's `FakeOut`; the packet is lent
-        // until it is released, which happens after this read.
-        let (out, packet) = unsafe { (&*out.cast::<FakeOut>(), *packet) };
-        // SAFETY: `len` bytes at `bytes` stay valid until the release.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                std::ptr::with_exposed_provenance::<u8>(packet.bytes),
-                packet.len,
-            )
-        }
-        .to_vec();
-        let known = |ns: u64| (ns != 0).then_some(ns);
-        let meta = VideoOutMeta {
-            header: VideoMetadata {
-                stream_id: packet.stream_id,
-                generation: packet.generation,
-                sequence: packet.sequence,
-                flags: packet.flags,
-                pts_micros: packet.pts_micros,
-            },
-            droppable: packet.droppable != 0,
-            keyframe: packet.keyframe != 0,
-            config: packet.config != 0,
-            timing: FrameTiming {
-                source_present_ns: known(packet.source_present_ns),
-                capture_ns: packet.capture_ns,
-                encode: EncodeTimings {
-                    input_ns: known(packet.encode_input_ns),
-                    output_ns: known(packet.encode_output_ns),
-                },
-            },
-        };
-        out.accept(meta, bytes, Receipt::Native(packet.key));
     }
 
     pub extern "C" fn submit(

@@ -333,7 +333,10 @@ and an optional `VirtualDisplayBackend` are separate traits whose results are po
 `VideoSink` (from P2, internal to Rust, replacing the consumer's video send path) puts video on lane
 1 as kind `0x10`, applies 6.4, and reports `SinkState { unsent_frames, oldest_unsent_age_ms,
 unconsumed_frames, credit_rtt_ms, backpressured }` to the pacer, recovery and ABR. `push` runs on
-the executor right after `Encoded` (R1); in P1 the `VideoOut` hop takes its place (3.5).
+the executor right after `Encoded` (R1); in P1 the `VideoOut` hop took its place (3.5). Shipped
+in P2: `StreamParts::output` (`VideoOutput::channel(SecureChannel, SinkPolicy, capacity)`) replaces
+`VideoOut`; the switches of 11.1 are `SinkPolicy` fields, and `StreamController::sink_state()`
+reads the published `SinkState`.
 
 ```rust
 // Consumer observers. Delivered by posting a job to the consumer's queue, never run on an executor.
@@ -391,7 +394,7 @@ session.
 **Outbound calls run only on the executor, during a drain:** `CaptureBackend` open, start, update
 and stop; `Converter::convert`; `Compositor` configure and compose; `EncoderFactory::create`;
 `Encoder` submit, `set_rate` and `invalidate`; `Decoder` calls and present; `VideoSink.push` (P1:
-`VideoOut::send`); and `ObserverQueue::post`. Synchronous results are returned as values
+`VideoOut::send`, removed in P2); and `ObserverQueue::post`. Synchronous results are returned as values
 (`SubmitResult`, `ComposeResult`), never as callbacks.
 
 **Leaf calls** may run on any thread; each uses atomics or at most one short, non-nested Rust lock,
@@ -421,7 +424,10 @@ the executor calls the foreign trait `VideoOut::send(meta, bytes, receipt)` with
 adapter takes its sink lock (which its `revoke()` also takes), checks the token and calls the
 consumer's send. Every completion, a synchronous refusal included, goes to the `SinkReceipt`;
 refusals and accepted keyframes are posted back (an accepted delta changes nothing). A send path
-holding its own lock across its enqueue into `streamcore-transport` is an allowed leaf. From P2, `VideoSink` replaces `VideoOut` (D2).
+holding its own lock across its enqueue into `streamcore-transport` is an allowed leaf. From P2, `VideoSink` replaces `VideoOut` (D2):
+its lock is taken before any transport lock, never the reverse; an idle sink enqueues inside `push`
+on the executor; later frames are enqueued by the previous frame's write completion on
+`streamcore-network` ([threading](VIDEO-THREADING.md#authority-and-the-sink)).
 
 **Reentrancy rule.**
 
@@ -464,7 +470,7 @@ and none follows.
 **Fences.** `submitted_seq` advances on the executor when `submit` returns `Submitted`; `Busy` and
 `Failed` consume no sequence, so a refused submit leaves no gap; gaps from encoder drops, shedding
 (6.4) and handover drops (8.8) are kept, never renumbered ([capture pipeline](CAPTURE-PIPELINE.md)).
-`Encoded`, `Dropped` and `SinkReceipt` update `delivered_keyframe` and `lost_seq` as the reference
+`Encoded`, `Dropped` and the sink's reports (P1: `SinkReceipt`) update `delivered_keyframe` and `lost_seq` as the reference
 host does. Recovery requests read `submitted_seq` on the executor; recovery timers are `wake_after`
 deadlines; the packetizer runs only on the executor, in event order.
 
@@ -686,6 +692,16 @@ Per stream, before fragmentation:
    the multiplexer. It ships **in the same release as `VideoSink`**: a consumer's file pump may pace
    on connection-wide backpressure that counts video; once video bypasses that path, only the bucket
    protects it.
+
+**As shipped (P2).** Rule 2's "confirmed" is read from the plan: `recovery` contains
+`LtrRefresh` or `extensions` contains `TemporalId`, which the planner sets only from confirmed
+encoder caps; `StatsSnapshot::sink_age_bound` reports whether it is in effect. Rule 5's capacity
+is the consumer's figure, else the plan's `medium_cap_bps`, else the sink's own estimate (the
+largest write rate of a frame into an idle lane over 2 s, at least twice the video rate). That
+estimate is **not measured against the link** and is reported as such
+(`bulk_capacity_estimated`); the bucket keeps its 1 Mbit/s bulk floor. The inputs are only
+useful if the channel runs the bucket (`TransportTuning::bulk_token_bucket` on before it was
+created); otherwise `bulk_bucket_inactive` is set and the consumer should log it.
 
 ### 6.5 Recovery ladder
 

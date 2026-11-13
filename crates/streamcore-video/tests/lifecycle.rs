@@ -174,7 +174,9 @@ fn revoked_ownership_cannot_start_or_revive_capture() {
             s.pump();
             assert!(lock(&s.encoder().submits).is_empty() || s.factory.count() == 0);
         }
-        assert_eq!(s.out.revokes.load(Ordering::SeqCst), 1);
+        // The sink is revoked: nothing is unsent and nothing more is sent.
+        assert_eq!(s.controller.sink_state().unsent_frames, 0);
+        assert!(s.out.samples().is_empty());
         s.close();
         s.assert_clean();
     }

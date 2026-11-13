@@ -61,7 +61,8 @@ pub struct TransportTuning {
     /// The multiplexer's bulk token bucket (6.4 item 5): while video is active,
     /// lane 4 is limited to (capacity − video rate) × 0.8 once the channel has
     /// rate inputs (`SecureChannel::set_bulk_rate_inputs`). It ships with
-    /// `VideoSink`, which provides those inputs.
+    /// `VideoSink`, which provides those inputs: a process that sends video
+    /// through the sink turns it on before its listeners and dials start.
     pub bulk_token_bucket: bool,
 }
 
@@ -97,7 +98,7 @@ pub fn transport_tuning() -> TransportTuning {
 /// bandwidth-delay product of a few hundred Mbit/s × 20 ms plus a few 1440p
 /// frames, a 25 ms LAN initial RTT, no datagram buffer, and a 64 KiB TCP low-water
 /// mark (about one frame at 30 Mbit/s and 60 fps). Cubic stays; the bulk bucket
-/// stays off until `VideoSink` ships.
+/// is on, as `VideoSink` needs it.
 #[uniffi::export]
 pub fn candidate_transport_tuning() -> TransportTuning {
     TransportTuning {
@@ -110,7 +111,7 @@ pub fn candidate_transport_tuning() -> TransportTuning {
             disable_datagrams: true,
             congestion: QuicCongestion::Cubic,
         },
-        bulk_token_bucket: false,
+        bulk_token_bucket: true,
     }
 }
 
@@ -205,7 +206,8 @@ mod tests {
     fn default_tuning_is_quinn_default_plus_the_fixed_lane_settings() {
         let tuned = candidate_transport_tuning();
         assert_ne!(tuned, TransportTuning::default());
-        assert!(!tuned.bulk_token_bucket);
+        // VideoSink ships: the candidate runs the bulk bucket; the default does not.
+        assert!(tuned.bulk_token_bucket && !TransportTuning::default().bulk_token_bucket);
         assert_eq!(tuned.quic.congestion, QuicCongestion::Cubic);
         // Building either configuration, with and without a LAN peer, succeeds.
         for quic in [QuicTuning::default(), tuned.quic] {

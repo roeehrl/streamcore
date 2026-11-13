@@ -148,42 +148,11 @@ final class Encoders: EncoderFactory, @unchecked Sendable {
     }
 }
 
-final class Out: VideoOut, @unchecked Sendable {
-    private let lock = NSLock()
-    private var revoked = false
-    private(set) var packets: [VideoOutMeta] = []
-    var count: Int { lock.withLock { packets.count } }
-    func send(meta: VideoOutMeta, bytes: Data, receipt: SinkReceipt) {
-        let accepted = lock.withLock { () -> Bool in
-            guard !revoked else { return false }
-            packets.append(meta)
-            return true
-        }
-        receipt.complete(accepted: accepted)  // synchronous, with no lock held
-    }
-    func backpressured() -> Bool { false }
-    func revoke() { lock.withLock { revoked = true } }
-
-    private(set) var payloads: [Data] = []
-    /// The C send: the packet is read in place and its bytes adopted without a copy.
-    static let nativeSend: StreamCoreNative.SendFunction = { out, packet in
-        let out = Unmanaged<Out>.fromOpaque(out!).takeUnretainedValue()
-        let packet = NativeVideoPacket(packet!)
-        let meta = VideoOutMeta(
-            header: VideoMetadata(streamId: packet.streamId, generation: packet.generation, sequence: packet.sequence,
-                                  flags: packet.flags, ptsMicros: packet.ptsMicros),
-            droppable: packet.droppable, keyframe: packet.keyframe, config: packet.config,
-            timing: FrameTiming(sourcePresentNs: packet.sourcePresentNs, captureNs: packet.captureNs,
-                                encode: EncodeTimings(inputNs: packet.encodeInputNs, outputNs: packet.encodeOutputNs)))
-        let data = packet.adoptData()
-        let accepted = out.lock.withLock { () -> Bool in
-            guard !out.revoked else { return false }
-            out.packets.append(meta)
-            out.payloads.append(data)
-            return true
-        }
-        packet.complete(accepted: accepted)
-    }
+/// No link: the stream's sink counts every frame written (`VideoOutput.discard`); the tests read
+/// what was sent from the stream's counters.
+func discardOutput() -> VideoOutput {
+    VideoOutput.discard(policy: SinkPolicy(bounds: true, shedDiscardable: true, deltaAgeBound: false,
+                                           bulkBucket: true, timingEvery: 0, frameTimingEvery: 0))
 }
 
 final class Observer: ObserverQueue, @unchecked Sendable {
@@ -206,7 +175,7 @@ private func waitUntil(_ condition: () -> Bool) async throws {
 @Test(.timeLimit(.minutes(1))) func aStreamRunsThroughSwiftAdaptersAndClosesAsync() async throws {
     let port = StreamPort()
     let queue = Queue(port: port)
-    let capture = Capture(), out = Out(), observer = Observer()
+    let capture = Capture(), observer = Observer()
     let spec = CaptureSpec(target: .display(displayId: 1), mode: .control, pixelWidth: 64, pixelHeight: 64,
                            minIntervalNs: 16_666_667, format: .nv12, color: .source, cursor: .composited, queueDepth: 5, adapterLuid: nil)
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
@@ -216,18 +185,18 @@ private func waitUntil(_ condition: () -> Bool) async throws {
                           refreshIntervalNs: nil, pacing: PacingPolicy(refreshAligned: true, adaptivePermits: true, immediateRecovery: true))
     let controller = try StreamController(parts: StreamParts(
         streamId: 1, spec: spec, plan: plan, port: port, queue: queue, capture: capture, converter: nil,
-        encoders: Encoders(), out: out, observer: observer, timings: nil))
+        encoders: Encoders(), output: discardOutput(), observer: observer, timings: nil))
     _ = controller.start()
     try await waitUntil { controller.phase() == .running }
-    for _ in 0..<3 {
+    for n in 1...3 {
         capture.emit(on: queue.queue)
-        let before = out.count
-        try await waitUntil { out.count > before }
+        try await waitUntil { controller.stats().encoded >= UInt64(n) }
     }
-    let packets = out.packets
-    #expect(packets.first?.config == true)
-    #expect(packets.dropFirst().first?.keyframe == true)
-    #expect(packets.filter { !$0.config }.map(\.header.sequence) == [1, 2, 3])
+    let stats = controller.stats()
+    // Config and keyframe, then two deltas, all through the sink.
+    #expect(stats.packetsSent == 4)
+    #expect(stats.packetsRefused == 0)
+    #expect(controller.sinkState().unsentFrames == 0)
 
     #expect(await controller.close() == .closed)
     #expect(observer.closed == .closed)
@@ -248,14 +217,14 @@ private func waitUntil(_ condition: () -> Bool) async throws {
     #expect(throws: MediaError.self) {
         _ = try StreamController(parts: StreamParts(
             streamId: 1, spec: spec, plan: plan, port: port, queue: Queue(port: port), capture: Capture(),
-            converter: nil, encoders: Encoders(), out: Out(), observer: Observer(), timings: nil))
+            converter: nil, encoders: Encoders(), output: discardOutput(), observer: Observer(), timings: nil))
     }
 }
 
 @Test(.timeLimit(.minutes(1))) func aStreamRunsThroughTheCABI() async throws {
     let port = StreamPort()
     let queue = Queue(port: port)
-    let capture = Capture(), out = Out(), observer = Observer()
+    let capture = Capture(), observer = Observer()
     let spec = CaptureSpec(target: .display(displayId: 1), mode: .control, pixelWidth: 64, pixelHeight: 64,
                            minIntervalNs: 16_666_667, format: .nv12, color: .source, cursor: .composited, queueDepth: 5, adapterLuid: nil)
     let plan = StreamPlan(mode: .control, codec: .h264, encodeWidth: 64, encodeHeight: 64, fps: 60,
@@ -265,24 +234,19 @@ private func waitUntil(_ condition: () -> Bool) async throws {
                           refreshIntervalNs: nil, pacing: PacingPolicy(refreshAligned: true, adaptivePermits: true, immediateRecovery: true))
     let controller = try StreamController(parts: StreamParts(
         streamId: 1, spec: spec, plan: plan, port: port, queue: queue, capture: capture, converter: nil,
-        encoders: Encoders(native: true), out: out, observer: observer, timings: nil))
+        encoders: Encoders(native: true), output: discardOutput(), observer: observer, timings: nil))
     #expect(StreamCoreNative.attach(port: port.nativeKey(), queue: queue, wake: Queue.nativeWake,
-                                    capture: capture, release: Capture.nativeRelease, out: out, send: Out.nativeSend))
+                                    capture: capture, release: Capture.nativeRelease))
     capture.nativePort = port.nativeKey()
     _ = controller.start()
     try await waitUntil { controller.phase() == .running }
-    for _ in 0..<4 {
+    for n in 1...4 {
         capture.emit(on: queue.queue)
-        let before = out.count
-        try await waitUntil { out.count > before }
+        try await waitUntil { controller.stats().encoded >= UInt64(n) }
     }
-    let packets = out.packets
-    #expect(packets.first?.config == true)
-    #expect(packets.dropFirst().first?.keyframe == true)
-    #expect(packets.filter { !$0.config }.map(\.header.sequence) == [1, 2, 3, 4])
-    #expect(packets.filter { !$0.config }.map(\.timing.encode.inputNs) == [1_001, 2_001, 3_001, 4_001])
-    #expect(out.payloads.first == Data("avcC".utf8))
-    #expect(out.payloads.dropFirst().allSatisfy { $0 == Data([0, 0, 0, 1, 0x65]) })
+    let stats = controller.stats()
+    #expect(stats.packetsSent == 5)
+    #expect(stats.encoderDrops == 0)
 
     #expect(await controller.close() == .closed)
     #expect(observer.closed == .closed)

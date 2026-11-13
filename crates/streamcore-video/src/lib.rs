@@ -1,7 +1,8 @@
 //! StreamCore's video control plane (docs/STREAMCORE-VIDEO.md, D1–D4).
 //!
 //! Rust runs the control plane of each stream: lifecycle, validation,
-//! admission, latest-frame retention, recovery and the send hop. Native code runs
+//! admission, latest-frame retention, recovery and sending (the `VideoSink`,
+//! straight onto a secure channel's video lane). Native code runs
 //! the data plane on GPU surfaces behind the [backend traits](traits). Pixels
 //! never cross into Rust: it holds opaque surface leases and metadata, and
 //! encoded bytes enter it once, through [`VideoSinkHandle::submit_encoded`] or
@@ -19,6 +20,7 @@ pub mod native;
 pub mod pacing;
 #[cfg(feature = "ffi-probe")]
 pub mod probe;
+pub(crate) mod sink;
 pub(crate) mod stream;
 pub mod traits;
 pub mod types;
@@ -30,9 +32,10 @@ pub use bounded::{run_bounded, run_bounded_value};
 pub use controller::{StreamController, StreamParts};
 pub use error::{MediaError, codes};
 pub use executor::{
-    Clock, MonotonicClock, NETWORK_THREAD_NAME, SinkReceipt, StreamPort, VideoSinkHandle,
-    blocking_allowed, on_executor,
+    Clock, MonotonicClock, NETWORK_THREAD_NAME, StreamPort, VideoSinkHandle, blocking_allowed,
+    on_executor,
 };
+pub use sink::{SendTicket, SinkPolicy, SinkState, SinkTransport, VideoOutput};
 /// The design's name for [`StreamEncoder`]: Rust backends may implement either.
 pub use traits::StreamEncoder as Encoder;
 pub use traits::*;

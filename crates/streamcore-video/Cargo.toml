@@ -13,12 +13,14 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 streamcore-media = { path = "../streamcore-media" }
+streamcore-transport = { path = "../streamcore-transport" }
 uniffi.workspace = true
 thiserror.workspace = true
 async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+tokio.workspace = true
 
 [features]
 # The binding smoke surface (an async foreign trait round trip, 3.8). Built into the

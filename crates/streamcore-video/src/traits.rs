@@ -186,23 +186,6 @@ pub trait EncoderEvents: Send + Sync {
     fn session_failed(&self, error: MediaError, recoverable: bool);
 }
 
-/// P1's send hop (3.5): the consumer's existing send path. From P2, `VideoSink`
-/// replaces it.
-#[uniffi::export(rust, foreign)]
-pub trait VideoOut: Send + Sync {
-    /// Called on the executor with no Rust lock held. The adapter takes its sink
-    /// lock (which `revoke` also takes), checks its authority token and calls the
-    /// consumer's send. Every completion, a synchronous refusal included, goes to
-    /// `receipt.complete`; a receipt dropped without completing counts as refused.
-    fn send(&self, meta: VideoOutMeta, bytes: Vec<u8>, receipt: Arc<crate::SinkReceipt>);
-    /// Whether the consumer's send path is backpressured; read on the executor
-    /// before a recovery keyframe. A leaf call.
-    fn backpressured(&self) -> bool;
-    /// Revoke the sink's authority: once this returns, `send` enqueues nothing.
-    /// A leaf call, made from any thread (by `close` and `revoke`).
-    fn revoke(&self);
-}
-
 /// The consumer's queue for observer jobs. Non-blocking.
 #[uniffi::export(rust, foreign)]
 pub trait ObserverQueue: Send + Sync {

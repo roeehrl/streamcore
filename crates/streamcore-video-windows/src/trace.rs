@@ -13,7 +13,7 @@
 //! | H2 | convert GPU-complete: the fence reached the frame's value (a waiting thread stamps it) |
 //! | H3 | encoder input accepted: `ProcessInput` returned |
 //! | H4 | access unit available: `ProcessOutput` returned on the MFT event thread |
-//! | H5 | `VideoOut::send` on the executor (stands in for `VideoSink` admit until P2) |
+//! | H5 | `VideoSink` push on the executor (the bench's discard sink does not stamp it) |
 //! | src | synthetic mode: the source finished drawing the counter this frame shows first |
 //!
 //! Recorder calls are leaf calls: one short lock, no calls out while it is held.
@@ -56,7 +56,7 @@ pub const STAGES: &[(&str, &str)] = &[
     ("H1->H2", "FrameArrived -> convert GPU-complete"),
     ("H2c->H3", "submit: permit/NeedInput wait + ProcessInput"),
     ("H3->H4", "encode: input accepted -> access unit"),
-    ("H4->H5", "hop to the executor + send"),
+    ("H4->H5", "hop to the executor + sink push"),
     ("H1->H4", "FrameArrived -> encoded"),
     ("H0->H4", "present -> encoded"),
     ("H0->H5", "present -> sent"),
@@ -213,7 +213,7 @@ impl Recorder {
         self.lock().counts.encoder_dropped += 1;
     }
 
-    /// The payload packet of `seq` was handed to `VideoOut::send` at `h5`.
+    /// The payload packet of `seq` was pushed to the `VideoSink` at `h5`.
     pub fn sent(&self, seq: u64, h5: u64) {
         let mut i = self.lock();
         if let Some(t) = i.frames.get_mut(&seq) {

@@ -21,38 +21,17 @@ use crate::cli::{Mode, Options, Pace};
 use crate::model::{BenchReport, SyntheticResult};
 use crate::trace::{FrameTrace, Recorder, summarize_stages};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use streamcore_video::{
     CaptureSpec, CaptureTarget, Codec, ColorMapping, ColorRequest, ConvertPath, CursorMode,
-    ObserverJob, ObserverQueue, OnSourceGone, PixelFormat, RecoveryStep, SinkReceipt,
-    StreamController, StreamMode, StreamParts, StreamPlan, StreamPort, VideoOut, VideoOutMeta,
+    ObserverJob, ObserverQueue, OnSourceGone, PixelFormat, RecoveryStep, SinkPolicy,
+    StreamController, StreamMode, StreamParts, StreamPlan, StreamPort, VideoOutput,
 };
 
-/// `VideoOut` for the bench: stamps H5 and accepts every packet.
-struct BenchOut {
-    recorder: Arc<Recorder>,
-    revoked: AtomicBool,
-}
-
-impl VideoOut for BenchOut {
-    fn send(&self, meta: VideoOutMeta, _bytes: Vec<u8>, receipt: Arc<SinkReceipt>) {
-        let h5 = now_ns();
-        if !meta.config {
-            self.recorder.sent(meta.header.sequence, h5);
-        }
-        receipt.complete(!self.revoked.load(Ordering::Acquire));
-    }
-
-    fn backpressured(&self) -> bool {
-        false
-    }
-
-    fn revoke(&self) {
-        self.revoked.store(true, Ordering::Release);
-    }
-}
+/// The bench has no link: its `VideoSink` discards every frame (counted written at once), so
+/// H5 and the sink's figures are not measured and the report says so instead of printing them.
+const SINK_NOT_MEASURED: &str = "sink: discard (not measured)";
 
 struct Observer(Mutex<mpsc::Sender<ObserverJob>>);
 
@@ -163,10 +142,6 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     } else {
         0
     };
-    let out = Arc::new(BenchOut {
-        recorder: recorder.clone(),
-        revoked: AtomicBool::new(false),
-    });
     let parts = StreamParts {
         stream_id: 1,
         spec: CaptureSpec {
@@ -213,7 +188,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         capture: capture.clone(),
         converter: Some(converter.clone()),
         encoders: factory.clone(),
-        out: out.clone(),
+        output: VideoOutput::discard(SinkPolicy::default()),
         observer: Arc::new(Observer(Mutex::new(jobs_tx))),
         timings: None,
     };
@@ -455,8 +430,8 @@ pub fn print(r: &BenchReport) {
         e.d3d11_aware
     );
     println!(
-        "fps captured {:.2}  submitted {:.2}  encoded {:.2}  sent {:.2}",
-        r.fps_captured, r.fps_submitted, r.fps_encoded, r.fps_sent
+        "fps captured {:.2}  submitted {:.2}  encoded {:.2}  {SINK_NOT_MEASURED}",
+        r.fps_captured, r.fps_submitted, r.fps_encoded
     );
     println!("recorder {:?}", r.counts);
     println!("stream {:?}", r.stream);
@@ -465,6 +440,10 @@ pub fn print(r: &BenchReport) {
         "row", "n", "p50 ms", "p95 ms", "p99 ms", "max ms"
     );
     for (name, desc) in crate::trace::STAGES {
+        if name.contains("H5") {
+            println!("{name:9} {SINK_NOT_MEASURED}");
+            continue;
+        }
         if let Some(s) = r.stages.get(*name) {
             println!(
                 "{:9} {:>6} {:>8.3} {:>8.3} {:>8.3} {:>8.3}   {}",
@@ -472,10 +451,7 @@ pub fn print(r: &BenchReport) {
             );
         }
     }
-    println!(
-        "R1: sends later than one frame interval after the access unit: {}",
-        r.r1_late_sends
-    );
+    println!("R1 (access unit -> sink): {SINK_NOT_MEASURED}");
     if let Some(s) = &r.synthetic {
         println!("synthetic: {s:?}");
     }

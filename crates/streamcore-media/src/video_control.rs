@@ -99,7 +99,7 @@ pub struct VideoFeedback {
     /// Video payload bytes of this stream the client consumed since the stream
     /// started on this channel.
     pub consumed_bytes: u64,
-    /// Decoder flushes since the stream started on this channel.
+    /// Frames flushed unshown (skip cause e) since the stream started on this channel.
     pub flushes: u32,
     /// Decoded frames never presented since the stream started on this channel.
     pub present_drops: u32,
