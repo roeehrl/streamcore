@@ -398,7 +398,9 @@ session hung: its frames are dropped and it is re-created.
   the adapter knows it at configure time. Rust also learns each session's real depth: the samples
   it accepted, from its first keyframe, up to and including its first output
   (`ClientStats::learned_depth`); a flush restarts the count. The bound is then
-  `max(2, max_queued, learned depth)`; until the first output it is at least 4 (provisional), so
+  `max(2, depth + 1)`, with the depth the larger of `max_queued` and the learned one: one frame
+  of slack beyond the decoder's pipeline, so one frame of arrival jitter (bursty Wi-Fi, a relay)
+  does not flush a decoder that always holds its depth; until the first output it is at least 4 (provisional), so
   a decoder that needs a few inputs before it outputs anything is not flushed while it fills (a
   decoder that never outputs is caught by the stall rule). The effective bound is
   `ClientStats::queue_bound`; a session deeper than 2, declared or learned, is a latency cost on
@@ -406,10 +408,12 @@ session hung: its frames are dropped and it is re-created.
   adapters should prefer decoders with a depth of 2 or less. A keyframe
   is then decoded; any other frame is dropped too, and a keyframe is requested (`QueueBound`).
 - **Busy.** After `DecodeResult::Busy` the executor holds the sample (Rust keeps a copy of every
-  sample until the decoder accepts it) and submits nothing more until `input_ready`, which submits
-  the newest held sample. A newer sample replaces a held discardable one, and a keyframe replaces
-  anything; replacing a held reference frame breaks the chain, so both are dropped and a keyframe
-  is requested (`Busy`).
+  sample until the decoder accepts it) and submits nothing more until `input_ready`. Later samples
+  wait behind it in order, as many as the queue bound leaves room for (held samples count as
+  waiting, so the bound above flushes beyond that); `input_ready` submits them in order until the
+  decoder is busy again. Nothing is skipped, so the reference chain stays intact. A keyframe that
+  arrives while samples wait makes them unnecessary: they are dropped (counted as flushed) and the
+  keyframe waits alone.
 - **Refusals and failures.** `DecodeResult::Failed` drops the frame and requests a keyframe;
   with `DeviceLost` it re-creates the session. `DecoderEvents::failed` with `recoverable` (or
   `DeviceLost`) re-creates; otherwise the stream fails (`ClientJob::Failed`; frames are dropped

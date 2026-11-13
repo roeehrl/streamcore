@@ -107,7 +107,7 @@ fn the_effective_queue_bound_and_deep_decoders_are_reported() {
     c.config(6);
     assert_eq!(
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
-        (5, 1)
+        (6, 1)
     );
 }
 
@@ -222,7 +222,8 @@ fn a_frame_before_the_configuration_requests_a_keyframe() {
 fn more_than_two_waiting_frames_flush_and_request_a_keyframe() {
     let c = Client::new();
     c.config(5);
-    // The first output teaches the stream the decoder's depth (1): bound 2.
+    // The first output teaches the stream the decoder's depth (1): bound
+    // max(2, 1 + 1) = 2.
     c.key(5, 1);
     c.output(1);
     assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (1, 2));
@@ -280,11 +281,19 @@ fn a_decoder_three_deep_runs_without_flushes() {
     }
     let stats = c.stats();
     assert_eq!(stats.learned_depth, 3);
-    assert_eq!(stats.queue_bound, 3);
+    // One frame of slack beyond the pipeline.
+    assert_eq!(stats.queue_bound, 4);
     assert_eq!(stats.deep_decoder_sessions, 1);
     assert_eq!((stats.queue_flushes, stats.flushed), (0, 0));
     assert!(c.jobs.keyframe_requests().is_empty());
     assert_eq!(stats.decoded, 118);
+    // One frame of jitter: two arrive before the next output.
+    c.delta(5, 121);
+    c.delta(5, 122);
+    c.output(119);
+    c.output(120);
+    assert_eq!(c.stats().queue_flushes, 0);
+    assert_eq!(c.stats().decoded, 120);
     // A new session learns again.
     c.config(6);
     assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
@@ -313,11 +322,12 @@ fn the_decoders_declared_depth_raises_the_bound() {
     let c = Client::new();
     *lock(&c.decoder.max_queued) = 4;
     c.config(5);
-    for seq in 1..=4 {
+    // max(2, 4 + 1) = 5.
+    for seq in 1..=5 {
         c.sample(5, seq, seq == 1, Default::default());
     }
     assert_eq!(c.decoder.flushes(), 0);
-    c.delta(5, 5);
+    c.delta(5, 6);
     assert_eq!(c.decoder.flushes(), 1);
 }
 
@@ -325,48 +335,82 @@ fn the_decoders_declared_depth_raises_the_bound() {
 // A busy decoder.
 
 #[test]
-fn a_busy_decoder_gets_the_newest_frame_at_input_ready() {
-    let c = Client::new();
-    c.config(5);
-    c.key(5, 1);
-    c.output(1);
-    c.decoder.answer(DecodeResult::Busy);
-    c.discardable(5, 2);
-    assert_eq!(c.stats().busy, 1);
-    // While busy, nothing is submitted; a newer frame replaces a held
-    // discardable one.
-    c.delta(5, 3);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2]);
-    assert_eq!(c.stats().flushed, 1);
-    c.decoder.port().input_ready();
-    c.queue.pump();
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3]);
-    assert!(c.jobs.keyframe_requests().is_empty());
-    c.output(3);
-    assert_eq!(c.stats().decoded, 2);
-}
-
-#[test]
-fn replacing_a_held_reference_frame_requests_a_keyframe() {
+fn a_busy_decoder_gets_the_waiting_frames_in_order_at_input_ready() {
     let c = Client::new();
     c.config(5);
     c.key(5, 1);
     c.output(1);
     c.decoder.answer(DecodeResult::Busy);
     c.delta(5, 2);
+    assert_eq!(c.stats().busy, 1);
+    // While busy, nothing is submitted; a newer frame waits behind the held one.
     c.delta(5, 3);
-    assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::Busy]);
-    assert_eq!(c.stats().flushed, 2);
-    c.decoder.port().input_ready();
-    c.queue.pump();
     assert_eq!(c.decoder.decode_seqs(), [1, 2]);
-    // A keyframe while busy is held and replaces anything.
-    c.decoder.answer(DecodeResult::Busy);
-    c.key(5, 4);
-    c.key(5, 5);
+    assert_eq!(c.stats().flushed, 0);
     c.decoder.port().input_ready();
     c.queue.pump();
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 4, 5]);
+    // Both, in order: the chain is intact, so no keyframe is needed.
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 2, 3]);
+    assert!(c.jobs.keyframe_requests().is_empty());
+    c.output(2);
+    c.output(3);
+    assert_eq!(c.stats().decoded, 3);
+}
+
+#[test]
+fn input_ready_submits_until_the_decoder_is_busy_again() {
+    let c = Client::with(|_| {});
+    *lock(&c.decoder.max_queued) = 3;
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    // Bound max(2, 3 + 1) = 4.
+    c.decoder.answer(DecodeResult::Busy);
+    c.delta(5, 2);
+    c.delta(5, 3);
+    c.delta(5, 4);
+    // The decoder takes one, then is busy again: 3 and 4 keep waiting.
+    c.decoder.answer(DecodeResult::Accepted);
+    c.decoder.answer(DecodeResult::Busy);
+    c.decoder.port().input_ready();
+    c.queue.pump();
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 2, 3]);
+    c.decoder.port().input_ready();
+    c.queue.pump();
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 2, 3, 3, 4]);
+    assert_eq!(c.stats().flushed, 0);
+    assert!(c.jobs.keyframe_requests().is_empty());
+}
+
+#[test]
+fn a_keyframe_while_busy_replaces_the_waiting_frames() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    c.decoder.answer(DecodeResult::Busy);
+    c.delta(5, 2);
+    c.key(5, 3);
+    assert_eq!(c.stats().flushed, 1);
+    c.decoder.port().input_ready();
+    c.queue.pump();
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3]);
+    assert!(c.jobs.keyframe_requests().is_empty());
+}
+
+#[test]
+fn a_full_wait_while_busy_is_a_queue_bound_flush() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    // Bound 2: one held and one more waiting, a third flushes.
+    c.decoder.answer(DecodeResult::Busy);
+    c.delta(5, 2);
+    c.delta(5, 3);
+    c.delta(5, 4);
+    assert_eq!(c.stats().queue_flushes, 1);
+    assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::QueueBound]);
 }
 
 #[test]
