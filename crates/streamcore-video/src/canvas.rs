@@ -36,7 +36,7 @@ pub mod limits {
 /// One display of a combined canvas: its identity and its global layout, as
 /// observed when the arrangement was reviewed.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
-pub struct CanvasMember {
+pub struct CanvasDisplay {
     pub display_id: u32,
     pub x: f64,
     pub y: f64,
@@ -47,7 +47,7 @@ pub struct CanvasMember {
     pub rotation: Rotation,
 }
 
-impl CanvasMember {
+impl CanvasDisplay {
     fn max_x(&self) -> f64 {
         self.x + self.width
     }
@@ -59,8 +59,8 @@ impl CanvasMember {
 /// The displays of one combined canvas. It names exact members; it never means
 /// "whatever displays exist when the stream starts".
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct CanvasLayout {
-    pub members: Vec<CanvasMember>,
+pub struct CanvasArrangement {
+    pub members: Vec<CanvasDisplay>,
 }
 
 /// The encoded canvas size, in pixels.
@@ -89,7 +89,7 @@ pub struct NormalizedPoint {
 
 /// The smallest rectangle in global units containing every member: (x, y,
 /// width, height).
-pub(crate) fn union(layout: &CanvasLayout) -> Option<(f64, f64, f64, f64)> {
+pub(crate) fn union(layout: &CanvasArrangement) -> Option<(f64, f64, f64, f64)> {
     let first = layout.members.first()?;
     let (mut min_x, mut min_y, mut max_x, mut max_y) =
         (first.x, first.y, first.max_x(), first.max_y());
@@ -102,12 +102,12 @@ pub(crate) fn union(layout: &CanvasLayout) -> Option<(f64, f64, f64, f64)> {
     Some((min_x, min_y, max_x - min_x, max_y - min_y))
 }
 
-fn overlaps(a: &CanvasMember, b: &CanvasMember) -> bool {
+fn overlaps(a: &CanvasDisplay, b: &CanvasDisplay) -> bool {
     a.x < b.max_x() && b.x < a.max_x() && a.y < b.max_y() && b.y < a.max_y()
 }
 
 /// Why `layout` cannot form a canvas, or `None` when it can.
-pub fn problem(layout: &CanvasLayout) -> Option<&'static str> {
+pub fn problem(layout: &CanvasArrangement) -> Option<&'static str> {
     use limits::*;
     let count = layout.members.len();
     if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&count) {
@@ -155,7 +155,7 @@ pub fn problem(layout: &CanvasLayout) -> Option<&'static str> {
 /// Rust is the single validator: a layout that cannot form a canvas is
 /// `InvalidSettings`.
 #[uniffi::export]
-pub fn canvas_validate(layout: CanvasLayout) -> Result<(), MediaError> {
+pub fn canvas_validate(layout: CanvasArrangement) -> Result<(), MediaError> {
     match problem(&layout) {
         None => Ok(()),
         Some(_) => Err(MediaError::InvalidSettings),
@@ -167,11 +167,11 @@ pub fn canvas_validate(layout: CanvasLayout) -> Result<(), MediaError> {
 /// then the edge limit and the pixel budget; even sizes. `None` when the layout
 /// is invalid or the canvas would be smaller than 2 × 2.
 #[uniffi::export]
-pub fn canvas_size(layout: CanvasLayout, max_dimension: u32) -> Option<CanvasSize> {
+pub fn canvas_size(layout: CanvasArrangement, max_dimension: u32) -> Option<CanvasSize> {
     size(&layout, max_dimension)
 }
 
-pub(crate) fn size(layout: &CanvasLayout, max_dimension: u32) -> Option<CanvasSize> {
+pub(crate) fn size(layout: &CanvasArrangement, max_dimension: u32) -> Option<CanvasSize> {
     if problem(layout).is_some() || max_dimension < 2 {
         return None;
     }
@@ -199,11 +199,11 @@ pub(crate) fn size(layout: &CanvasLayout, max_dimension: u32) -> Option<CanvasSi
 /// order (`CanvasTile::member` is the member's index). Edges are rounded
 /// independently, so adjacent displays share an edge exactly.
 #[uniffi::export]
-pub fn canvas_tiles(layout: CanvasLayout, width: u32, height: u32) -> Vec<CanvasTile> {
+pub fn canvas_tiles(layout: CanvasArrangement, width: u32, height: u32) -> Vec<CanvasTile> {
     tiles(&layout, width, height)
 }
 
-pub(crate) fn tiles(layout: &CanvasLayout, width: u32, height: u32) -> Vec<CanvasTile> {
+pub(crate) fn tiles(layout: &CanvasArrangement, width: u32, height: u32) -> Vec<CanvasTile> {
     let Some((ux, uy, uw, uh)) = union(layout) else {
         return Vec::new();
     };
@@ -246,18 +246,18 @@ pub(crate) fn tiles(layout: &CanvasLayout, width: u32, height: u32) -> Vec<Canva
 /// edges. `None` in a gap or outside the canvas: input never lands on a display
 /// it was not aimed at. A shared edge belongs to the display that starts there.
 #[uniffi::export]
-pub fn canvas_input_target(layout: CanvasLayout, x: f64, y: f64) -> Option<CanvasPoint> {
+pub fn canvas_input_target(layout: CanvasArrangement, x: f64, y: f64) -> Option<CanvasPoint> {
     input_target(&layout, x, y)
 }
 
-pub(crate) fn input_target(layout: &CanvasLayout, x: f64, y: f64) -> Option<CanvasPoint> {
+pub(crate) fn input_target(layout: &CanvasArrangement, x: f64, y: f64) -> Option<CanvasPoint> {
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
     let (ux, uy, uw, uh) = union(layout)?;
     let (gx, gy) = (ux + x * uw, uy + y * uh);
-    let half_open = |m: &CanvasMember| m.x <= gx && gx < m.max_x() && m.y <= gy && gy < m.max_y();
-    let closed = |m: &CanvasMember| m.x <= gx && gx <= m.max_x() && m.y <= gy && gy <= m.max_y();
+    let half_open = |m: &CanvasDisplay| m.x <= gx && gx < m.max_x() && m.y <= gy && gy < m.max_y();
+    let closed = |m: &CanvasDisplay| m.x <= gx && gx <= m.max_x() && m.y <= gy && gy <= m.max_y();
     let (index, member) = layout
         .members
         .iter()
@@ -276,7 +276,7 @@ pub(crate) fn input_target(layout: &CanvasLayout, x: f64, y: f64) -> Option<Canv
 /// The nearest canvas point that lies on a member, for a cursor the client
 /// moves itself, so it never rests in a gap.
 #[uniffi::export]
-pub fn canvas_nearest_member_point(layout: CanvasLayout, x: f64, y: f64) -> NormalizedPoint {
+pub fn canvas_nearest_member_point(layout: CanvasArrangement, x: f64, y: f64) -> NormalizedPoint {
     let Some((ux, uy, uw, uh)) = union(&layout) else {
         return NormalizedPoint { x, y };
     };
@@ -301,7 +301,7 @@ pub fn canvas_nearest_member_point(layout: CanvasLayout, x: f64, y: f64) -> Norm
 /// the size is caught here; a backend reports a mirrored display, or one whose
 /// rotation changed since its capture opened, as gone (`observe_layout` →
 /// `None`).
-pub(crate) fn observed_matches(member: &CanvasMember, observed: &DisplayLayout) -> bool {
+pub(crate) fn observed_matches(member: &CanvasDisplay, observed: &DisplayLayout) -> bool {
     if observed.display_id != member.display_id
         || !observed.scale.is_finite()
         || observed.scale <= 0.0
@@ -321,7 +321,7 @@ pub(crate) fn observed_matches(member: &CanvasMember, observed: &DisplayLayout) 
 /// The canvas size a stream may encode at: within the limits, even, at least
 /// 2 × 2, with the union's aspect ratio (within 2 %, the rounding of a small
 /// canvas), and every tile at least 2 × 2.
-pub(crate) fn valid_canvas_size(layout: &CanvasLayout, width: u32, height: u32) -> bool {
+pub(crate) fn valid_canvas_size(layout: &CanvasArrangement, width: u32, height: u32) -> bool {
     let Some((_, _, uw, uh)) = union(layout) else {
         return false;
     };
@@ -346,8 +346,8 @@ pub(crate) fn valid_canvas_size(layout: &CanvasLayout, width: u32, height: u32) 
 mod tests {
     use super::*;
 
-    fn member(id: u32, x: f64, y: f64, w: f64, h: f64, scale: f64) -> CanvasMember {
-        CanvasMember {
+    fn member(id: u32, x: f64, y: f64, w: f64, h: f64, scale: f64) -> CanvasDisplay {
+        CanvasDisplay {
             display_id: id,
             x,
             y,
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn size_and_tiles_share_edges() {
-        let layout = CanvasLayout {
+        let layout = CanvasArrangement {
             members: vec![
                 member(1, 0.0, 0.0, 1512.0, 982.0, 2.0),
                 member(2, 1512.0, -200.0, 2560.0, 1440.0, 1.0),

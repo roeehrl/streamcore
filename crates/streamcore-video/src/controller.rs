@@ -43,7 +43,7 @@ pub struct StreamParts {
 /// the composite's format (NV12).
 #[derive(uniffi::Record)]
 pub struct CanvasParts {
-    pub layout: crate::canvas::CanvasLayout,
+    pub layout: crate::canvas::CanvasArrangement,
     pub compositor: Arc<dyn Compositor>,
 }
 

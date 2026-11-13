@@ -69,7 +69,7 @@ struct GroupOp {
 }
 
 pub(crate) struct CanvasRun {
-    layout: CanvasLayout,
+    layout: CanvasArrangement,
     compositor: Arc<dyn Compositor>,
     tiles: Vec<CanvasTile>,
     members: Vec<Member>,
@@ -117,7 +117,7 @@ impl CanvasRun {
         }
     }
 
-    pub(super) fn layout(&self) -> &CanvasLayout {
+    pub(super) fn layout(&self) -> &CanvasArrangement {
         &self.layout
     }
 
@@ -134,7 +134,7 @@ pub(super) fn validate(
     spec: &CaptureSpec,
     plan: &StreamPlan,
     display_ids: &[u32],
-    layout: &CanvasLayout,
+    layout: &CanvasArrangement,
 ) -> Result<(), MediaError> {
     let ids: Vec<u32> = layout.members.iter().map(|m| m.display_id).collect();
     if canvas::problem(layout).is_some()

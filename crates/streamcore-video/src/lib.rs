@@ -31,8 +31,8 @@ pub mod threading {}
 
 pub use bounded::{run_bounded, run_bounded_value};
 pub use canvas::{
-    CanvasLayout, CanvasMember, CanvasPoint, CanvasSize, NormalizedPoint, canvas_input_target,
-    canvas_nearest_member_point, canvas_size, canvas_tiles, canvas_validate,
+    CanvasArrangement, CanvasDisplay, CanvasPoint, CanvasSize, NormalizedPoint,
+    canvas_input_target, canvas_nearest_member_point, canvas_size, canvas_tiles, canvas_validate,
 };
 pub use controller::{CanvasParts, StreamController, StreamParts};
 pub use error::{MediaError, codes};

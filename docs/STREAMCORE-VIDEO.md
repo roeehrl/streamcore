@@ -579,7 +579,7 @@ a pool of three, an exhausted pool retrying one interval later) and VideoToolbox
 **As shipped (P2).** `StreamController::new_canvas(parts, CanvasParts { layout, compositor })`
 runs a `CaptureTarget::Canvas` stream; `StreamController::new` keeps answering such a spec with
 `Unsupported`, so a backend without a compositor keeps the consumer's own path. The layout
-(`CanvasLayout`, members in one global coordinate space with their scale) is validated with the
+(`CanvasArrangement`, members in one global coordinate space with their scale) is validated with the
 consumer's limits (2–8 members, no overlap, ≤ 8192 px per edge, ≤ 7680×4320); `canvas_size`,
 `canvas_tiles`, `canvas_input_target` and `canvas_nearest_member_point` are exported for the
 consumer. Rust opens one `Display` capture per member at its tile size, starts and stops them

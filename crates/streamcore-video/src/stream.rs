@@ -18,7 +18,7 @@
 mod canvas_run;
 
 use crate::bounded::run_bounded_value;
-use crate::canvas::CanvasLayout;
+use crate::canvas::CanvasArrangement;
 use crate::controller::CanvasParts;
 use crate::error::{MediaError, codes};
 use crate::executor::*;
@@ -232,7 +232,7 @@ const MAX_STOP_WAITERS: usize = 16;
 pub(crate) fn validate(
     spec: &CaptureSpec,
     plan: &StreamPlan,
-    layout: Option<&CanvasLayout>,
+    layout: Option<&CanvasArrangement>,
 ) -> Result<(), MediaError> {
     let dims = |w: u32, h: u32| (2..=8192).contains(&w) && (2..=8192).contains(&h);
     let fps = i64::from(plan.fps);

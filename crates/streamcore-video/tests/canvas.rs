@@ -283,8 +283,8 @@ impl Compositor for FakeCompositor {
 // ---------------------------------------------------------------------------
 // Layouts and harness.
 
-fn member(display_id: u32, x: f64, y: f64, width: f64, height: f64, scale: f64) -> CanvasMember {
-    CanvasMember {
+fn member(display_id: u32, x: f64, y: f64, width: f64, height: f64, scale: f64) -> CanvasDisplay {
+    CanvasDisplay {
         display_id,
         x,
         y,
@@ -296,8 +296,8 @@ fn member(display_id: u32, x: f64, y: f64, width: f64, height: f64, scale: f64) 
 }
 
 /// Three displays in an L: a gap at the bottom right.
-fn layout3() -> CanvasLayout {
-    CanvasLayout {
+fn layout3() -> CanvasArrangement {
+    CanvasArrangement {
         members: vec![
             member(1, 0.0, 0.0, 800.0, 600.0, 1.0),
             member(2, 800.0, 0.0, 800.0, 600.0, 1.0),
@@ -306,7 +306,7 @@ fn layout3() -> CanvasLayout {
     }
 }
 
-fn canvas_spec(layout: &CanvasLayout, size: CanvasSize) -> CaptureSpec {
+fn canvas_spec(layout: &CanvasArrangement, size: CanvasSize) -> CaptureSpec {
     CaptureSpec {
         target: CaptureTarget::Canvas {
             display_ids: layout.members.iter().map(|m| m.display_id).collect(),
@@ -342,7 +342,7 @@ impl Canvas {
         Self::with(layout3(), |_| {})
     }
 
-    fn with(layout: CanvasLayout, adjust: impl FnOnce(&mut StreamParts)) -> Self {
+    fn with(layout: CanvasArrangement, adjust: impl FnOnce(&mut StreamParts)) -> Self {
         let fakes = Fakes::new();
         let members = FakeMembers::new(fakes.log.clone());
         let compositor = FakeCompositor::new(fakes.log.clone());
@@ -448,17 +448,17 @@ impl Canvas {
 #[test]
 fn layout_validation_mirrors_the_limits() {
     assert!(canvas_validate(layout3()).is_ok());
-    let one = CanvasLayout {
+    let one = CanvasArrangement {
         members: vec![member(1, 0.0, 0.0, 800.0, 600.0, 1.0)],
     };
     assert_eq!(canvas_validate(one), Err(MediaError::InvalidSettings));
-    let nine = CanvasLayout {
+    let nine = CanvasArrangement {
         members: (0..9)
             .map(|i| member(i, f64::from(i) * 100.0, 0.0, 100.0, 100.0, 1.0))
             .collect(),
     };
     assert!(canvas_validate(nine).is_err());
-    let eight = CanvasLayout {
+    let eight = CanvasArrangement {
         members: (0..8)
             .map(|i| member(i, f64::from(i) * 100.0, 0.0, 100.0, 100.0, 1.0))
             .collect(),
@@ -486,7 +486,7 @@ fn layout_validation_mirrors_the_limits() {
         layout.members[1] = bad;
         assert!(canvas_validate(layout).is_err(), "{bad:?}");
     }
-    let wide = CanvasLayout {
+    let wide = CanvasArrangement {
         members: vec![
             member(1, -60_000.0, 0.0, 100.0, 100.0, 1.0),
             member(2, 60_000.0, 0.0, 100.0, 100.0, 1.0),
@@ -498,7 +498,7 @@ fn layout_validation_mirrors_the_limits() {
 #[test]
 fn canvas_size_keeps_one_scale_within_the_limits() {
     // Mixed densities: the densest member's scale is the ceiling.
-    let mixed = CanvasLayout {
+    let mixed = CanvasArrangement {
         members: vec![
             member(1, 0.0, 0.0, 1512.0, 982.0, 2.0),
             member(2, 1512.0, 0.0, 2560.0, 1440.0, 1.0),
@@ -609,7 +609,7 @@ fn a_canvas_without_a_compositor_is_unsupported() {
 
 #[test]
 fn a_canvas_is_validated_before_anything_native() {
-    let invalid = |adjust: &dyn Fn(&mut StreamParts, &mut CanvasLayout)| {
+    let invalid = |adjust: &dyn Fn(&mut StreamParts, &mut CanvasArrangement)| {
         let fakes = Fakes::new();
         let compositor = FakeCompositor::new(fakes.log.clone());
         let clock = Arc::new(ManualClock(AtomicU64::new(SECOND)));
