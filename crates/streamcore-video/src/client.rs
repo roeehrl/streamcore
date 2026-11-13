@@ -50,6 +50,10 @@ const LOSS_KEPT: usize = LossBitmap::MAX_BYTES * 8;
 /// fail the stream.
 const RECREATE_BUDGET: usize = 3;
 const RECREATE_WINDOW_NS: u64 = 10_000_000_000;
+/// The queue bound until a session's first output, when its depth is not
+/// known yet: generous, so a decoder that needs a few inputs before it
+/// outputs anything is not flushed while it fills.
+const PROVISIONAL_QUEUE_BOUND: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Records.
@@ -74,12 +78,16 @@ pub struct DecoderInfo {
     /// `RealTime`).
     pub low_latency_confirmed: bool,
     pub hardware: bool,
-    /// The decoder's real pipeline depth: the inputs it needs before its
-    /// first output (0 or 1 for a low-latency decoder). The decoder queue
-    /// bound is `max(2, max_queued)` (6.2). A depth above 2 is a latency
-    /// cost on every frame (R2 wants zero reorder and no pipeline):
-    /// adapters should prefer a decoder with a depth of 2 or less, and Rust
-    /// counts such sessions (`ClientStats::deep_decoder_sessions`).
+    /// The decoder's pipeline depth as far as the adapter knows it at
+    /// configure time: the inputs it needs before its first output (0 or 1
+    /// for a low-latency decoder). Rust also learns the real depth from the
+    /// session's first output (`ClientStats::learned_depth`), so an adapter
+    /// that cannot know it reports its best guess. The decoder queue bound
+    /// is `max(2, max_queued, learned depth)` (6.2), and at least 4 until the
+    /// first output. A depth above 2 is a latency cost on every frame (R2
+    /// wants zero reorder and no pipeline): adapters should prefer a decoder
+    /// with a depth of 2 or less, and Rust counts such sessions
+    /// (`ClientStats::deep_decoder_sessions`).
     pub max_queued: u8,
     /// Free-form notes for diagnostics: the vendor keys applied, retries with
     /// fewer keys, the decoder's name.
@@ -202,12 +210,17 @@ pub struct ClientStats {
     /// Decoder sessions configured.
     pub sessions: u64,
     /// The current session's decoder queue bound:
-    /// `max(ClientTimings::queue_bound, DecoderInfo::max_queued)` (0 before
-    /// the first session).
+    /// `max(ClientTimings::queue_bound, DecoderInfo::max_queued, learned_depth)`,
+    /// or the provisional bound (at least 4) until the session's first
+    /// output (0 before the first session).
     pub queue_bound: u32,
-    /// Sessions whose decoder declared a pipeline deeper than 2
-    /// (`DecoderInfo::max_queued > 2`): each holds frames back, a latency
-    /// cost on every frame.
+    /// The current session's pipeline depth as learned from its first
+    /// output: the samples it accepted, from its first keyframe, up to and
+    /// including the first one it output (0 until then).
+    pub learned_depth: u32,
+    /// Sessions whose decoder pipeline is deeper than 2, as declared
+    /// (`DecoderInfo::max_queued`) or learned: each holds frames back, a
+    /// latency cost on every frame.
     pub deep_decoder_sessions: u64,
     /// Sessions replaced after a stall, failure or hung flush.
     pub recreates: u64,
@@ -920,15 +933,29 @@ impl ClientShared {
     }
 }
 
+/// One decoder session's counters, shared by the executor and the port.
+#[derive(Default)]
+struct SessionCounters {
+    /// The newest sequence this session output, raised before the post: a
+    /// frame decoded inside `decode` (or while its event waits in the
+    /// mailbox) no longer counts against the queue bound.
+    output: AtomicU64,
+    /// Samples the session holds counted towards its depth: raised by the
+    /// executor before each `decode` from the session's first keyframe (and
+    /// lowered again when it is not accepted), reset by a flush.
+    accepted: AtomicU64,
+    /// `accepted` when the session's first output arrived (0: none yet),
+    /// taken by the port at the output itself, so a sample accepted while
+    /// the event waits in the mailbox does not count.
+    depth: AtomicU64,
+}
+
 /// One decoder session's [`DecoderEvents`]: holds the executor weakly and
 /// carries the session, so a replaced session's calls are ignored.
 struct DecoderPort {
     executor: Weak<ClientShared>,
     session: u64,
-    /// The newest sequence this session output, raised before the post: a
-    /// frame decoded inside `decode` (or while its event waits in the
-    /// mailbox) no longer counts against the queue bound.
-    output: Arc<AtomicU64>,
+    counters: Arc<SessionCounters>,
 }
 
 impl DecoderPort {
@@ -941,7 +968,16 @@ impl DecoderPort {
 
 impl DecoderEvents for DecoderPort {
     fn decoded(&self, seq: u64, c3_ns: u64) {
-        self.output.fetch_max(seq, Ordering::AcqRel);
+        self.counters.output.fetch_max(seq, Ordering::AcqRel);
+        let accepted = self.counters.accepted.load(Ordering::Acquire);
+        if accepted > 0 {
+            let _ = self.counters.depth.compare_exchange(
+                0,
+                accepted,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         self.post(ClientEvent::Decoded {
             session: self.session,
             seq,
@@ -1045,8 +1081,10 @@ struct ClientState {
     info: Option<DecoderInfo>,
     /// Transport clock minus the decoder's clock, in ns.
     clock_offset_ns: i128,
-    /// The session port's newest output sequence.
-    output: Arc<AtomicU64>,
+    /// The current session's counters (shared with its port).
+    counters: Arc<SessionCounters>,
+    /// The current session's learned depth (`None` until its first output).
+    learned_depth: Option<u8>,
     in_flight: VecDeque<InFlight>,
     /// The newest sample waiting while the decoder is busy.
     held: Option<Sample>,
@@ -1124,7 +1162,8 @@ impl ClientState {
             live: false,
             info: None,
             clock_offset_ns: 0,
-            output: Arc::default(),
+            counters: Arc::default(),
+            learned_depth: None,
             in_flight: VecDeque::new(),
             held: None,
             busy: false,
@@ -1454,11 +1493,13 @@ impl ClientState {
         self.session += 1;
         self.live = false;
         self.busy = false;
-        self.output = Arc::default();
+        self.counters = Arc::default();
+        self.learned_depth = None;
+        self.stats.learned_depth = 0;
         let port: Arc<dyn DecoderEvents> = Arc::new(DecoderPort {
             executor: self.me.clone(),
             session: self.session,
-            output: self.output.clone(),
+            counters: self.counters.clone(),
         });
         match decoder.configure(self.codec, config, self.color, queue, port) {
             Ok(info) => {
@@ -1470,9 +1511,9 @@ impl ClientState {
                 if info.max_queued > 2 {
                     self.stats.deep_decoder_sessions += 1;
                 }
-                self.stats.queue_bound = u32::from(self.timings.queue_bound.max(info.max_queued));
                 self.phase = ClientPhase::Running;
                 self.info = Some(info.clone());
+                self.stats.queue_bound = self.queue_bound() as u32;
                 self.notify(
                     cx,
                     ClientJob::Configured {
@@ -1503,13 +1544,37 @@ impl ClientState {
     /// frame whose `decoded` is still in the mailbox has been output (a
     /// session's sequences increase, and it outputs in decode order).
     fn waiting(&self) -> usize {
-        let output = self.output.load(Ordering::Acquire);
+        let output = self.counters.output.load(Ordering::Acquire);
         self.in_flight.iter().filter(|f| f.seq > output).count() + usize::from(self.held.is_some())
     }
 
+    /// `max(2, max_queued, learned depth)` once the session output a frame;
+    /// before that, at least [`PROVISIONAL_QUEUE_BOUND`].
     fn queue_bound(&self) -> usize {
         let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
-        usize::from(self.timings.queue_bound.max(declared))
+        let bound = self.timings.queue_bound.max(declared);
+        let bound = match self.learned_depth {
+            Some(depth) => bound.max(depth),
+            None => bound.max(PROVISIONAL_QUEUE_BOUND),
+        };
+        usize::from(bound)
+    }
+
+    /// The session output a frame: its depth is the samples it had accepted
+    /// (from its first keyframe) when its first output arrived.
+    fn learn_depth(&mut self) {
+        if self.learned_depth.is_some() {
+            return;
+        }
+        let depth = self.counters.depth.load(Ordering::Acquire).max(1);
+        let depth = u8::try_from(depth).unwrap_or(u8::MAX);
+        self.learned_depth = Some(depth);
+        self.stats.learned_depth = u32::from(depth);
+        let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
+        if depth > 2 && declared <= 2 {
+            self.stats.deep_decoder_sessions += 1;
+        }
+        self.stats.queue_bound = self.queue_bound() as u32;
     }
 
     /// A frame the receiver passed: the two-frame bound, then the busy hold,
@@ -1572,11 +1637,24 @@ impl ClientState {
         };
         let session = self.session;
         let Sample { data, meta } = sample;
+        // Counted towards the session's depth before the call: a decoder may
+        // output it from inside `decode`.
+        let counted = self.learned_depth.is_none()
+            && (meta.keyframe || self.counters.accepted.load(Ordering::Acquire) > 0);
+        if counted {
+            self.counters.accepted.fetch_add(1, Ordering::AcqRel);
+        }
         // Rust keeps the bytes until the decoder takes them: a `Busy` sample
         // is retried at `input_ready`.
         let result = decoder.decode(data.clone(), meta);
         if self.session != session || self.closed.is_some() {
             return;
+        }
+        if counted && result != DecodeResult::Accepted {
+            let _ = self
+                .counters
+                .accepted
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
         }
         match result {
             DecodeResult::Accepted => {
@@ -1654,6 +1732,10 @@ impl ClientState {
     /// hung).
     fn flush_decoder(&mut self, cx: &Arc<ClientShared>) -> bool {
         let dropped = self.waiting() as u64;
+        // A flushed decoder fills again: learning restarts at the next keyframe.
+        if self.learned_depth.is_none() {
+            self.counters.accepted.store(0, Ordering::Release);
+        }
         for entry in std::mem::take(&mut self.in_flight) {
             self.finish(entry.generation, entry.seq);
         }
@@ -1816,6 +1898,7 @@ impl ClientState {
         let Some(entry) = self.in_flight.pop_front() else {
             return;
         };
+        self.learn_depth();
         self.stats.decoded += 1;
         self.last_progress_ns = cx.clock.now_ns();
         let c3_us = self.wire_us(c3_ns);
