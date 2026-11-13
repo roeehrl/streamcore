@@ -22,6 +22,16 @@ pub fn ns_to_hundred_ns(ns: u64) -> i64 {
     i64::try_from(ns / 100).unwrap_or(i64::MAX)
 }
 
+/// A refresh interval in ns from a display rate given as a fraction (numerator / denominator Hz,
+/// as `QueryDisplayConfig` reports it): 1 s × `den` / `num`, rounded. `None` for a zero rate.
+pub fn interval_from_rational(num: u32, den: u32) -> Option<u64> {
+    if num == 0 || den == 0 {
+        return None;
+    }
+    let ns = (u128::from(den) * 1_000_000_000 + u128::from(num) / 2) / u128::from(num);
+    u64::try_from(ns).ok().filter(|ns| *ns > 0)
+}
+
 /// Nanoseconds to milliseconds as a float, for reports.
 pub fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
@@ -101,5 +111,14 @@ mod tests {
         assert_eq!(hundred_ns_to_ns(-5), 0);
         assert_eq!(ns_to_hundred_ns(16_666_700), 166_667);
         assert!((ns_to_ms(1_500_000) - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn refresh_interval_from_a_rational_rate() {
+        assert_eq!(interval_from_rational(60, 1), Some(16_666_667));
+        assert_eq!(interval_from_rational(60_000, 1001), Some(16_683_333));
+        assert_eq!(interval_from_rational(144_000, 1000), Some(6_944_444));
+        assert_eq!(interval_from_rational(0, 1), None);
+        assert_eq!(interval_from_rational(60, 0), None);
     }
 }

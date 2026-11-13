@@ -55,16 +55,36 @@ the measurement binary driven by `scripts/run-video-windows-bench.sh`.
   reports nothing applied then. If the current state cannot be read, the opt-out is skipped
   (`throttling_unreadable`) rather than overwrite the host's policy. A host that embeds the
   backend doesn't need to do anything; a host with its own encoder path should do the same.
-  It costs power while streaming, which these measurements justify (720p, an Intel integrated
-  GPU, a remote-desktop session at 32 Hz, 11 Nov 2026):
+  It costs power while streaming, which these measurements justify (an Intel integrated GPU;
+  a remote-desktop session at 720p and 32 Hz on 11 Nov 2026, and the PC's own 3840x2160
+  monitor at 59.94 Hz on 13 Nov 2026):
 
   | | encode p50 / p99 (probe, one in flight) | capture → encoded p50 / p99 (synthetic bench) |
   |---|---|---|
-  | default 15.6 ms tick | 14.3 / 16.1 ms | 15.5 / 23.8 ms |
-  | `TimerPeriod` held | 6.2 / 7.8 ms | 8.2 / 9.8 ms |
-  | `TimerPeriod` held, console minimized | 6.1 / 7.6 ms | |
+  | 720p remote desktop, default 15.6 ms tick | 14.3 / 16.1 ms | 15.5 / 23.8 ms |
+  | 720p remote desktop, `TimerPeriod` held | 6.2 / 7.8 ms | 8.2 / 9.8 ms |
+  | 720p remote desktop, `TimerPeriod` held, console minimized | 6.1 / 7.6 ms | |
+  | 4K monitor, default 15.6 ms tick | 31.2 / 49.4 ms | 77.8 / 102.1 ms (only 28.8 of 58.9 fps encoded) |
+  | 4K monitor, `TimerPeriod` held | 14.8 / 37.1 ms | 15.2 / 18.2 ms (58.9 fps) |
 
   The bench's `--timer-period off` measures without it.
+- **Display geometry is in physical pixels.** A host process may be DPI unaware or system
+  aware, and Windows then reports a scaled display in scaled units (a 3840x2160 monitor at 150 %
+  reads as 2560x1440) while WGC delivers physical pixels. Adapter and output enumeration run
+  under a per-monitor-aware thread context (`PhysicalPixels`) and read each monitor's rectangle
+  with `GetMonitorInfoW`, so `DisplayLayout` sizes, origins and regions are physical whatever the
+  host's manifest says; `scale` is the monitor's effective DPI / 96.
+- **Refresh and rotation come from the display path.** `refresh_interval_ns(output)` reads the
+  current mode's rate from `QueryDisplayConfig` as a fraction (59.94 Hz stays 60000/1001; the
+  `EnumDisplaySettings` integer would say 59) for `StreamPlan::refresh_interval_ns`, and again for
+  `StreamController::set_refresh_interval` after `WM_DISPLAYCHANGE`. `None` when unreadable. The
+  same path gives `DisplayLayout::rotation` (Portrait reads 90, Portrait (flipped) 270). WGC frames
+  arrive in desktop orientation in every rotation (checked on a 4K monitor in both portrait
+  modes: 2160x3840, every barcode decoded), so the converter never rotates.
+- **H0 is the frame's display time.** `SystemRelativeTime` is when the composition reaches the
+  screen, and DWM hands the frame to WGC before that refresh: under constant redraw at 60 Hz it
+  arrives about 12 ms early (H1 → H0 p50 11.7 ms), on an idle desktop at about the same time.
+  `source_present_ns` carries it unchanged; stage offsets from H0 can be negative on Windows.
 - **Stream changes.** On `MF_E_TRANSFORM_STREAM_CHANGE` the output type is adopted and
   `ProcessOutput` called once more, as MF's contract asks. Quick Sync answers that retry with
   E_UNEXPECTED and sends the pending frame with its next `METransformHaveOutput`: E_UNEXPECTED

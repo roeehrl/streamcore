@@ -22,6 +22,7 @@ streamcore-video = { path = "../streamcore-video", optional = true }
 streamcore-media = { path = "../streamcore-media", optional = true }
 windows = { workspace = true, optional = true, features = [
     "Foundation",
+    "Win32_Devices_Display",
     "Foundation_Metadata",
     "Graphics",
     "Graphics_Capture",
