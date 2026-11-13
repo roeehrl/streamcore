@@ -278,6 +278,14 @@ impl VideoReceiver {
         }
         s.ltr_decoded.push_back(token);
     }
+    /// A new decoder session that starts at a keyframe: it holds none of the LTR
+    /// frames the old one decoded, so an LTR refresh from them cannot repair a
+    /// later break. The chain itself is unchanged.
+    pub fn forget_ltr(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.ltr_decoded.clear();
+        }
+    }
     /// Layer flush, attachment or decode failure invalidates reference frames.
     pub fn require_keyframe(&self) {
         if let Ok(mut s) = self.state.lock() {

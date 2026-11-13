@@ -463,14 +463,29 @@ fn an_ltr_refresh_restores_the_chain_only_from_a_decoded_token() {
         r.accept_frame(packet(1, 11, 0), ltr(2, 0x02, h264::unit(10, false, false))),
         Recover
     );
+    // A new decoder session forgets them too, without breaking the chain.
+    assert_eq!(
+        r.accept_frame(packet(1, 14, 1), frame(h264::unit(0, true, false))),
+        Decode
+    );
+    r.note_ltr_decoded(1, 14);
+    r.forget_ltr();
+    assert_eq!(
+        r.accept_frame(packet(1, 15, 0), frame(h264::unit(1, false, false))),
+        Decode
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 17, 0), ltr(14, 0x02, h264::unit(5, false, false))),
+        Recover
+    );
     // Tokens of another generation are not taken.
     r.note_ltr_decoded(2, 7);
     assert_eq!(
-        r.accept_frame(packet(1, 12, 0), ltr(7, 0x02, h264::unit(11, false, false))),
+        r.accept_frame(packet(1, 18, 0), ltr(7, 0x02, h264::unit(11, false, false))),
         Recover
     );
     assert_eq!(
-        r.accept_frame(packet(1, 13, 1), frame(h264::unit(0, true, false))),
+        r.accept_frame(packet(1, 19, 1), frame(h264::unit(0, true, false))),
         Decode
     );
 }
