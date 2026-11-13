@@ -738,6 +738,27 @@ instead of after today's 0.5 s (client keyframe requests already do); later IDRs
 second. LTR state clears on every generation change and transport switch. Discardable frames come
 from two temporal layers where supported; missing discardable sequences do not invalidate the chain.
 
+**As shipped (P2).** `encoder_plan_features(caps, client_ltr, client_temporal_layers)` is the
+planner rule: `LtrRefresh` (and the `ltr` extension) only from `EncoderCaps.ltr == Confirmed` and a
+client that acknowledges, `Discardable` and `TemporalId` only from confirmed temporal layers and a
+client that understands them; `Idr` always ends the list. `EncoderSpec.ltr` and
+`EncoderSpec.temporal_layers` follow the plan. The executor remembers the LTR tokens the current
+encoder marked (per wire generation) and takes a client acknowledgement
+(`StreamController::note_ltr_ack(generation, token)`, from `videoFeedback`) only for one of them;
+the newest acknowledgement goes to the encoder once (`SubmitOpts::ltr_acknowledged`). A recovery
+with an acknowledgement in hand submits `SubmitOpts::ltr_refresh`; the IDR interval does not hold
+a refresh back, and the refresh ends the recovery when written, like a keyframe. A refresh that the
+encoder answers with a plain delta, or that is lost, escalates at once to an IDR; later IDRs keep
+the interval. A client keyframe request always gets an IDR and drops the held acknowledgement.
+Encoder and wire generation changes and `StreamController::note_transport_changed` clear it.
+`VideoSink` sheds by rule 1 only frames the plan announced as discardable, and exempts LTR
+refreshes from rule 2. Receivers use `VideoReceiver::accept_frame` with the `ltr` TLV and the
+payload's first bytes: on H.264 a sequence gap breaks the chain only if `frame_num` shows a missing
+reference picture, and an LTR refresh from a token the receiver decoded
+(`note_ltr_decoded`) restores it. The VideoToolbox H.264 encoder on Apple silicon marks every frame
+as an LTR candidate until acknowledgements arrive, and with a base layer at half the frame rate
+outputs layer-1 frames as non-reference pictures.
+
 ### 6.6 Rate adaptation
 
 Delay-based and identical on every medium (TCP and USB relays hide loss): inputs are unsent age,

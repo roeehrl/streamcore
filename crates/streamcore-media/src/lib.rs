@@ -4,6 +4,7 @@
 //! buffers cross the native interface.
 
 pub mod binary;
+pub mod h264;
 pub mod media;
 pub mod stream;
 pub mod video_control;

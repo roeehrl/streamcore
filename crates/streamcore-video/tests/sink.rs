@@ -112,9 +112,14 @@ fn one_frame_in_the_transport_and_later_ones_follow_its_write() {
     s.assert_wire_order();
 }
 
+/// A plan whose client takes temporal layers (`encoder_plan_features`).
+fn layered(_: &Fakes, parts: &mut StreamParts) {
+    parts.plan.extensions = vec![FrameExtension::Discardable, FrameExtension::TemporalId];
+}
+
 #[test]
 fn rule_1_a_queued_discardable_frame_is_dropped_when_a_newer_one_arrives() {
-    let s = bounded();
+    let s = bounded_with(sink_policy(), layered);
     let encoder = three_in_the_encoder(&s);
     encoder.complete(1);
     encoder.complete_discardable(2);
@@ -135,13 +140,31 @@ fn rule_1_a_queued_discardable_frame_is_dropped_when_a_newer_one_arrives() {
 }
 
 #[test]
+fn rule_1_sheds_nothing_the_plan_did_not_announce_as_discardable() {
+    // The encoder marks frame 2 discardable, but the client was not told
+    // (no temporal layers in the plan): a gap would break its chain.
+    let s = bounded();
+    let encoder = three_in_the_encoder(&s);
+    encoder.complete(1);
+    encoder.complete_discardable(2);
+    encoder.complete(3);
+    s.pump();
+    while s.out.finish_any(0, true) {}
+    s.pump();
+    assert_eq!(seqs(&s), vec![1, 2, 3]);
+    assert_eq!(s.controller.stats().sink_discardable_shed, 0);
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
 fn rule_1_can_be_switched_off() {
     let s = bounded_with(
         SinkPolicy {
             shed_discardable: false,
             ..sink_policy()
         },
-        |_, _| {},
+        layered,
     );
     let encoder = three_in_the_encoder(&s);
     encoder.complete(1);

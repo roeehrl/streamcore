@@ -210,7 +210,30 @@ struct Receiver {
     sequence: u64,
     configured: bool,
     keyframe: bool,
+    /// H.264 parameters of this generation's configuration, when it is H.264.
+    h264: Option<crate::h264::AvcParams>,
+    /// `frame_num` of the last reference picture accepted on an intact chain.
+    prev_ref_frame_num: Option<u32>,
+    /// LTR tokens of this generation the client decoded on an intact chain,
+    /// newest last ([`VideoReceiver::note_ltr_decoded`]).
+    ltr_decoded: std::collections::VecDeque<u32>,
 }
+
+/// How many decoded LTR tokens a receiver remembers.
+const LTR_DECODED_KEPT: usize = 64;
+
+/// What a receiver needs of a frame beyond its header (STREAMCORE-VIDEO.md
+/// 6.5): the `ltr` TLV and the first bytes of the payload.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ReceivedFrame {
+    /// The `ltr` TLV's token (0: none) and flags.
+    pub ltr_token: u32,
+    pub ltr_flags: u8,
+    /// The configuration packet's whole payload (`avcC`/`hvcC`), or the first
+    /// bytes of a sample (256 are plenty for an H.264 slice header).
+    pub head: Vec<u8>,
+}
+
 #[derive(uniffi::Object)]
 pub struct VideoReceiver {
     stream_id: u32,
@@ -226,6 +249,66 @@ impl VideoReceiver {
         }
     }
     pub fn accept(&self, metadata: VideoMetadata) -> VideoDisposition {
+        self.accept_inner(metadata, None)
+    }
+    /// [`Self::accept`] for a stream with temporal layers or LTR (6.5). A gap
+    /// in sequences breaks the chain only if it removed a reference picture
+    /// (H.264: `frame_num` does not follow the last reference picture's); a
+    /// missing discardable frame does not. An LTR refresh (`ltr_flags` `0x02`)
+    /// predicted from a token this receiver was told it decoded
+    /// ([`Self::note_ltr_decoded`]) restores a broken chain like a keyframe.
+    /// For other codecs, or without the configuration's SPS, every gap is a
+    /// break, as with `accept`.
+    pub fn accept_frame(&self, metadata: VideoMetadata, frame: ReceivedFrame) -> VideoDisposition {
+        self.accept_inner(metadata, Some(frame))
+    }
+    /// The decoder output frame `token` (an `ltr` mark) of `generation`, which
+    /// was accepted on an intact chain: an LTR refresh from it can be decoded,
+    /// and the client acknowledges it in `videoFeedback` (after decode, never
+    /// on submit, 5).
+    pub fn note_ltr_decoded(&self, generation: u64, token: u32) {
+        let Ok(mut s) = self.state.lock() else {
+            return;
+        };
+        if token == 0 || generation != s.generation || s.ltr_decoded.contains(&token) {
+            return;
+        }
+        if s.ltr_decoded.len() == LTR_DECODED_KEPT {
+            s.ltr_decoded.pop_front();
+        }
+        s.ltr_decoded.push_back(token);
+    }
+    /// A new decoder session that starts at a keyframe: it holds none of the LTR
+    /// frames the old one decoded, so an LTR refresh from them cannot repair a
+    /// later break. The chain itself is unchanged.
+    pub fn forget_ltr(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.ltr_decoded.clear();
+        }
+    }
+    /// Layer flush, attachment or decode failure invalidates reference frames.
+    pub fn require_keyframe(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.keyframe = false;
+            // A flushed or new decoder holds no LTR frames.
+            s.ltr_decoded.clear();
+        }
+    }
+    pub fn reject_config(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.configured = false;
+            s.keyframe = false;
+            s.ltr_decoded.clear();
+        }
+    }
+}
+
+impl VideoReceiver {
+    fn accept_inner(
+        &self,
+        metadata: VideoMetadata,
+        frame: Option<ReceivedFrame>,
+    ) -> VideoDisposition {
         use VideoDisposition::{Configure, Decode, Ignore, Recover};
         let Ok(mut s) = self.state.lock() else {
             return Recover;
@@ -249,6 +332,9 @@ impl VideoReceiver {
             }
             s.configured = true;
             s.keyframe = false;
+            s.h264 = frame
+                .as_ref()
+                .and_then(|f| crate::h264::AvcParams::from_avcc(&f.head));
             return Configure;
         }
         if metadata.sequence <= s.sequence {
@@ -260,25 +346,45 @@ impl VideoReceiver {
             s.keyframe = false;
             return Recover;
         }
+        let refs = match (&frame, s.h264) {
+            (Some(f), Some(params)) => crate::h264::slice_refs(&f.head, &params),
+            _ => None,
+        };
         if metadata.flags == 1 {
             s.keyframe = true;
+            s.prev_ref_frame_num = refs.map(|r| r.frame_num);
+            return Decode;
+        }
+        let refresh = frame.as_ref().is_some_and(|f| {
+            f.ltr_token != 0
+                && f.ltr_flags & crate::media::LtrInfo::REFRESH != 0
+                && s.ltr_decoded.contains(&f.ltr_token)
+        });
+        if refresh {
+            // Predicted only from an LTR frame this decoder holds.
+            s.keyframe = true;
+            s.prev_ref_frame_num = refs.map(|r| r.frame_num);
             return Decode;
         }
         if !consecutive {
-            s.keyframe = false;
+            // Only a gap of non-reference pictures keeps the chain: the next
+            // frame_num follows the last reference picture's.
+            let intact = match (refs, s.h264, s.prev_ref_frame_num) {
+                (Some(refs), Some(params), Some(prev)) => {
+                    refs.frame_num == (prev + 1) % params.max_frame_num()
+                }
+                _ => false,
+            };
+            if !intact {
+                s.keyframe = false;
+            }
         }
-        if s.keyframe { Decode } else { Recover }
-    }
-    /// Layer flush, attachment or decode failure invalidates reference frames.
-    pub fn require_keyframe(&self) {
-        if let Ok(mut s) = self.state.lock() {
-            s.keyframe = false;
+        if !s.keyframe {
+            return Recover;
         }
-    }
-    pub fn reject_config(&self) {
-        if let Ok(mut s) = self.state.lock() {
-            s.configured = false;
-            s.keyframe = false;
+        if let Some(refs) = refs.filter(|r| r.nal_ref_idc != 0) {
+            s.prev_ref_frame_num = Some(refs.frame_num);
         }
+        Decode
     }
 }
