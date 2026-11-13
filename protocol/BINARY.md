@@ -105,7 +105,7 @@ datagram mode), 38 bytes plus optional parts:
 | video payload bytes consumed since the stream started on this channel | u64 |
 | frames flushed unshown since then (skip cause e; `StreamController::note_client_flush`) | u32 |
 | decoded frames never presented since then | u32 |
-| flags: `0x01` loss bitmap follows, `0x02` LTR ack follows | u8 |
+| flags: `0x01` loss bitmap follows, `0x02` LTR ack follows, `0x04` C5 estimated | u8 |
 | if `0x01`: base sequence (nonzero) u64, bitmap length u8 (1–128), bitmap; bit `i`, least significant first in each byte, set = sequence `base + i` missing | 9 + length |
 | if `0x02`: LTR token decoded on the current transport, nonzero | u32 |
 | frame count (0–32) | u8 |
@@ -113,8 +113,10 @@ datagram mode), 38 bytes plus optional parts:
 
 The loss bitmap lists every sequence the client did not receive; the host ignores sequences its
 sink shed when it uses the bitmap for rate adaptation or recovery; a missing discardable sequence
-does not break the chain (design 6.5). The per-frame entry has no flags: whether C5 was measured
-or estimated is not on the wire.
+does not break the chain (design 6.5). Flag `0x04` says that every entry's C5 in this report is
+the platform's estimate rather than a measured present time (Apple's display layer estimates;
+Android's frame-rendered listener measures); it applies to the whole report, so a client never
+mixes estimated and measured C5 in one report and splits its pending entries instead.
 
 **`0x13` videoNack** (datagram mode only): stream ID u32, generation u64
 (nonzero), sequence u64 (nonzero), count u16 (1–1024), then `count` u16 fragment

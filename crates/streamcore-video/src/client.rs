@@ -1007,6 +1007,8 @@ struct FrameRecord {
     c1_us: u64,
     c3_us: u64,
     c5_us: u64,
+    /// The platform only estimated C5.
+    c5_estimated: bool,
     /// Nothing more will happen to it (presented, dropped, flushed).
     finished: bool,
 }
@@ -1361,6 +1363,7 @@ impl ClientState {
                 c1_us,
                 c3_us: 0,
                 c5_us: 0,
+                c5_estimated: false,
                 finished: false,
             });
         }
@@ -1874,6 +1877,7 @@ impl ClientState {
         let c5_us = self.wire_us(c5_ns);
         if let Some(record) = self.record(generation, seq) {
             record.c5_us = c5_us;
+            record.c5_estimated = estimated;
             record.finished = true;
         }
         self.mark_dirty(cx);
@@ -1939,9 +1943,10 @@ impl ClientState {
     /// client did not receive, including discardable frames the host's sink
     /// shed: the host ignores sequences its sink shed when it uses the bitmap
     /// for rate adaptation or recovery, and a missing discardable sequence
-    /// does not break the chain (design 6.5). Whether C5 was estimated has no
-    /// field in the per-frame entry; it is counted in
-    /// `ClientStats::presented_estimated`.
+    /// does not break the chain (design 6.5). The `c5_estimated` flag covers
+    /// every entry's C5 in a report, so a report never mixes estimated and
+    /// measured C5: the ready entries of the other kind go in a second report
+    /// sent right after (without the loss bitmap and the LTR ack).
     fn send_feedback(&mut self, cx: &Arc<ClientShared>) {
         self.cancel_timer(TimerKind::Feedback);
         if !self.dirty || self.generation == 0 {
@@ -1950,24 +1955,38 @@ impl ClientState {
         let now_us = Self::now_us(cx);
         let interval_us = self.timings.feedback_interval_ns / 1_000;
         let generation = self.generation;
-        let mut frames = Vec::new();
+        // Ready entries with their kind of C5 (None: not presented).
+        let mut ready_frames = Vec::new();
         self.records.retain(|r| {
             let ready = r.finished || now_us.saturating_sub(r.c1_us) >= interval_us;
             if ready && r.generation == generation && r.seq != 0 {
-                frames.push(FramePresentation {
-                    sequence: r.seq,
-                    receive_us: r.c1_us,
-                    decode_us: r.c3_us,
-                    present_us: r.c5_us,
-                });
+                let kind = (r.c5_us != 0).then_some(r.c5_estimated);
+                ready_frames.push((
+                    FramePresentation {
+                        sequence: r.seq,
+                        receive_us: r.c1_us,
+                        decode_us: r.c3_us,
+                        present_us: r.c5_us,
+                    },
+                    kind,
+                ));
             }
             !ready
         });
-        if frames.len() > VideoFeedback::MAX_FRAMES {
-            frames.drain(..frames.len() - VideoFeedback::MAX_FRAMES);
+        // One kind of C5 per report (the `c5_estimated` flag covers every
+        // entry): the first presented entry's kind goes in this report with
+        // the entries not presented; the other kind in a second one.
+        let first = ready_frames.iter().find_map(|(_, kind)| *kind);
+        let (mut frames, mut others): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
+        for (frame, kind) in ready_frames {
+            if kind.is_none() || kind == first {
+                frames.push(frame);
+            } else {
+                others.push(frame);
+            }
         }
         let loss = self.loss_bitmap();
-        let feedback = VideoFeedback {
+        let report = VideoFeedback {
             stream_id: self.stream_id,
             generation,
             highest_complete_sequence: self.highest_seq,
@@ -1976,12 +1995,30 @@ impl ClientState {
             present_drops: self.present_drops,
             loss,
             ltr_ack: self.pending_ack.take(),
-            frames,
+            c5_estimated: first == Some(true),
+            frames: newest(frames),
         };
         self.dirty = !self.records.is_empty() || !self.loss.is_empty();
         if self.dirty {
             self.set_timer(cx, self.timings.feedback_interval_ns, TimerKind::Feedback);
         }
+        if !others.is_empty() {
+            let split = VideoFeedback {
+                loss: None,
+                ltr_ack: None,
+                c5_estimated: first != Some(true),
+                frames: newest(others),
+                ..report.clone()
+            };
+            self.send_report(cx, report);
+            self.send_report(cx, split);
+        } else {
+            self.send_report(cx, report);
+        }
+    }
+
+    /// Enqueue one report on lane 0, or hand it to the consumer.
+    fn send_report(&mut self, cx: &Arc<ClientShared>, feedback: VideoFeedback) {
         let Ok(body) = feedback.encode() else {
             return;
         };
@@ -2053,6 +2090,14 @@ impl ClientState {
         self.events = None;
         self.transport = None;
     }
+}
+
+/// The newest [`VideoFeedback::MAX_FRAMES`] entries.
+fn newest(mut frames: Vec<FramePresentation>) -> Vec<FramePresentation> {
+    if frames.len() > VideoFeedback::MAX_FRAMES {
+        frames.drain(..frames.len() - VideoFeedback::MAX_FRAMES);
+    }
+    frames
 }
 
 /// A generation's colour tags from its configuration (H.264: the SPS's VUI),

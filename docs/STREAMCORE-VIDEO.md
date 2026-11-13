@@ -1193,7 +1193,7 @@ widens it unconditionally and senders emit the new kinds only when frames.v4 was
 
 - `videoFeedback` (client → host, about every 100 ms; every 20 ms in datagram mode): highest
   complete sequence, optional loss bitmap, consumed bytes, per-frame receive/decode/present times,
-  flushes, present drops, optional LTR ack.
+  flushes, present drops, optional LTR ack, whether the report's present times are estimates.
 - `videoNack` (datagram mode only): missing fragments of a frame.
 - `frameTiming` (host → client, sampled; every frame on USB): H5 and H6, which cannot be in the
   frame's own header, and the sink's backpressure flag (8.7 health rule).
