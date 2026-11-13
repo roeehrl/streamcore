@@ -97,15 +97,17 @@ fn each_generation_configures_with_its_own_colour() {
 fn the_effective_queue_bound_and_deep_decoders_are_reported() {
     let c = Client::new();
     c.config(5);
+    c.key(5, 1);
+    c.output(1);
     assert_eq!(
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
         (2, 0)
     );
-    *lock(&c.decoder.max_queued) = 4;
+    *lock(&c.decoder.max_queued) = 5;
     c.config(6);
     assert_eq!(
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
-        (4, 1)
+        (5, 1)
     );
 }
 
@@ -220,26 +222,72 @@ fn a_frame_before_the_configuration_requests_a_keyframe() {
 fn more_than_two_waiting_frames_flush_and_request_a_keyframe() {
     let c = Client::new();
     c.config(5);
+    // The first output teaches the stream the decoder's depth (1): bound 2.
     c.key(5, 1);
+    c.output(1);
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (1, 2));
     c.delta(5, 2);
-    // Two wait; a third delta flushes them and itself.
     c.delta(5, 3);
+    // Two wait; a third delta flushes them and itself.
+    c.delta(5, 4);
     assert_eq!(c.decoder.flushes(), 1);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2]);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3]);
     assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::QueueBound]);
     let stats = c.stats();
     assert_eq!((stats.queue_flushes, stats.flushed), (1, 3));
     // Deltas until the keyframe are dropped (the request is not repeated
     // inside the interval).
-    c.delta(5, 4);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2]);
-    c.key(5, 5);
-    c.output(5);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 5]);
+    c.delta(5, 5);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3]);
+    c.key(5, 6);
+    c.output(6);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 6]);
     // Late outputs of the flushed frames name nothing.
-    c.decoder.decoded(2);
+    c.decoder.decoded(3);
     c.queue.pump();
-    assert_eq!(c.stats().decoded, 1);
+    assert_eq!(c.stats().decoded, 2);
+}
+
+#[test]
+fn until_the_first_output_the_bound_is_provisional() {
+    let c = Client::new();
+    c.config(5);
+    assert_eq!(c.stats().queue_bound, 4);
+    // Four inputs without an output are not a backlog yet.
+    c.key(5, 1);
+    for seq in 2..=4 {
+        c.delta(5, seq);
+    }
+    assert_eq!(c.decoder.flushes(), 0);
+    // A fifth is.
+    c.delta(5, 5);
+    assert_eq!(c.decoder.flushes(), 1);
+}
+
+#[test]
+fn a_decoder_three_deep_runs_without_flushes() {
+    let c = Client::new();
+    c.config(5);
+    // Output lags input by two frames: the first output after the third input.
+    c.key(5, 1);
+    c.delta(5, 2);
+    c.delta(5, 3);
+    c.output(1);
+    for seq in 4..=120 {
+        c.delta(5, seq);
+        c.output(seq - 2);
+        c.advance_ms(16);
+    }
+    let stats = c.stats();
+    assert_eq!(stats.learned_depth, 3);
+    assert_eq!(stats.queue_bound, 3);
+    assert_eq!(stats.deep_decoder_sessions, 1);
+    assert_eq!((stats.queue_flushes, stats.flushed), (0, 0));
+    assert!(c.jobs.keyframe_requests().is_empty());
+    assert_eq!(stats.decoded, 118);
+    // A new session learns again.
+    c.config(6);
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
 }
 
 #[test]
@@ -247,15 +295,17 @@ fn a_keyframe_over_the_bound_flushes_without_a_request() {
     let c = Client::new();
     c.config(5);
     c.key(5, 1);
+    c.output(1);
     c.delta(5, 2);
-    c.key(5, 3);
+    c.delta(5, 3);
+    c.key(5, 4);
     assert_eq!(c.decoder.flushes(), 1);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3]);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4]);
     assert!(c.jobs.keyframe_requests().is_empty());
     assert_eq!(c.stats().flushed, 2);
-    c.output(3);
-    c.delta(5, 4);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4]);
+    c.output(4);
+    c.delta(5, 5);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5]);
 }
 
 #[test]
@@ -613,9 +663,11 @@ fn a_hung_flush_recreates_the_session() {
     let c = Client::new();
     c.config(5);
     c.key(5, 1);
+    c.output(1);
     c.delta(5, 2);
-    *lock(&c.decoder.flush_outcome) = InvalidateOutcome::TimedOut;
     c.delta(5, 3);
+    *lock(&c.decoder.flush_outcome) = InvalidateOutcome::TimedOut;
+    c.delta(5, 4);
     let stats = c.stats();
     assert_eq!(stats.flush_timeouts, 1);
     assert_eq!(stats.recreates, 1);
