@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use streamcore_media::media::{ExtendedVideoPacket, FrameVersion, VideoExtensions, VideoMetadata};
@@ -511,6 +511,9 @@ pub struct FakeEncoder {
     /// (the spec's, then the last `set_rate`) over the time since the previous
     /// frame, a keyframe four times that.
     pub honour_rate: AtomicBool,
+    /// Moves the reported H3 and H4 (normally 10 and 20 ns after the
+    /// submitted time) by this many ns: a negative shift puts them before H0.
+    pub timing_shift_ns: AtomicI64,
     last_pts: AtomicU64,
 }
 
@@ -622,9 +625,13 @@ impl FakeEncoder {
             discardable,
             temporal_id,
             ltr,
-            timings: EncodeTimings {
-                input_ns: Some(pending.opts.capture_ns + 10),
-                output_ns: Some(pending.opts.capture_ns + 20),
+            timings: {
+                let shift = self.timing_shift_ns.load(Ordering::SeqCst);
+                let at = |ns: i64| Some(pending.opts.capture_ns.saturating_add_signed(ns + shift));
+                EncodeTimings {
+                    input_ns: at(10),
+                    output_ns: at(20),
+                }
             },
         });
         self.drop_permit(pending);
@@ -837,6 +844,7 @@ impl EncoderFactory for FakeFactory {
             ignore_refresh: AtomicBool::new(false),
             acked: Mutex::new(None),
             honour_rate: AtomicBool::new(self.honour_rate.load(Ordering::SeqCst)),
+            timing_shift_ns: AtomicI64::new(0),
             last_pts: AtomicU64::new(0),
         });
         encoders.push(encoder.clone());

@@ -272,6 +272,73 @@ fn frames_v4_extension_fixture_is_exact_and_every_tlv_round_trips() {
 }
 
 #[test]
+fn frames_v4_timing_offsets_are_signed_with_i32_min_as_not_measured() {
+    // protocol/BINARY.md, "frames.v4": all four timing values are i32 LE. H0 can
+    // come after H1, H3 and H4 (a source whose H0 is its display time), so every
+    // offset can be negative; 0x80000000 marks an H2, H3 or H4 not measured.
+    let timing = |h2_us, h3_us, h4_us, h1_minus_h0_us| VideoExtensions {
+        timing: Some(FrameTiming {
+            h2_us,
+            h3_us,
+            h4_us,
+            h1_minus_h0_us,
+        }),
+        ..VideoExtensions::default()
+    };
+    let cases: [(VideoExtensions, [u8; 16]); 3] = [
+        // H0 after capture and encode input: H3 − H0 = −11 000, H4 − H0 = −1,
+        // H1 − H0 = −11 700, H2 not measured.
+        (
+            timing(FrameTiming::NOT_MEASURED, -11_000, -1, -11_700),
+            [
+                0x00, 0x00, 0x00, 0x80, 0x08, 0xd5, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x4c, 0xd2,
+                0xff, 0xff,
+            ],
+        ),
+        // Nothing after H1 measured.
+        (
+            timing(
+                FrameTiming::NOT_MEASURED,
+                FrameTiming::NOT_MEASURED,
+                FrameTiming::NOT_MEASURED,
+                0,
+            ),
+            [
+                0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0, 0, 0, 0,
+            ],
+        ),
+        // The most negative measured offset, and the largest.
+        (
+            timing(i32::MIN + 1, 0, i32::MAX, 1),
+            [
+                0x01, 0x00, 0x00, 0x80, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0,
+            ],
+        ),
+    ];
+    for (extensions, value) in cases {
+        let mut fixture = v4_header(0x80);
+        fixture.extend([18, 0]); // ext_len 18
+        fixture.extend([1, 16]);
+        fixture.extend(value);
+        fixture.extend([0xaa]);
+        let packet = ExtendedVideoPacket {
+            metadata: DELTA,
+            extensions,
+            data: &[0xaa],
+        };
+        assert_eq!(packet.encode(FrameVersion::V4).unwrap(), fixture);
+        assert_eq!(
+            ExtendedVideoPacket::decode(&fixture, FrameVersion::V4).unwrap(),
+            packet
+        );
+    }
+    assert_eq!(FrameTiming::NOT_MEASURED, i32::MIN);
+    assert_eq!(FrameTiming::offset_us(i64::MIN), i32::MIN + 1);
+    assert_eq!(FrameTiming::offset_us(i64::MAX), i32::MAX);
+    assert_eq!(FrameTiming::offset_us(-11_700), -11_700);
+}
+
+#[test]
 fn frames_v4_absent_tlvs_have_defined_defaults_and_a_bare_v4_frame_is_valid() {
     // A frame with no TLVs: not discardable, temporal layer 0, no timing, no LTR, no
     // epoch. The encoder never sets 0x80 for it; it is byte-identical to v3.

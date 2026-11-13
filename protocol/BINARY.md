@@ -49,7 +49,7 @@ with `FrameVersion::{V3, V4}`; `media::VideoPacket` stays the strict v3 codec.
 
 | Type | Name | `len` | Value (little endian) | When absent |
 | --- | --- | --- | --- | --- |
-| `0x01` | timing | 16 | u32 µs from H0 to H2, H3 and H4, then i32 H1 − H0; `0xFFFFFFFF` = stage not measured | no timing |
+| `0x01` | timing | 16 | four **signed** i32 µs offsets from H0: H2 − H0, H3 − H0, H4 − H0, H1 − H0; `0x80000000` (`i32::MIN`) = H2, H3 or H4 not measured | no timing |
 | `0x02` | capture_us | 8 | u64 H0 on the host's StreamCore monotonic clock (µs) | no capture time |
 | `0x03` | discardable | 0 | none: presence means the frame is discardable | **not discardable** |
 | `0x04` | ltr | 5 | u32 nonzero token, u8 flags: `0x01` mark (stored as LTR `token`), `0x02` refresh (predicted only from LTR `token`); other bits reserved, written 0 and ignored | no LTR state |
@@ -66,13 +66,21 @@ with `FrameVersion::{V3, V4}`; `media::VideoPacket` stays the strict v3 codec.
   with any other `len`, a known type repeated, an LTR token of 0, a TLV running
   past `ext_len`, an `ext_len` past the payload, or no sample data after the block
   is invalid.
+- `timing` offsets are **signed** (two's complement), all four of them. H0 is the
+  source's display or present time, which can come after capture (H1) and even
+  after encode (H3, H4) where capture precedes display (Windows WGC, whose
+  `SystemRelativeTime` is the composition's display time), so any offset can be
+  negative. `0x80000000` marks an H2, H3 or H4 the host does not measure (an NV12
+  path has no H2); a measured offset saturates at `0x80000001` and `0x7FFFFFFF`
+  and never takes that value. A receiver tolerates negative offsets.
 - `capture_us` keeps the frame's H0, including on recovery re-encodes;
   `pts_micros` stays the strictly increasing submission time (recovery frames are
   re-stamped with the current time). `timing` is sampled (every frame in
   qualification).
 
 Fixtures: `crates/streamcore-media/tests/binary_contract.rs` (an every-TLV frame,
-a frame with no TLVs, an explicit-zero temporal id, unknown and malformed TLVs).
+negative and not-measured timing offsets, a frame with no TLVs, an explicit-zero
+temporal id, unknown and malformed TLVs).
 
 ## Lane-0 video kinds (`frames.v4`)
 

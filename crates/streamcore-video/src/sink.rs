@@ -436,13 +436,17 @@ pub(crate) struct FrameFields {
     pub(crate) layout_epoch: u64,
 }
 
-fn offset_us(from: u64, to: Option<u64>) -> u32 {
-    to.and_then(|to| to.checked_sub(from))
-        .map_or(WireTiming::NOT_MEASURED, |ns| {
-            u32::try_from(ns / 1_000)
-                .unwrap_or(WireTiming::NOT_MEASURED - 1)
-                .min(WireTiming::NOT_MEASURED - 1)
-        })
+/// `to − from` in signed µs: H0 may come after H1, H3 or H4 (on Windows H0 is
+/// the composition's display time, after WGC delivers the frame).
+fn offset_us(from: u64, to: Option<u64>) -> i32 {
+    to.map_or(WireTiming::NOT_MEASURED, |to| {
+        WireTiming::offset_us(signed_ns(to, from) / 1_000)
+    })
+}
+
+/// `a − b` in ns, saturating.
+fn signed_ns(a: u64, b: u64) -> i64 {
+    i64::try_from(i128::from(a) - i128::from(b)).unwrap_or(if a < b { i64::MIN } else { i64::MAX })
 }
 
 /// The extension TLVs `plan` selects for one frame (9.4). `timing` is sampled.
@@ -456,17 +460,11 @@ pub(crate) fn extensions(
         match kind {
             FrameExtension::Timing if with_timing => {
                 if let Some(h0) = fields.h0_ns {
-                    let h1 = i64::try_from(fields.h1_ns).unwrap_or(i64::MAX)
-                        - i64::try_from(h0).unwrap_or(i64::MAX);
                     ext.timing = Some(WireTiming {
                         h2_us: WireTiming::NOT_MEASURED,
                         h3_us: offset_us(h0, fields.h3_ns),
                         h4_us: offset_us(h0, fields.h4_ns),
-                        h1_minus_h0_us: i32::try_from(h1 / 1_000).unwrap_or(if h1 < 0 {
-                            i32::MIN
-                        } else {
-                            i32::MAX
-                        }),
+                        h1_minus_h0_us: offset_us(h0, Some(fields.h1_ns)),
                     });
                 }
             }
@@ -1332,5 +1330,39 @@ mod tests {
         assert_eq!(ext.layout_epoch, Some(4));
         // Timing is sampled.
         assert!(extensions(&all, &fields, false).timing.is_none());
+    }
+
+    #[test]
+    fn timing_offsets_are_signed_when_h0_comes_after_capture() {
+        // Windows: H0 is the display time, after WGC delivered the frame (H1)
+        // and sometimes after encode (H3, H4).
+        let fields = FrameFields {
+            h0_ns: Some(20_000_000),
+            h1_ns: 8_300_000,
+            h3_ns: Some(9_000_000),
+            h4_ns: Some(21_500_000),
+            ..FrameFields::default()
+        };
+        let timing = extensions(&[FrameExtension::Timing], &fields, true)
+            .timing
+            .unwrap();
+        assert_eq!(timing.h1_minus_h0_us, -11_700);
+        assert_eq!(timing.h3_us, -11_000);
+        assert_eq!(timing.h4_us, 1_500);
+        assert_eq!(timing.h2_us, WireTiming::NOT_MEASURED);
+        // Saturation never produces the not-measured value.
+        let far = FrameFields {
+            h0_ns: Some(u64::MAX),
+            h1_ns: 0,
+            h3_ns: Some(0),
+            h4_ns: Some(u64::MAX),
+            ..FrameFields::default()
+        };
+        let timing = extensions(&[FrameExtension::Timing], &far, true)
+            .timing
+            .unwrap();
+        assert_eq!(timing.h1_minus_h0_us, i32::MIN + 1);
+        assert_eq!(timing.h3_us, i32::MIN + 1);
+        assert_eq!(timing.h4_us, 0);
     }
 }

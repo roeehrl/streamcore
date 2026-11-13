@@ -97,22 +97,34 @@ impl RefreshPacer {
     }
 
     /// A held frame becomes due at host time `now` because nothing newer came:
-    /// admit it as a frame presented at `max(now, due)`.
+    /// admit it as a frame presented at `max(now, due)`. The hold timer fires
+    /// after the due time, so `now` normally lies within one target interval
+    /// past it and the cadence keeps its phase; a source whose H0 runs ahead
+    /// of the host's `now` (6.3) changes nothing here.
     pub fn admit_held(&mut self, now: u64) {
         let at = self.due.map_or(now, |due| now.max(due));
         let admitted = self.offer(at);
         debug_assert!(admitted);
     }
 
-    /// How long after a held frame's arrival its timer fires: half a refresh
-    /// (plus a little) past the due time, so a frame presented on time still
-    /// arrives first, at most one target interval plus one refresh.
-    pub fn hold_delay_ns(&self, h0: u64) -> u64 {
-        let due = self.due.unwrap_or(h0);
-        let until_due = due.saturating_sub(h0);
-        until_due
+    /// The host time a held frame's timer fires at: half a refresh (plus a
+    /// little) past the due time, so a frame presented on time still arrives
+    /// first. The due time is on the H0 timeline, which is the host clock; a
+    /// held frame's own H0 is no reference for "now", since H0 may come after
+    /// the capture (Windows: the display time).
+    pub fn hold_deadline_ns(&self, h0: u64) -> u64 {
+        self.due
+            .unwrap_or(h0)
             .saturating_add(self.refresh_ns / 2)
             .saturating_add(HOLD_GRACE_NS)
+    }
+
+    /// How long from host time `now` (the held frame's arrival) its timer
+    /// waits: until [`Self::hold_deadline_ns`], at most one target interval
+    /// plus one refresh, and zero when the deadline has passed.
+    pub fn hold_delay_ns(&self, h0: u64, now: u64) -> u64 {
+        self.hold_deadline_ns(h0)
+            .saturating_sub(now)
             .min(self.target_ns.saturating_add(self.refresh_ns))
     }
 }

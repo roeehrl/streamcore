@@ -105,20 +105,30 @@ impl FrameVersion {
     }
 }
 
-/// Stage offsets from H0 (`capture_us`) in microseconds, and H1 − H0, which can be
-/// negative when the capture callback's clock leads the present time.
-/// [`FrameTiming::NOT_MEASURED`] marks a stage the host does not measure (an NV12
-/// path has no H2).
+/// Signed stage offsets from H0 (`capture_us`) in microseconds: H2 − H0, H3 − H0,
+/// H4 − H0 and H1 − H0. Every one can be negative: H0 is the source's display or
+/// present time, which comes after capture (H1) and sometimes after encode on
+/// platforms where capture precedes display (Windows WGC), and H1 − H0 is
+/// negative whenever the capture callback precedes the present time.
+/// [`FrameTiming::NOT_MEASURED`] (`i32::MIN`) marks an H2, H3 or H4 the host does
+/// not measure (an NV12 path has no H2); a measured offset saturates at
+/// `i32::MIN + 1` and `i32::MAX`, so it never takes that value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameTiming {
-    pub h2_us: u32,
-    pub h3_us: u32,
-    pub h4_us: u32,
+    pub h2_us: i32,
+    pub h3_us: i32,
+    pub h4_us: i32,
     pub h1_minus_h0_us: i32,
 }
 impl FrameTiming {
-    pub const NOT_MEASURED: u32 = u32::MAX;
+    /// `0x80000000` on the wire.
+    pub const NOT_MEASURED: i32 = i32::MIN;
     const LENGTH: usize = 16;
+    /// A measured offset in µs, saturated so it never reads as
+    /// [`Self::NOT_MEASURED`].
+    pub fn offset_us(us: i64) -> i32 {
+        i32::try_from(us.clamp(i64::from(i32::MIN) + 1, i64::from(i32::MAX))).unwrap_or(i32::MAX)
+    }
 }
 
 /// Long-term reference state of one frame (`0x04 ltr`).
@@ -202,9 +212,9 @@ impl VideoExtensions {
                 tlv::TIMING => {
                     exact(FrameTiming::LENGTH)?;
                     out.timing = Some(FrameTiming {
-                        h2_us: u32_at(0)?,
-                        h3_us: u32_at(4)?,
-                        h4_us: u32_at(8)?,
+                        h2_us: u32_at(0)? as i32,
+                        h3_us: u32_at(4)? as i32,
+                        h4_us: u32_at(8)? as i32,
                         h1_minus_h0_us: u32_at(12)? as i32,
                     });
                 }

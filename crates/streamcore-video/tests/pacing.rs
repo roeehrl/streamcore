@@ -106,6 +106,55 @@ fn the_due_time_resynchronises_after_idle() {
 }
 
 #[test]
+fn the_hold_deadline_is_absolute_on_the_host_clock() {
+    // A 60 Hz Windows source: H0 (the display time) comes 12 ms after H1.
+    let lead = 12 * MS;
+    let mut pacer = RefreshPacer::new(interval(60), interval(60));
+    assert!(pacer.offer(lead));
+    let due = lead + interval(60);
+    assert_eq!(pacer.due_ns(), Some(due));
+    // An early frame arrives at H1 = 8 ms with H0 = 20 ms: held.
+    let (h1, h0) = (8 * MS, 8 * MS + lead);
+    assert!(!pacer.offer(h0));
+    let deadline = pacer.hold_deadline_ns(h0);
+    assert_eq!(deadline, due + interval(60) / 2 + MS);
+    // Armed from the host's now (H1), not from H0: it fires at the deadline,
+    // not one H1 -> H0 early.
+    assert_eq!(h1 + pacer.hold_delay_ns(h0, h1), deadline);
+    // Capped as before, at a target interval plus a refresh from now; zero
+    // once the deadline has passed.
+    assert_eq!(pacer.hold_delay_ns(h0, 0), interval(60) * 2);
+    assert_eq!(pacer.hold_delay_ns(h0, deadline + MS), 0);
+    // The held frame admitted at the deadline keeps the cadence's phase: the
+    // next frame on time is admitted.
+    pacer.admit_held(deadline);
+    assert_eq!(pacer.due_ns(), Some(due + interval(60)));
+    assert!(pacer.offer(due + interval(60)));
+}
+
+#[test]
+fn h0_after_capture_still_paces_and_resyncs_after_idle() {
+    // H0 = H1 + 12 ms on a 60 Hz panel with ±1 ms jitter: 60 of 60, and every
+    // admission within half a refresh of its due time.
+    let lead = 12 * MS;
+    let mut pacer = RefreshPacer::new(interval(60), interval(60));
+    let admitted = (0..60u64)
+        .map(|k| k * interval(60) + lead + if k % 2 == 0 { MS } else { 0 })
+        .filter(|&h0| pacer.offer(h0))
+        .count();
+    assert_eq!(admitted, 60);
+    // Idle for a second, then frames again: resynchronised, 60 per second.
+    let idle_until = 2 * NS_PER_SECOND + lead;
+    assert!(pacer.offer(idle_until));
+    assert_eq!(pacer.due_ns(), Some(idle_until + interval(60)));
+    let after = (1..60u64)
+        .map(|k| idle_until + k * interval(60))
+        .filter(|&h0| pacer.offer(h0))
+        .count();
+    assert_eq!(after + 1, 60);
+}
+
+#[test]
 fn without_a_refresh_interval_the_pacer_falls_back_to_the_target() {
     let pacer = RefreshPacer::new(interval(60), 0);
     assert_eq!(pacer.refresh_ns(), interval(60));
@@ -465,4 +514,74 @@ fn encoder_submit(s: &Manual, seq: u64) -> SubmitOpts {
         .iter()
         .find(|opts| opts.submit_seq == seq)
         .expect("submitted")
+}
+
+/// A Windows-style frame: captured now (H1) and presented `lead` later (H0,
+/// the composition's display time).
+fn present_ahead(s: &Manual, lead: u64) -> SurfaceId {
+    let now = s.clock.now_ns();
+    let mut info = s.capture.surface(srgb(), now);
+    info.source_present_ns = Some(now + lead);
+    let id = info.id;
+    s.capture.emit_info(info);
+    s.pump();
+    id
+}
+
+#[test]
+fn h0_twelve_ms_after_h1_still_submits_60_frames_per_second_at_60_hz() {
+    let s = paced(Some(interval(60)), |_| {});
+    for k in 0..60u64 {
+        // The measured H1 -> H0 spread: about +12 ms, a little jitter.
+        present_ahead(&s, 12 * MS + (k % 3) * MS / 2);
+        s.encoder().complete_all();
+        s.queue.advance(interval(60));
+    }
+    let stats = s.controller.stats();
+    assert_eq!(stats.submitted, 60);
+    assert_eq!(stats.pacer_held, 0);
+    assert_eq!(stats.pacer_timer_admits, 0);
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn a_held_frame_fires_on_the_host_clock_when_h0_comes_after_capture() {
+    let lead = 12 * MS;
+    let s = paced(Some(interval(60)), |_| {});
+    let t0 = s.clock.now_ns();
+    present_ahead(&s, lead);
+    let encoder = s.encoder();
+    assert_eq!(encoder.pending_seqs(), vec![1]);
+    encoder.complete_all();
+    s.pump();
+    // Due at H0 = t0 + 12 ms + one interval. A frame arriving 8 ms in (H0 =
+    // t0 + 20 ms) is early: held.
+    let due = t0 + lead + interval(60);
+    s.queue.advance(8 * MS);
+    present_ahead(&s, lead);
+    assert!(encoder.pending_seqs().is_empty());
+    // Its timer fires at due + refresh / 2 + 1 ms on the host clock. A delay
+    // measured from H0 would fire 12 ms earlier (t0 + 26 ms).
+    let deadline = due + interval(60) / 2 + MS;
+    s.queue.advance(deadline - MS - s.clock.now_ns());
+    assert!(
+        encoder.pending_seqs().is_empty(),
+        "fired early, at {}",
+        s.clock.now_ns() - t0
+    );
+    s.queue.advance(MS);
+    assert_eq!(encoder.pending_seqs(), vec![2]);
+    assert_eq!(s.controller.stats().pacer_timer_admits, 1);
+    encoder.complete_all();
+    s.pump();
+    // The cadence keeps its phase: due one interval after the held frame's
+    // slot, so the next frame (H1 = t0 + 45 ms, H0 = t0 + 57 ms) is admitted.
+    s.queue.advance(t0 + 45 * MS - s.clock.now_ns());
+    present_ahead(&s, lead);
+    assert_eq!(encoder.pending_seqs(), vec![3]);
+    encoder.complete_all();
+    s.pump();
+    s.close();
+    s.assert_clean();
 }
