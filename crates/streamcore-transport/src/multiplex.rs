@@ -558,7 +558,12 @@ impl Multiplexer {
         if *self.closed.borrow() {
             return Err(ChannelError::Closed);
         }
-        s.bulk_retry_us = None;
+        // Only the writer that serves the bulk lane owns its retry time: on QUIC
+        // each lane has its own writer, and another lane's call must not clear
+        // it, or the bulk writer would wait for a wake-up that never comes.
+        if only.is_none() || only == Some(BULK_LANE) {
+            s.bulk_retry_us = None;
+        }
         if (only.is_none() || only == Some(0))
             && s.credit_streak < 8
             && let Some(record) = self.take_credit(&mut s)?
@@ -1275,6 +1280,41 @@ mod tests {
                 assert_eq!(bulk, 16);
             }
         }
+    }
+
+    /// On QUIC every lane has its own writer: a video writer's call must not
+    /// clear the retry time the bucket gave the bulk writer, or bulk waits for a
+    /// wake-up that never comes once the rate inputs stop moving.
+    #[test]
+    fn another_lanes_writer_keeps_the_bulk_retry_time() {
+        let mux = Multiplexer::with_features(
+            None,
+            None,
+            Features {
+                bulk_token_bucket: true,
+                ..Features::default()
+            },
+        );
+        mux.set_bulk_rates(16_000_000, 15_000_000).unwrap();
+        mux.enqueue(ChannelLane::Video, vec![1]).unwrap();
+        mux.enqueue(ChannelLane::Bulk, vec![2; 16 * CHUNK]).unwrap();
+        while let Some(record) = mux.next(Some(BULK_LANE)).unwrap() {
+            if let Record::Data(f) = record {
+                mux.written(&f).unwrap();
+            }
+        }
+        assert!(mux.sender.lock().unwrap().bulk_retry_us.is_some());
+        // The video lane's writer runs in between.
+        while let Some(record) = mux.next(Some(1)).unwrap() {
+            if let Record::Data(f) = record {
+                mux.written(&f).unwrap();
+            }
+        }
+        let _ = mux.next(Some(0)).unwrap();
+        assert!(
+            mux.sender.lock().unwrap().bulk_retry_us.is_some(),
+            "the bulk writer still has its retry time"
+        );
     }
 
     #[test]
