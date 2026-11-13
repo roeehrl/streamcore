@@ -147,8 +147,9 @@ pub enum KeyframeReason {
     /// More frames waited for the decoder than its queue bound (6.2): they
     /// were flushed.
     QueueBound,
-    /// Reserved: no longer issued. A busy decoder's samples now wait in order
-    /// (a full wait is a `QueueBound` flush).
+    /// No longer issued; kept so the bindings' enum stays stable. A busy
+    /// decoder's samples wait in order, and a full wait is a `QueueBound`
+    /// flush.
     Busy,
     /// The decoder refused a frame ([`DecodeResult::Failed`]).
     DecodeFailed,
@@ -195,7 +196,8 @@ pub struct ClientStats {
     pub flushed: u64,
     /// Decoded frames never presented because a newer one was.
     pub present_drops: u64,
-    /// Two-frame bound flushes (6.2).
+    /// Queue bound flushes (6.2): more frames waited for the decoder than
+    /// `queue_bound`.
     pub queue_flushes: u64,
     /// `decode` returned `Busy`.
     pub busy: u64,
@@ -211,11 +213,16 @@ pub struct ClientStats {
     pub ltr_acks: u64,
     /// Decoder sessions configured.
     pub sessions: u64,
-    /// The current session's decoder queue bound: `max(2, depth + 1)` with
-    /// the depth the larger of `DecoderInfo::max_queued` and
-    /// `learned_depth`, or the provisional bound (at least 4) until the
-    /// session's first output (0 before the first session).
+    /// The current session's decoder queue bound: `max(2, depth + 1)`, or
+    /// the provisional bound (at least 4) until the session's first output
+    /// (0 before the first session).
     pub queue_bound: u32,
+    /// The current session's depth in effect: the larger of
+    /// `DecoderInfo::max_queued` and `learned_depth` (the declared one until
+    /// the first output). Frames a decoder this deep holds back are its
+    /// built-in latency.
+    #[uniffi(default = 0)]
+    pub depth: u32,
     /// The current session's pipeline depth as learned from its first
     /// output: the samples it accepted, from its first keyframe, up to and
     /// including the first one it output (0 until then).
@@ -1518,6 +1525,7 @@ impl ClientState {
                 self.phase = ClientPhase::Running;
                 self.info = Some(info.clone());
                 self.stats.queue_bound = self.queue_bound() as u32;
+                self.stats.depth = u32::from(self.depth());
                 self.notify(
                     cx,
                     ClientJob::Configured {
@@ -1588,10 +1596,17 @@ impl ClientState {
             self.stats.deep_decoder_sessions += 1;
         }
         self.stats.queue_bound = self.queue_bound() as u32;
+        self.stats.depth = u32::from(self.depth());
     }
 
-    /// A frame the receiver passed: the two-frame bound, then the busy hold,
-    /// then `decode`.
+    /// The depth in effect: the larger of the declared and the learned one.
+    fn depth(&self) -> u8 {
+        let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
+        declared.max(self.learned_depth.unwrap_or(0))
+    }
+
+    /// A frame the receiver passed: the queue bound, then the busy hold, then
+    /// `decode`.
     fn submit(&mut self, cx: &Arc<ClientShared>, sample: Sample) {
         if !self.live {
             // No session (a configure failed or a flush hung): the chain
