@@ -86,6 +86,32 @@ doesn't add an entry to `crates/streamcore-input/CHANGES.md`.
 developer paths; it needs a private denylist outside the repository (see the script).
 `ci/local/linux.sh` runs `scripts/ci.sh` in a Linux container (Docker or Colima).
 
+## Example video host
+
+`crates/streamcore-video/examples/video_host.rs` is a platform-neutral host for bringing up
+clients: a real `StreamController` sending on a `SecureChannel`, a timer-driven capture and a
+synthetic encoder that loops a 60-frame 640×360 H.264 clip
+([`examples/data`](crates/streamcore-video/examples/data/README.md)). It runs on macOS, Windows
+and Linux:
+
+```sh
+cargo run --release -p streamcore-video --example video_host -- --listen <lan-ip>:7700 [--pair-port 7701] [--fps 60]
+```
+
+Give it the LAN address clients reach. It prints a connect line for each 120-second pairing
+window, `streamcore-video://<lan-ip>:7700?pair=7701&pin=<pin>&fp=<host fingerprint>`, which a
+client pairs and connects with (the Android harness in `android/` takes it pasted). The client
+advertises the `streamcore.video-demo.v1` capability; a `{"type":"keyframe"}` message of kind
+`0x01` asks for a keyframe (the encoder jumps to the clip's next IDR). The `video_client`
+example is a headless client for the same line: it pairs, connects and prints the decode
+counters without a device (its decoder only counts):
+
+```sh
+cargo run --release -p streamcore-video --example video_client -- '<connect line>' --seconds 10
+```
+
+Both are built, not run, by `cargo test`.
+
 ## Licence
 
 StreamCore is licensed under the [GNU Affero General Public License v3.0](LICENSE).
