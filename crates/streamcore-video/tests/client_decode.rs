@@ -27,15 +27,17 @@ fn the_first_config_packet_configures_the_decoder() {
         [
             Call::Configure {
                 session: 1,
-                config: b"config-5".to_vec()
+                config: b"config-5".to_vec(),
+                color: ColorTags::BT709,
             },
             Call::SetMode(PresentMode::Responsive),
         ]
     );
     assert_eq!(c.stream.phase(), ClientPhase::Running);
     assert_eq!(
-        c.jobs
-            .count(|j| matches!(j, ClientJob::Configured { generation: 5, info } if info.hardware)),
+        c.jobs.count(
+            |j| matches!(j, ClientJob::Configured { generation: 5, info, .. } if info.hardware)
+        ),
         1
     );
     // A repeated configuration of the same generation (before each keyframe)
@@ -43,6 +45,68 @@ fn the_first_config_packet_configures_the_decoder() {
     c.config(5);
     assert_eq!(c.decoder.configures(), 1);
     assert_eq!(c.stats().sessions, 1);
+}
+
+#[test]
+fn each_generation_configures_with_its_own_colour() {
+    let c = Client::new();
+    let colors = || -> Vec<ColorTags> {
+        lock(&c.decoder.calls)
+            .iter()
+            .filter_map(|call| match call {
+                Call::Configure { color, .. } => Some(*color),
+                _ => None,
+            })
+            .collect()
+    };
+    // BT.709, limited range, stated in the SPS's VUI.
+    c.config_bytes(5, &avcc_with_signal(false, Some((1, 1, 1))));
+    // BT.2020 PQ, full range.
+    c.config_bytes(6, &avcc_with_signal(true, Some((9, 16, 9))));
+    // A range without a colour description: the rest from the stream's
+    // default; then a configuration without a VUI at all.
+    c.config_bytes(7, &avcc_with_signal(true, None));
+    c.config(8);
+    let pq = ColorTags {
+        primaries: ColorPrimaries::Bt2020,
+        transfer: TransferFunction::Pq,
+        matrix: YCbCrMatrix::Bt2020,
+        full_range: true,
+    };
+    let full_709 = ColorTags {
+        full_range: true,
+        ..ColorTags::BT709
+    };
+    assert_eq!(colors(), [ColorTags::BT709, pq, full_709, ColorTags::BT709]);
+    assert_eq!(
+        c.jobs.count(
+            |j| matches!(j, ClientJob::Configured { generation: 6, color, .. } if *color == pq)
+        ),
+        1
+    );
+    // A re-creation keeps the generation's colour.
+    c.config_bytes(9, &avcc_with_signal(true, Some((9, 16, 9))));
+    c.key(9, 1);
+    c.advance_ms(500);
+    assert_eq!(c.stats().stalls, 1);
+    assert_eq!(colors().last(), Some(&pq));
+    assert_eq!(c.decoder.configures(), 6);
+}
+
+#[test]
+fn the_effective_queue_bound_and_deep_decoders_are_reported() {
+    let c = Client::new();
+    c.config(5);
+    assert_eq!(
+        (c.stats().queue_bound, c.stats().deep_decoder_sessions),
+        (2, 0)
+    );
+    *lock(&c.decoder.max_queued) = 4;
+    c.config(6);
+    assert_eq!(
+        (c.stats().queue_bound, c.stats().deep_decoder_sessions),
+        (4, 1)
+    );
 }
 
 #[test]
@@ -90,7 +154,7 @@ fn a_new_generation_flushes_then_configures_the_same_decoder_again() {
     let calls = lock(&c.decoder.calls).clone();
     let flush = calls.iter().position(|c| *c == Call::Flush).unwrap();
     assert!(
-        matches!(&calls[flush + 1], Call::Configure { session: 2, config } if config == b"config-6")
+        matches!(&calls[flush + 1], Call::Configure { session: 2, config, .. } if config == b"config-6")
     );
     // The old generation's waiting frame was dropped unshown.
     assert_eq!(c.stats().flushed, 1);
@@ -421,7 +485,7 @@ fn a_decoder_without_output_for_500_ms_is_recreated() {
     // Re-created with the generation's configuration.
     assert!(matches!(
         lock(&c.decoder.calls).iter().rev().find(|c| matches!(c, Call::Configure { .. })),
-        Some(Call::Configure { session: 2, config }) if config == b"config-5"
+        Some(Call::Configure { session: 2, config, .. }) if config == b"config-5"
     ));
     assert_eq!(
         c.jobs.count(|j| *j

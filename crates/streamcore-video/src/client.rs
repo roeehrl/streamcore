@@ -74,9 +74,12 @@ pub struct DecoderInfo {
     /// `RealTime`).
     pub low_latency_confirmed: bool,
     pub hardware: bool,
-    /// Frames the decoder holds before its first output (its pipeline depth;
-    /// 0 or 1 for a low-latency decoder). The decoder queue bound is
-    /// `max(2, max_queued)` (6.2).
+    /// The decoder's real pipeline depth: the inputs it needs before its
+    /// first output (0 or 1 for a low-latency decoder). The decoder queue
+    /// bound is `max(2, max_queued)` (6.2). A depth above 2 is a latency
+    /// cost on every frame (R2 wants zero reorder and no pipeline):
+    /// adapters should prefer a decoder with a depth of 2 or less, and Rust
+    /// counts such sessions (`ClientStats::deep_decoder_sessions`).
     pub max_queued: u8,
     /// Free-form notes for diagnostics: the vendor keys applied, retries with
     /// fewer keys, the decoder's name.
@@ -198,6 +201,14 @@ pub struct ClientStats {
     pub ltr_acks: u64,
     /// Decoder sessions configured.
     pub sessions: u64,
+    /// The current session's decoder queue bound:
+    /// `max(ClientTimings::queue_bound, DecoderInfo::max_queued)` (0 before
+    /// the first session).
+    pub queue_bound: u32,
+    /// Sessions whose decoder declared a pipeline deeper than 2
+    /// (`DecoderInfo::max_queued > 2`): each holds frames back, a latency
+    /// cost on every frame.
+    pub deep_decoder_sessions: u64,
     /// Sessions replaced after a stall, failure or hung flush.
     pub recreates: u64,
     pub stalls: u64,
@@ -235,9 +246,10 @@ pub enum ClientPhase {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum ClientJob {
     /// A decoder session was configured for wire `generation` (the first one
-    /// starts the stream).
+    /// starts the stream) with the generation's colour tags.
     Configured {
         generation: u64,
+        color: ColorTags,
         info: DecoderInfo,
     },
     /// Ask the host for a keyframe. StreamCore has no lane-0 kind for it: the
@@ -324,9 +336,15 @@ impl Default for ClientTimings {
 ///
 /// **Sessions.** Each successful `configure` starts a decoder session with its
 /// own `events` port; calls on a replaced session's port are ignored. A new
-/// wire generation (a resolution, codec or colour change, or any new encoder
-/// on the host) is a new session: Rust calls `flush()` and then `configure()`
-/// again on this same object with the new configuration. A decoder that
+/// wire generation (a resolution or colour change, or any new encoder on the
+/// host) is a new session: Rust calls `flush()` and then `configure()` again
+/// on this same object with the new configuration and that generation's
+/// colour tags (the codec is fixed per stream).
+///
+/// **Pipeline depth.** Prefer a decoder that outputs each frame before it
+/// needs the next (`DecoderInfo::max_queued` of 2 or less): R2 wants zero
+/// reorder, and a deeper pipeline raises the queue bound and delays every
+/// frame by its depth. A decoder that
 /// cannot change its configuration in place tears its platform session down
 /// and creates a new one inside `configure`. Re-creation after a stall or a
 /// failure is the same `flush()` then `configure()`, with the generation's
@@ -439,9 +457,15 @@ impl Clock for TransportClock {
 #[derive(uniffi::Record)]
 pub struct ClientParts {
     pub stream_id: u32,
-    /// The stream's codec and colour (from the consumer's stream-started
-    /// message), passed to every `configure`.
+    /// The stream's codec (from the consumer's stream-started message), fixed
+    /// for the stream and passed to every `configure`.
     pub codec: Codec,
+    /// The colour assumed where a generation's configuration does not state
+    /// it. Each generation's colour comes from its configuration: for H.264
+    /// the SPS's VUI `video_signal_type` (range, and primaries, transfer and
+    /// matrix when it has a colour description); a field it leaves out or
+    /// marks unspecified, and every field for HEVC (its VUI is not parsed
+    /// yet), takes this value.
     pub color: ColorTags,
     pub mode: PresentMode,
     pub port: Arc<StreamPort>,
@@ -991,6 +1015,9 @@ struct ClientState {
     me: Weak<ClientShared>,
     stream_id: u32,
     codec: Codec,
+    /// `ClientParts::color`: where a configuration leaves colour unstated.
+    default_color: ColorTags,
+    /// The current generation's colour tags.
     color: ColorTags,
     mode: PresentMode,
     timings: ClientTimings,
@@ -1079,6 +1106,7 @@ impl ClientState {
             me,
             stream_id,
             codec,
+            default_color: color,
             color,
             mode,
             timings,
@@ -1407,6 +1435,7 @@ impl ClientState {
                 self.live = false;
             }
         }
+        self.color = config_color(self.codec, &config, self.default_color);
         self.config = Some(config.clone());
         self.open_session(cx, config);
     }
@@ -1435,12 +1464,17 @@ impl ClientState {
                 decoder.set_mode(self.mode);
                 self.last_progress_ns = cx.clock.now_ns();
                 self.stats.sessions += 1;
+                if info.max_queued > 2 {
+                    self.stats.deep_decoder_sessions += 1;
+                }
+                self.stats.queue_bound = u32::from(self.timings.queue_bound.max(info.max_queued));
                 self.phase = ClientPhase::Running;
                 self.info = Some(info.clone());
                 self.notify(
                     cx,
                     ClientJob::Configured {
                         generation: self.generation,
+                        color: self.color,
                         info,
                     },
                 );
@@ -1901,7 +1935,13 @@ impl ClientState {
     /// One `videoFeedback` for the current generation, if anything changed:
     /// frames that finished or waited one interval since C1 (each reported
     /// once, at most 32, the newest), missing sequences, the counters and a
-    /// new LTR acknowledgement.
+    /// new LTR acknowledgement. The loss bitmap lists every sequence this
+    /// client did not receive, including discardable frames the host's sink
+    /// shed: the host ignores sequences its sink shed when it uses the bitmap
+    /// for rate adaptation or recovery, and a missing discardable sequence
+    /// does not break the chain (design 6.5). Whether C5 was estimated has no
+    /// field in the per-frame entry; it is counted in
+    /// `ClientStats::presented_estimated`.
     fn send_feedback(&mut self, cx: &Arc<ClientShared>) {
         self.cancel_timer(TimerKind::Feedback);
         if !self.dirty || self.generation == 0 {
@@ -2012,5 +2052,47 @@ impl ClientState {
         self.decoder = None;
         self.events = None;
         self.transport = None;
+    }
+}
+
+/// A generation's colour tags from its configuration (H.264: the SPS's VUI),
+/// each field `default` where the configuration does not state it.
+fn config_color(codec: Codec, config: &[u8], default: ColorTags) -> ColorTags {
+    use crate::types::{ColorPrimaries, TransferFunction, YCbCrMatrix};
+    let signal = match codec {
+        Codec::H264 => streamcore_media::h264::VideoSignal::from_avcc(config),
+        // The HEVC VUI is not parsed yet.
+        Codec::Hevc | Codec::Av1 => None,
+    };
+    let Some(signal) = signal else {
+        return default;
+    };
+    // ITU-T H.273 code points.
+    let primaries = match signal.primaries {
+        Some(1) => ColorPrimaries::Bt709,
+        Some(9) => ColorPrimaries::Bt2020,
+        Some(12) => ColorPrimaries::DisplayP3,
+        _ => default.primaries,
+    };
+    let transfer = match signal.transfer {
+        Some(1 | 6 | 14 | 15) => TransferFunction::Bt709,
+        Some(8) => TransferFunction::Linear,
+        Some(13) => TransferFunction::Srgb,
+        Some(16) => TransferFunction::Pq,
+        Some(18) => TransferFunction::Hlg,
+        _ => default.transfer,
+    };
+    let matrix = match signal.matrix {
+        Some(0) => YCbCrMatrix::Identity,
+        Some(1) => YCbCrMatrix::Bt709,
+        Some(5 | 6) => YCbCrMatrix::Bt601,
+        Some(9) => YCbCrMatrix::Bt2020,
+        _ => default.matrix,
+    };
+    ColorTags {
+        primaries,
+        transfer,
+        matrix,
+        full_range: signal.full_range,
     }
 }

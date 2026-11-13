@@ -24,7 +24,11 @@ pub const START_NS: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
-    Configure { session: usize, config: Vec<u8> },
+    Configure {
+        session: usize,
+        config: Vec<u8>,
+        color: ColorTags,
+    },
     Decode(SampleMeta),
     Flush,
     SetMode(PresentMode),
@@ -148,12 +152,16 @@ impl StreamDecoder for FakeDecoder {
         &self,
         _codec: Codec,
         config: Vec<u8>,
-        _color: ColorTags,
+        color: ColorTags,
         _queue: Arc<dyn SerialQueue>,
         events: Arc<dyn DecoderEvents>,
     ) -> Result<DecoderInfo, MediaError> {
         let session = self.sessions() + 1;
-        self.note(Call::Configure { session, config });
+        self.note(Call::Configure {
+            session,
+            config,
+            color,
+        });
         if let Some(error) = lock(&self.configure_errors).pop_front() {
             return Err(error);
         }
@@ -334,6 +342,10 @@ impl Client {
     }
 
     pub fn config(&self, generation: u64) {
+        self.config_bytes(generation, format!("config-{generation}").as_bytes());
+    }
+
+    pub fn config_bytes(&self, generation: u64, config: &[u8]) {
         self.deliver(
             VideoMetadata {
                 stream_id: STREAM,
@@ -343,7 +355,7 @@ impl Client {
                 pts_micros: 0,
             },
             VideoExtensions::default(),
-            format!("config-{generation}").as_bytes(),
+            config,
         );
     }
 
@@ -416,4 +428,62 @@ impl Client {
     pub fn stats(&self) -> ClientStats {
         self.stream.stats()
     }
+}
+
+/// An `avcC` whose SPS (Main profile, 1920×1080) has a VUI with
+/// `video_signal_type`: the range and, if given, H.273 primaries, transfer and
+/// matrix.
+pub fn avcc_with_signal(full_range: bool, colour: Option<(u8, u8, u8)>) -> Vec<u8> {
+    let mut bits = Vec::<bool>::new();
+    let mut put = |value: u32, n: u32| {
+        for i in (0..n).rev() {
+            bits.push((value >> i) & 1 == 1);
+        }
+    };
+    let ue = |put: &mut dyn FnMut(u32, u32), value: u32| {
+        let v = value + 1;
+        let len = 32 - v.leading_zeros();
+        put(0, len - 1);
+        put(v, len);
+    };
+    put(77, 8); // profile_idc
+    put(0, 16);
+    ue(&mut put, 0); // seq_parameter_set_id
+    ue(&mut put, 0); // log2_max_frame_num_minus4
+    ue(&mut put, 2); // pic_order_cnt_type
+    ue(&mut put, 1); // max_num_ref_frames
+    put(0, 1);
+    ue(&mut put, 119);
+    ue(&mut put, 67);
+    put(1, 1); // frame_mbs_only_flag
+    put(1, 1); // direct_8x8_inference_flag
+    put(0, 1); // frame_cropping_flag
+    put(1, 1); // vui_parameters_present_flag
+    put(0, 1); // aspect_ratio_info_present_flag
+    put(0, 1); // overscan_info_present_flag
+    put(1, 1); // video_signal_type_present_flag
+    put(5, 3);
+    put(u32::from(full_range), 1);
+    match colour {
+        Some((p, t, m)) => {
+            put(1, 1);
+            put(u32::from(p), 8);
+            put(u32::from(t), 8);
+            put(u32::from(m), 8);
+        }
+        None => put(0, 1),
+    }
+    put(0, 1);
+    put(1, 1); // stop bit
+    let mut sps = vec![0x67];
+    sps.extend(bits.chunks(8).map(|c| {
+        c.iter()
+            .enumerate()
+            .fold(0u8, |b, (i, &x)| b | (u8::from(x) << (7 - i)))
+    }));
+    let mut avcc = vec![1, 77, 0, 40, 0xff, 0xe1];
+    avcc.extend((sps.len() as u16).to_be_bytes());
+    avcc.extend(&sps);
+    avcc.extend([1, 0, 2, 0x68, 0xce]);
+    avcc
 }
