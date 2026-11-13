@@ -367,7 +367,12 @@ waits in the mailbox, no longer counts against the queue bound.
 **Sessions.** Each successful `configure` is a decoder session with its own `DecoderEvents` port;
 events carry the session, and a replaced session's events are counted as stale and ignored, as are
 events naming no waiting frame. A new wire generation is a new session: the executor calls
-`flush()` and then `configure()` again on the same `StreamDecoder` with the new configuration.
+`flush()` and then `configure()` again on the same `StreamDecoder` with the new configuration and
+the generation's colour tags. The codec is fixed per stream (`ClientParts::codec`); the colour is
+read from each configuration, because the host states it nowhere else: for H.264 the SPS's VUI
+`video_signal_type` (range, and the H.273 primaries, transfer and matrix when it has a colour
+description). A field the VUI leaves out or marks unspecified, and every field for HEVC (whose VUI
+is not parsed yet), takes `ClientParts::color`. `ClientJob::Configured` carries the tags used.
 Re-creation after a stall, a failure or a hung flush is the same `flush()` then `configure()`
 with the generation's configuration, followed by `VideoReceiver::require_keyframe` and a keyframe
 request. More than 3 re-creations (or failed configures) in 10 s fail the stream. After every
@@ -388,7 +393,11 @@ session hung: its frames are dropped and it is re-created.
   stream; another error drops the configuration (`reject_config`) until the host repeats it before
   its next keyframe.
 - **Queue bound (6.2).** When `max(2, DecoderInfo::max_queued)` frames already wait for the decoder
-  (accepted and not output, or held while it is busy), the next frame flushes them all. A keyframe
+  (accepted and not output, or held while it is busy), the next frame flushes them all.
+  `max_queued` is the decoder's real pipeline depth (the inputs it needs before its first output).
+  The effective bound is `ClientStats::queue_bound`; a session deeper than 2 is a latency cost on
+  every frame (R2 wants zero reorder), counted in `ClientStats::deep_decoder_sessions`, and
+  adapters should prefer decoders with a depth of 2 or less. A keyframe
   is then decoded; any other frame is dropped too, and a keyframe is requested (`QueueBound`).
 - **Busy.** After `DecodeResult::Busy` the executor holds the sample (Rust keeps a copy of every
   sample until the decoder accepts it) and submits nothing more until `input_ready`, which submits
@@ -421,8 +430,11 @@ session hung: its frames are dropped and it is re-created.
   frame is reported once, when nothing more will happen to it or one interval after its C1. A new
   generation sends the old one's pending report first. With a frames.v4 channel
   (`ClientParts::channel`) the executor enqueues it on lane 0 itself, as the host's sink writes
-  `frameTiming`; otherwise it posts the same enveloped bytes as `ClientJob::Feedback`. The wire
-  format has no field for whether C5 was estimated; that is counted in
+  `frameTiming`; otherwise it posts the same enveloped bytes as `ClientJob::Feedback`. The loss
+  bitmap lists every sequence the client did not receive, including discardable frames the host's
+  sink shed: the host ignores sequences its sink shed when it uses the bitmap for rate adaptation
+  or recovery, and a missing discardable sequence does not break the chain (design 6.5). The
+  per-frame entry has no flags, so whether C5 was estimated is not on the wire; it is counted in
   `ClientStats::presented_estimated` only.
 
 **Close.** `begin_close` posts `Close` and returns; the async `close()` (Kotlin `closeStream()`)
@@ -445,7 +457,8 @@ wake per delivered frame); `sink.rs` the sink with its bounds on (R1 for an idle
 rule, `SinkState` and the pacer's gate, the consumed-credit RTT, refusals, revocation, rate inputs,
 `frameTiming`); `sink_loopback.rs` the sink on a real channel beside a bulk transfer;
 `client_decode.rs` the client stream's policy on a fake decoder (sessions and generation changes,
-the queue bound, busy decoders, events from inside `decode`, stale events, stalls, failures and
+the generation's colour, the queue bound and deep decoders, busy decoders, events from inside
+`decode`, stale events, stalls, failures and
 the re-creation budget, keyframe requests and their rate limit, LTR acknowledgement and wait,
 feedback, close); `client_loopback.rs` a client stream on a real channel, its feedback arriving
 at the host.

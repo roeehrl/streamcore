@@ -111,6 +111,11 @@ datagram mode), 38 bytes plus optional parts:
 | frame count (0–32) | u8 |
 | per frame: sequence (nonzero) u64, C1 message complete u64, C3 decoded u64, C5 presented u64; 0 = stage not reached | 32 each |
 
+The loss bitmap lists every sequence the client did not receive; the host ignores sequences its
+sink shed when it uses the bitmap for rate adaptation or recovery; a missing discardable sequence
+does not break the chain (design 6.5). The per-frame entry has no flags: whether C5 was measured
+or estimated is not on the wire.
+
 **`0x13` videoNack** (datagram mode only): stream ID u32, generation u64
 (nonzero), sequence u64 (nonzero), count u16 (1–1024), then `count` u16 fragment
 indices in strictly increasing order. 22 + 2 × count bytes.

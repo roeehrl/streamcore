@@ -668,7 +668,8 @@ receiver, configures, decodes, flushes and re-creates the decoder, requests keyf
 consumer (`ClientEvents`, a post-only job queue; StreamCore has no lane-0 kind for them) at most
 twice per second, waits 150 ms for an LTR refresh while an acknowledged LTR is in use, re-creates
 a decoder with no output for 500 ms, and sends `videoFeedback` on lane 0 itself. A new wire
-generation is `flush()` then `configure()` on the same decoder. Its threading and policy are in
+generation is `flush()` then `configure()` on the same decoder, with that generation's colour
+tags read from its configuration (H.264: the SPS's VUI); the codec is fixed per stream. Its threading and policy are in
 [threading](VIDEO-THREADING.md#client).
 
 - **Apple:** today samples go straight into `AVSampleBufferDisplayLayer` (C5 an estimate). From P2
