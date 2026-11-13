@@ -187,6 +187,7 @@ impl EncoderFactory for MfEncoderFactory {
                 dynamic_rate: true,
                 min_inputs_before_output: u8::try_from(min).unwrap_or(u8::MAX),
                 vui_checked: true,
+                max_frame_qp: false,
             })
             .collect()
     }

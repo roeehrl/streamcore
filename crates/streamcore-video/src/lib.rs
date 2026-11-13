@@ -11,6 +11,7 @@
 //! Each stream has exactly one serial executor ([`StreamController`] over a
 //! [`SerialQueue`]); the threading and reentrancy rules are in [`threading`].
 
+pub mod abr;
 pub mod bitstream;
 pub mod bounded;
 pub mod canvas;
