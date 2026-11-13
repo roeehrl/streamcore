@@ -334,6 +334,9 @@ pub(crate) struct SinkUnit {
     pub(crate) generation: u64,
     pub(crate) sequence: u64,
     pub(crate) keyframe: bool,
+    /// An LTR refresh (6.5): like a keyframe it ends a recovery and is never
+    /// shed by the delta age bound, but it supersedes nothing.
+    pub(crate) refresh: bool,
     pub(crate) discardable: bool,
     /// The configuration message (if any), then the payload message.
     pub(crate) messages: Vec<Vec<u8>>,
@@ -353,11 +356,8 @@ pub(crate) enum Shed {
 /// What the sink reports to the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SinkEvent {
-    Written {
-        encoder: u64,
-        sequence: u64,
-        keyframe: bool,
-    },
+    /// A keyframe or an LTR refresh was written (it can end a recovery).
+    Written { encoder: u64, sequence: u64 },
     /// Refused or failed by the transport (a loss).
     Failed {
         encoder: u64,
@@ -510,6 +510,8 @@ struct Transit {
     generation: u64,
     sequence: u64,
     keyframe: bool,
+    /// A keyframe or an LTR refresh.
+    restores: bool,
     h5_ns: u64,
     h5_us: u64,
     enqueued_ns: u64,
@@ -887,7 +889,11 @@ impl Inner {
                     return false;
                 }
                 // Rule 2's hook: only with confirmed LTR or temporal layers.
-                if self.age_bound && !q.keyframe && now.saturating_sub(queued.h5_ns) > bound {
+                if self.age_bound
+                    && !q.keyframe
+                    && !q.refresh
+                    && now.saturating_sub(queued.h5_ns) > bound
+                {
                     shed.push((q.encoder, q.sequence, Shed::Aged));
                     return false;
                 }
@@ -954,6 +960,7 @@ impl Inner {
                 generation: unit.generation,
                 sequence: unit.sequence,
                 keyframe: unit.keyframe,
+                restores: unit.keyframe || unit.refresh,
                 h5_ns,
                 h5_us,
                 enqueued_ns: now,
@@ -989,13 +996,12 @@ impl Inner {
                         .min(u128::from(MAX_CAPACITY_BPS)) as u64;
                     core.capacity.push_back((now, bps));
                 }
-                // Only a keyframe matters to the executor (it can end a
-                // recovery); a written delta posts nothing.
-                if transit.keyframe {
+                // Only a keyframe or an LTR refresh matters to the executor (it
+                // can end a recovery); a written delta posts nothing.
+                if transit.restores {
                     core.events.push(SinkEvent::Written {
                         encoder: transit.encoder,
                         sequence: transit.sequence,
-                        keyframe: true,
                     });
                 }
                 self.frame_timing(core, &transit, at_us);

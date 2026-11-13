@@ -243,3 +243,234 @@ fn every_permit_release_calls_the_hook_once_and_close_races_admit_nothing() {
         assert!(queue.is_closed() && queue.acquire().is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Temporal layers and LTR (STREAMCORE-VIDEO.md 6.5).
+
+mod h264 {
+    //! Minimal H.264 bitstream pieces: an avcC with a High-profile SPS
+    //! (log2_max_frame_num 4) and one-slice access units.
+
+    #[derive(Default)]
+    struct Writer(Vec<bool>);
+
+    impl Writer {
+        fn bits(&mut self, value: u32, n: u8) {
+            for i in (0..n).rev() {
+                self.0.push((value >> i) & 1 == 1);
+            }
+        }
+        fn ue(&mut self, value: u32) {
+            let v = value + 1;
+            let len = 32 - v.leading_zeros();
+            self.bits(0, (len - 1) as u8);
+            self.bits(v, len as u8);
+        }
+        fn bytes(mut self) -> Vec<u8> {
+            self.0.push(true);
+            self.0
+                .chunks(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u8, |b, (i, &x)| b | (u8::from(x) << (7 - i)))
+                })
+                .collect()
+        }
+    }
+
+    pub fn avcc() -> Vec<u8> {
+        let mut w = Writer::default();
+        w.bits(100, 8);
+        w.bits(0, 16);
+        w.ue(0);
+        w.ue(1);
+        w.ue(0);
+        w.ue(0);
+        w.bits(0, 2);
+        w.ue(0); // log2_max_frame_num_minus4
+        w.ue(0);
+        let mut sps = vec![0x67];
+        sps.extend(w.bytes());
+        let mut out = vec![1, 100, 0, 0x1f, 0xff, 0xe1];
+        out.extend((sps.len() as u16).to_be_bytes());
+        out.extend(sps);
+        out.extend([1, 0, 2, 0x68, 0xce]);
+        out
+    }
+
+    /// One access unit: a slice with `frame_num`, a reference picture unless
+    /// `discardable`.
+    pub fn unit(frame_num: u32, idr: bool, discardable: bool) -> Vec<u8> {
+        let mut w = Writer::default();
+        w.ue(0);
+        w.ue(if idr { 7 } else { 5 });
+        w.ue(0);
+        w.bits(frame_num, 4);
+        let nal_ref_idc = if discardable { 0 } else { 3 };
+        let mut nal = vec![(nal_ref_idc << 5) | if idr { 5 } else { 1 }];
+        nal.extend(w.bytes());
+        nal.extend([0x55; 40]);
+        let mut out = (nal.len() as u32).to_be_bytes().to_vec();
+        out.extend(nal);
+        out
+    }
+}
+
+use streamcore_media::stream::ReceivedFrame;
+
+fn frame(head: Vec<u8>) -> ReceivedFrame {
+    ReceivedFrame {
+        ltr_token: 0,
+        ltr_flags: 0,
+        head,
+    }
+}
+
+fn ltr(token: u32, flags: u8, head: Vec<u8>) -> ReceivedFrame {
+    ReceivedFrame {
+        ltr_token: token,
+        ltr_flags: flags,
+        head,
+    }
+}
+
+/// Two temporal layers as VideoToolbox makes them: frame_num advances only
+/// after layer-0 (reference) pictures; layer-1 pictures are non-reference.
+fn layered_unit(sequence: u64) -> Vec<u8> {
+    // Sequence 1 is the IDR (frame_num 0); then layer 1 on even sequences.
+    if sequence == 1 {
+        return h264::unit(0, true, false);
+    }
+    let references_before = (sequence / 2) as u32; // layer-0 pictures before it
+    h264::unit(references_before % 16, false, sequence.is_multiple_of(2))
+}
+
+fn configured_layered() -> VideoReceiver {
+    let r = VideoReceiver::new(7);
+    assert_eq!(
+        r.accept_frame(packet(1, 0, 2), frame(h264::avcc())),
+        Configure
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 1, 1), frame(layered_unit(1))),
+        Decode
+    );
+    r
+}
+
+#[test]
+fn a_missing_discardable_frame_does_not_break_the_chain() {
+    let r = configured_layered();
+    assert_eq!(
+        r.accept_frame(packet(1, 2, 0), frame(layered_unit(2))),
+        Decode
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 3, 0), frame(layered_unit(3))),
+        Decode
+    );
+    // Sequence 4 (layer 1, non-reference) was shed: 5 still follows 3.
+    assert_eq!(
+        r.accept_frame(packet(1, 5, 0), frame(layered_unit(5))),
+        Decode
+    );
+    // So were 6 and 8 around a received 7, and frame_num wraps at 16.
+    assert_eq!(
+        r.accept_frame(packet(1, 7, 0), frame(layered_unit(7))),
+        Decode
+    );
+    for sequence in (9..=41).step_by(2) {
+        assert_eq!(
+            r.accept_frame(packet(1, sequence, 0), frame(layered_unit(sequence))),
+            Decode,
+            "sequence {sequence}"
+        );
+    }
+}
+
+#[test]
+fn a_missing_reference_frame_breaks_the_chain() {
+    let r = configured_layered();
+    assert_eq!(
+        r.accept_frame(packet(1, 2, 0), frame(layered_unit(2))),
+        Decode
+    );
+    // Sequence 3 (layer 0, a reference) is missing: 4 and 5 cannot decode.
+    assert_eq!(
+        r.accept_frame(packet(1, 4, 0), frame(layered_unit(4))),
+        Recover
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 5, 0), frame(layered_unit(5))),
+        Recover
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 6, 1), frame(h264::unit(0, true, false))),
+        Decode
+    );
+}
+
+#[test]
+fn without_h264_parameters_every_gap_is_a_break() {
+    let r = VideoReceiver::new(7);
+    assert_eq!(
+        r.accept_frame(packet(1, 0, 2), frame(b"hvcC".to_vec())),
+        Configure
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 1, 1), frame(layered_unit(1))),
+        Decode
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 3, 0), frame(layered_unit(3))),
+        Recover
+    );
+    // `accept` (no payload) keeps the old rule too.
+    let r = configured_layered();
+    assert_eq!(r.accept(packet(1, 3, 0)), Recover);
+}
+
+#[test]
+fn an_ltr_refresh_restores_the_chain_only_from_a_decoded_token() {
+    let r = configured_layered();
+    assert_eq!(
+        r.accept_frame(packet(1, 2, 0), ltr(2, 0x01, h264::unit(1, false, false))),
+        Decode
+    );
+    r.note_ltr_decoded(1, 2);
+    // Frames 3–5 are lost; 6 is a refresh from token 2 (frame_num jumps).
+    assert_eq!(
+        r.accept_frame(packet(1, 6, 0), ltr(2, 0x02, h264::unit(5, false, false))),
+        Decode
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 7, 0), frame(h264::unit(6, false, false))),
+        Decode
+    );
+    // A refresh from a token never decoded cannot repair a break.
+    assert_eq!(
+        r.accept_frame(packet(1, 9, 0), frame(h264::unit(8, false, false))),
+        Recover
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 10, 0), ltr(9, 0x02, h264::unit(9, false, false))),
+        Recover
+    );
+    // A flushed decoder holds no LTR frames.
+    r.require_keyframe();
+    assert_eq!(
+        r.accept_frame(packet(1, 11, 0), ltr(2, 0x02, h264::unit(10, false, false))),
+        Recover
+    );
+    // Tokens of another generation are not taken.
+    r.note_ltr_decoded(2, 7);
+    assert_eq!(
+        r.accept_frame(packet(1, 12, 0), ltr(7, 0x02, h264::unit(11, false, false))),
+        Recover
+    );
+    assert_eq!(
+        r.accept_frame(packet(1, 13, 1), frame(h264::unit(0, true, false))),
+        Decode
+    );
+}

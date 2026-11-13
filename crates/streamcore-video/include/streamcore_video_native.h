@@ -54,8 +54,10 @@ bool streamcore_video_attach_stream(uint64_t port, streamcore_video_stream_callb
 #define STREAMCORE_VIDEO_ERROR_ENCODER_FAILED_RECOVERABLE 7
 #define STREAMCORE_VIDEO_ERROR_TIMEOUT 8
 #define STREAMCORE_VIDEO_ERROR_INTERNAL 9
+// ltr_acknowledged: SubmitOpts.ltrAcknowledged (0: none); ltr_refresh: SubmitOpts.ltrRefresh.
 typedef int32_t (*streamcore_video_submit_fn)(void *encoder, uint64_t surface, uint64_t submit_seq,
-                                               uint64_t pts_ns, uint64_t capture_ns, bool force_keyframe);
+                                               uint64_t pts_ns, uint64_t capture_ns, bool force_keyframe,
+                                               uint32_t ltr_acknowledged, bool ltr_refresh);
 
 // Attaches `submit` for the encoder whose EncoderSpec.sink has key `sink`; call it from
 // EncoderFactory.create before returning `encoder`, the encoder object returned.

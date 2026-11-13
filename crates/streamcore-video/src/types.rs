@@ -462,6 +462,15 @@ pub struct EncoderSpec {
     pub color: ColorTags,
     pub adapter: Option<u64>,
     pub sink: Arc<VideoSinkHandle>,
+    /// Mark long-term reference frames (6.5): set only when the plan's
+    /// recovery has [`RecoveryStep::LtrRefresh`], which the planner allows only
+    /// for confirmed caps ([`encoder_plan_features`]).
+    #[uniffi(default = false)]
+    pub ltr: bool,
+    /// Two temporal layers, the upper one discardable (6.5): set only when the
+    /// plan's extensions have [`FrameExtension::TemporalId`].
+    #[uniffi(default = false)]
+    pub temporal_layers: bool,
 }
 
 impl std::fmt::Debug for EncoderSpec {
@@ -475,6 +484,8 @@ impl std::fmt::Debug for EncoderSpec {
             .field("input_format", &self.input_format)
             .field("color", &self.color)
             .field("adapter", &self.adapter)
+            .field("ltr", &self.ltr)
+            .field("temporal_layers", &self.temporal_layers)
             .finish_non_exhaustive()
     }
 }
@@ -498,6 +509,16 @@ pub struct SubmitOpts {
     /// H0 or H1 of the image, kept on recovery re-encodes.
     pub capture_ns: u64,
     pub force_keyframe: bool,
+    /// Encode this frame predicted only from an LTR frame the client
+    /// acknowledged (6.5); never set with `force_keyframe`. An encoder that
+    /// cannot outputs a keyframe or a plain delta (the executor then escalates
+    /// to an IDR).
+    #[uniffi(default = false)]
+    pub ltr_refresh: bool,
+    /// A newly acknowledged LTR token (the frame's `LtrInfo::token`), passed
+    /// once, on the first submit after the client's acknowledgement arrived.
+    #[uniffi(default = None)]
+    pub ltr_acknowledged: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
@@ -533,10 +554,26 @@ pub enum BitstreamForm {
     AnnexB,
 }
 
+/// A frame's LTR state (9.4 `ltr`): `token` is nonzero; `flags` has
+/// [`LtrInfo::MARK`] (this frame is stored as LTR `token`) and/or
+/// [`LtrInfo::REFRESH`] (this frame is predicted only from LTR `token`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct LtrInfo {
     pub token: u32,
     pub flags: u8,
+}
+
+impl LtrInfo {
+    pub const MARK: u8 = 0x01;
+    pub const REFRESH: u8 = 0x02;
+
+    pub fn marks(&self) -> bool {
+        self.token != 0 && self.flags & Self::MARK != 0
+    }
+
+    pub fn refreshes(&self) -> bool {
+        self.token != 0 && self.flags & Self::REFRESH != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Record)]
@@ -816,6 +853,21 @@ pub struct StatsSnapshot {
     /// Refresh-aligned admission has no refresh interval and uses the target
     /// interval instead.
     pub refresh_fallback: bool,
+    /// Recovery (6.5): LTR refreshes submitted (also in `recoveries`).
+    #[uniffi(default = 0)]
+    pub ltr_refreshes: u64,
+    /// LTR refreshes the encoder answered with neither a refresh nor a
+    /// keyframe, or that were lost before they were written; each escalated
+    /// the recovery to an IDR.
+    #[uniffi(default = 0)]
+    pub ltr_refresh_failed: u64,
+    /// Client LTR acknowledgements taken (`note_ltr_ack`).
+    #[uniffi(default = 0)]
+    pub ltr_acks: u64,
+    /// Acknowledgements ignored: another generation, a token the current
+    /// encoder did not mark, or older than the one held.
+    #[uniffi(default = 0)]
+    pub ltr_acks_ignored: u64,
     /// Canvas (3.9): composites drawn.
     #[uniffi(default = 0)]
     pub canvas_composed: u64,
@@ -930,4 +982,55 @@ pub struct StreamUpdate {
     pub capture: CaptureUpdate,
     pub encode_width: Option<u32>,
     pub encode_height: Option<u32>,
+}
+
+/// The recovery steps and frame extensions an encoder's caps allow (3.3, 6.4,
+/// 6.5): what a planner puts in [`StreamPlan::recovery`] and
+/// [`StreamPlan::extensions`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct EncoderPlanFeatures {
+    /// Always ends with [`RecoveryStep::Idr`].
+    pub recovery: Vec<RecoveryStep>,
+    /// Only the layer and LTR extensions (`Discardable`, `TemporalId`, `Ltr`);
+    /// the consumer adds the others it sends.
+    pub extensions: Vec<FrameExtension>,
+}
+
+/// The planner rule for LTR and temporal layers: each only from **confirmed**
+/// caps (a probe session accepted the setting and its output carried it), and
+/// only when the client takes it (`client_ltr`: it acknowledges LTR tokens
+/// after decode and understands the `ltr` extension; `client_temporal_layers`:
+/// it understands `discardable` and `temporal_id` and does not treat a missing
+/// discardable frame as a chain break). `caps` `None`: no probe, nothing but
+/// IDR. Intra refresh is listed when confirmed; no executor step uses it yet.
+#[uniffi::export]
+pub fn encoder_plan_features(
+    caps: Option<EncoderCaps>,
+    client_ltr: bool,
+    client_temporal_layers: bool,
+) -> EncoderPlanFeatures {
+    let mut recovery = Vec::new();
+    let mut extensions = Vec::new();
+    if let Some(caps) = caps {
+        if caps.ltr == FeatureSupport::Confirmed && client_ltr {
+            recovery.push(RecoveryStep::LtrRefresh);
+        }
+        if caps.intra_refresh == FeatureSupport::Confirmed {
+            recovery.push(RecoveryStep::IntraRefresh);
+        }
+        if caps.temporal_layers == FeatureSupport::Confirmed && client_temporal_layers {
+            extensions.push(FrameExtension::Discardable);
+        }
+        if recovery.contains(&RecoveryStep::LtrRefresh) {
+            extensions.push(FrameExtension::Ltr);
+        }
+        if caps.temporal_layers == FeatureSupport::Confirmed && client_temporal_layers {
+            extensions.push(FrameExtension::TemporalId);
+        }
+    }
+    recovery.push(RecoveryStep::Idr);
+    EncoderPlanFeatures {
+        recovery,
+        extensions,
+    }
 }

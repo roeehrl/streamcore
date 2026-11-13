@@ -35,7 +35,7 @@
 
 use crate::error::MediaError;
 use crate::executor::{Shared, StreamPort, VideoSinkHandle, lock};
-use crate::types::{BitstreamForm, EncodeTimings, EncodedFrame, LtrInfo};
+use crate::types::{BitstreamForm, EncodeTimings, EncodedFrame, LtrInfo, SubmitOpts};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -114,7 +114,8 @@ pub type WakeFn = extern "C" fn(queue: *mut c_void);
 /// `streamcore_video_stream_callbacks.release`: `CaptureBackend::release`.
 pub type ReleaseFn = extern "C" fn(capture: *mut c_void, surface: u64);
 /// `streamcore_video_submit_fn`: `StreamEncoder::submit`, returning one of the
-/// `SUBMIT_*` codes.
+/// `SUBMIT_*` codes. `ltr_acknowledged` is `SubmitOpts::ltr_acknowledged`
+/// (`0`: none) and `ltr_refresh` is `SubmitOpts::ltr_refresh`.
 pub type SubmitFn = extern "C" fn(
     encoder: *mut c_void,
     surface: u64,
@@ -122,6 +123,8 @@ pub type SubmitFn = extern "C" fn(
     pts_ns: u64,
     capture_ns: u64,
     force_keyframe: bool,
+    ltr_acknowledged: u32,
+    ltr_refresh: bool,
 ) -> i32;
 
 /// `streamcore_video_stream_callbacks`: the per-frame calls of a stream's
@@ -227,21 +230,16 @@ pub(crate) enum Submitted {
 }
 
 impl NativeSubmit {
-    pub(crate) fn call(
-        self,
-        surface: u64,
-        submit_seq: u64,
-        pts_ns: u64,
-        capture_ns: u64,
-        force_keyframe: bool,
-    ) -> Submitted {
+    pub(crate) fn call(self, surface: u64, opts: &SubmitOpts) -> Submitted {
         match (self.1)(
             self.0.get(),
             surface,
-            submit_seq,
-            pts_ns,
-            capture_ns,
-            force_keyframe,
+            opts.submit_seq,
+            opts.pts_ns,
+            opts.capture_ns,
+            opts.force_keyframe,
+            opts.ltr_acknowledged.unwrap_or(0),
+            opts.ltr_refresh,
         ) {
             SUBMITTED => Submitted::Ok,
             SUBMIT_BUSY => Submitted::Busy,

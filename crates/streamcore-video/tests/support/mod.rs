@@ -499,6 +499,14 @@ pub struct FakeEncoder {
     next_token: AtomicU64,
     /// Called inside `submit` (to post commands mid-drain).
     pub on_submit: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Behave as an LTR encoder (VideoToolbox's model): every output marks
+    /// LTR token = its sequence; a refresh submit outputs a delta predicted
+    /// from the newest acknowledged token.
+    pub ltr: AtomicBool,
+    /// Answer refresh submits with a plain delta (an encoder that cannot).
+    pub ignore_refresh: AtomicBool,
+    /// The newest `ltr_acknowledged` seen.
+    pub acked: Mutex<Option<u32>>,
 }
 
 impl FakeEncoder {
@@ -548,6 +556,27 @@ impl FakeEncoder {
             return false;
         };
         let keyframe = pending.opts.force_keyframe;
+        let ltr = if self.ltr.load(Ordering::SeqCst) {
+            let acked = *lock(&self.acked);
+            match acked {
+                Some(token)
+                    if pending.opts.ltr_refresh
+                        && !keyframe
+                        && !self.ignore_refresh.load(Ordering::SeqCst) =>
+                {
+                    Some(LtrInfo {
+                        token,
+                        flags: LtrInfo::REFRESH,
+                    })
+                }
+                _ => Some(LtrInfo {
+                    token: u32::try_from(seq).unwrap_or(u32::MAX),
+                    flags: LtrInfo::MARK,
+                }),
+            }
+        } else {
+            None
+        };
         let payload_token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let mut payload = seq.to_le_bytes().to_vec();
         payload.push(u8::from(keyframe));
@@ -570,7 +599,7 @@ impl FakeEncoder {
             form,
             discardable,
             temporal_id,
-            ltr: None,
+            ltr,
             timings: EncodeTimings {
                 input_ns: Some(pending.opts.capture_ns + 10),
                 output_ns: Some(pending.opts.capture_ns + 20),
@@ -642,6 +671,9 @@ impl FakeEncoder {
             return SubmitResult::Failed { error };
         }
         lock(&self.submits).push(opts);
+        if let Some(token) = opts.ltr_acknowledged {
+            *lock(&self.acked) = Some(token);
+        }
         let held = self.log.native_permits.fetch_add(1, Ordering::SeqCst) + 1;
         self.log
             .peak_native_permits
@@ -758,6 +790,7 @@ impl EncoderFactory for FakeFactory {
             return Err(MediaError::Unsupported);
         }
         let mut encoders = lock(&self.encoders);
+        let ltr = spec.ltr;
         let encoder = Arc::new(FakeEncoder {
             index: encoders.len(),
             codec: spec.codec,
@@ -775,6 +808,9 @@ impl EncoderFactory for FakeFactory {
             rates: Mutex::new(Vec::new()),
             next_token: AtomicU64::new(1),
             on_submit: Mutex::new(None),
+            ltr: AtomicBool::new(ltr),
+            ignore_refresh: AtomicBool::new(false),
+            acked: Mutex::new(None),
         });
         encoders.push(encoder.clone());
         if self.native.load(Ordering::SeqCst) {
@@ -1450,6 +1486,8 @@ pub mod glue {
         pts_ns: u64,
         capture_ns: u64,
         force_keyframe: bool,
+        ltr_acknowledged: u32,
+        ltr_refresh: bool,
     ) -> i32 {
         // SAFETY: the context is the `FakeEncoder` returned by `create`, which
         // the stream holds while it may submit.
@@ -1459,6 +1497,8 @@ pub mod glue {
             pts_ns,
             capture_ns,
             force_keyframe,
+            ltr_refresh,
+            ltr_acknowledged: (ltr_acknowledged != 0).then_some(ltr_acknowledged),
         };
         match encoder.accept(opts, None) {
             SubmitResult::Submitted => native::SUBMITTED,

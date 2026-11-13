@@ -9,6 +9,18 @@
 //! a keyframe submitted after the loss is delivered; a client request fences the
 //! latest submission and recovers at once.
 //!
+//! The ladder (6.5): when the plan lists `RecoveryStep::LtrRefresh` (confirmed
+//! caps, [`crate::encoder_plan_features`]) and the client acknowledged an LTR
+//! token of the current encoder after decode on the current transport
+//! ([`crate::StreamController::note_ltr_ack`]), a recovery submits an LTR
+//! refresh (a delta predicted only from acknowledged LTR frames) instead of an
+//! IDR. A refresh is not rate-limited by the IDR interval; it ends the recovery
+//! once written, like a keyframe. If the encoder answers it with a plain delta,
+//! or the refresh is lost, the recovery escalates to an IDR at once (the first
+//! IDR of the episode), and later IDRs keep at most one per recovery interval.
+//! A client keyframe request always gets an IDR. The held acknowledgement is
+//! cleared on every encoder or wire generation change and transport change.
+//!
 //! Admission (6.2, 6.3, [`crate::pacing`]): a frame is due when refresh-aligned
 //! admission accepts it (or a hold timer finds nothing newer came); a due frame
 //! is submitted while fewer frames than the permit target are in the encoder,
@@ -39,6 +51,13 @@ pub(crate) enum Command {
     Refresh(Option<u64>),
     /// The client flushed this many frames (skip cause e).
     ClientFlush(u64),
+    /// The client decoded LTR frame `token` of wire generation `generation`.
+    LtrAck {
+        generation: u64,
+        token: u32,
+    },
+    /// The stream moved to another transport.
+    TransportChanged,
     Revoked,
     Stats,
 }
@@ -193,6 +212,8 @@ pub(crate) struct StreamState {
     recovery_posted: bool,
     /// The newest submit that forced a keyframe.
     keyframe_submitted_seq: u64,
+    /// LTR state (6.5) of the current encoder and wire generation.
+    ltr: LtrState,
 
     /// Refresh-aligned admission (6.3) and its hold timer.
     pacer: RefreshPacer,
@@ -217,6 +238,50 @@ pub(crate) struct StreamState {
     /// Inside an inline frame drain: only admission, compose, convert and
     /// submit run; everything else is posted.
     inline: bool,
+}
+
+/// How many marked LTR tokens of the current encoder are remembered (acks of
+/// older ones are ignored).
+const LTR_MARKS_KEPT: usize = 256;
+
+/// The LTR side of the recovery ladder (6.5).
+#[derive(Default)]
+struct LtrState {
+    /// The wire generation the marks belong to.
+    generation: u64,
+    /// (token, sequence) of frames the current encoder marked as LTR, oldest
+    /// first.
+    marked: VecDeque<(u32, u64)>,
+    /// The newest acknowledged (token, sequence).
+    acked: Option<(u32, u64)>,
+    /// A new acknowledgement not yet passed to the encoder.
+    pending_ack: Option<u32>,
+    /// Acks count only for frames marked after this sequence (a transport
+    /// change).
+    min_seq: u64,
+    /// The next submit asks for an LTR refresh.
+    force_refresh: bool,
+    /// The newest submit that asked for an LTR refresh.
+    refresh_seq: u64,
+    /// An LTR refresh of this episode failed: the next recovery is an IDR.
+    escalate: bool,
+}
+
+impl LtrState {
+    /// Forget marks and acknowledgements (a new encoder or wire generation).
+    fn reset_tokens(&mut self) {
+        self.marked.clear();
+        self.acked = None;
+        self.pending_ack = None;
+        self.min_seq = 0;
+    }
+
+    /// Forget the recovery episode.
+    fn reset_episode(&mut self) {
+        self.force_refresh = false;
+        self.refresh_seq = 0;
+        self.escalate = false;
+    }
 }
 
 const FAILURE_REBUILD_WINDOW_NS: u64 = 10_000_000_000;
@@ -373,6 +438,7 @@ impl StreamState {
             recovery_timer: None,
             recovery_posted: false,
             keyframe_submitted_seq: 0,
+            ltr: LtrState::default(),
             pacer,
             pace_timer: None,
             permits,
@@ -633,6 +699,13 @@ impl StreamState {
             }
             Command::ClientFlush(frames) => {
                 self.stats.client_flushed = self.stats.client_flushed.saturating_add(frames);
+            }
+            Command::LtrAck { generation, token } => self.on_ltr_ack(generation, token),
+            Command::TransportChanged => {
+                // Acks from the old transport no longer count (6.5).
+                self.ltr.acked = None;
+                self.ltr.pending_ack = None;
+                self.ltr.min_seq = self.submitted_seq;
             }
             Command::Revoked => {
                 self.cancel_pace();
@@ -1124,6 +1197,10 @@ impl StreamState {
         loop {
             self.encoder_generation += 1;
             let generation = self.encoder_generation;
+            // A new encoder knows none of the old one's LTR frames.
+            self.ltr.reset_tokens();
+            self.ltr.refresh_seq = 0;
+            self.ltr.force_refresh = false;
             let sink = VideoSinkHandle::new(self.executor.clone(), generation);
             let spec = EncoderSpec {
                 codec,
@@ -1135,6 +1212,8 @@ impl StreamState {
                 color,
                 adapter: self.plan.adapter_luid,
                 sink: sink.clone(),
+                ltr: self.plan_ltr(),
+                temporal_layers: self.plan.extensions.contains(&FrameExtension::TemporalId),
             };
             let events: Arc<dyn EncoderEvents> = Arc::new(EncoderPort {
                 executor: self.executor.clone(),
@@ -1504,6 +1583,7 @@ impl StreamState {
         let sink = slot.sink.clone();
         let generation = slot.generation;
         let force_keyframe = self.force_keyframe || slot.first_submit;
+        let ltr_refresh = self.ltr.force_refresh && !force_keyframe;
         let mut surface_lease = Some(latest.lease.clone());
         let mut surface = latest.info.id;
         let mut converted = None;
@@ -1567,6 +1647,8 @@ impl StreamState {
             pts_ns,
             capture_ns: source_present_ns.unwrap_or(image_capture_ns),
             force_keyframe,
+            ltr_refresh,
+            ltr_acknowledged: self.ltr.pending_ack,
         };
         debug_assert!(is_current(cx.id));
         let result = match native_submit {
@@ -1574,12 +1656,11 @@ impl StreamState {
             // held before the call, since the output may be posted inside it.
             Some(native) => {
                 sink.hold(seq, permit.clone());
-                let result =
-                    match native.call(surface, seq, pts_ns, opts.capture_ns, force_keyframe) {
-                        crate::native::Submitted::Ok => SubmitResult::Submitted,
-                        crate::native::Submitted::Busy => SubmitResult::Busy,
-                        crate::native::Submitted::Failed(error) => SubmitResult::Failed { error },
-                    };
+                let result = match native.call(surface, &opts) {
+                    crate::native::Submitted::Ok => SubmitResult::Submitted,
+                    crate::native::Submitted::Busy => SubmitResult::Busy,
+                    crate::native::Submitted::Failed(error) => SubmitResult::Failed { error },
+                };
                 if result != SubmitResult::Submitted {
                     sink.unhold(seq);
                 }
@@ -1593,8 +1674,13 @@ impl StreamState {
                 if force_keyframe {
                     self.keyframe_submitted_seq = seq;
                 }
+                if ltr_refresh {
+                    self.ltr.refresh_seq = seq;
+                }
+                self.ltr.pending_ack = None;
                 self.last_pts_ns = pts_ns;
                 self.force_keyframe = false;
+                self.ltr.force_refresh = false;
                 self.stats.submitted += 1;
                 if let Some(slot) = &mut self.encoder {
                     slot.first_submit = false;
@@ -1805,6 +1891,7 @@ impl StreamState {
             self.last_config = Some(config);
         }
         self.stats.encoded += 1;
+        let refresh = self.note_ltr_output(cx, &frame, headers[headers.len() - 1].generation);
         if let Some(entry) = &entry {
             let encode_ns = cx.clock.now_ns().saturating_sub(entry.submitted_at);
             self.permits.record(encode_ns, interval_ns(self.plan.fps));
@@ -1869,7 +1956,8 @@ impl StreamState {
                 generation: header.generation,
                 sequence: header.sequence,
                 keyframe: frame.keyframe,
-                discardable: frame.discardable && !frame.keyframe,
+                refresh,
+                discardable: self.discardable(&frame),
                 messages,
             });
             for event in events {
@@ -1901,7 +1989,7 @@ impl StreamState {
             h3_ns: timing.encode.input_ns,
             h4_ns: timing.encode.output_ns,
             capture_us,
-            discardable: frame.discardable && !frame.keyframe,
+            discardable: self.discardable(frame),
             temporal_id: frame.temporal_id,
             ltr: frame.ltr,
             layout_epoch: self.layout_epoch,
@@ -1919,6 +2007,7 @@ impl StreamState {
         }
         self.stalled = false;
         self.stats.encoder_drops += 1;
+        self.ltr_refresh_lost(cx, seq);
         match reason {
             // A no-output completion is a loss, even of the last idle capture:
             // recovery must not depend on another screen update.
@@ -1937,18 +2026,17 @@ impl StreamState {
         use crate::sink::{Shed, SinkEvent};
         let current = |encoder| !self.closing && self.is_current_encoder(encoder);
         match event {
-            SinkEvent::Written {
-                encoder,
-                sequence,
-                keyframe,
-            } => {
-                if keyframe && current(encoder) {
+            SinkEvent::Written { encoder, sequence } => {
+                // A keyframe or an LTR refresh: nothing before it is referenced
+                // any more.
+                if current(encoder) {
                     self.delivered_keyframe = self.delivered_keyframe.max(sequence);
-                    // A keyframe submitted before the loss cannot end its recovery.
+                    // One submitted before the loss cannot end its recovery.
                     if sequence > self.lost_seq {
                         self.recovery_needed = false;
                         self.recovery_timer = None;
                         self.cancel_timers(|kind| *kind == TimerKind::Recovery);
+                        self.ltr.reset_episode();
                     }
                 }
             }
@@ -1962,6 +2050,7 @@ impl StreamState {
                     if !keyframe {
                         self.stats.sender_shed += 1;
                     }
+                    self.ltr_refresh_lost(cx, sequence);
                     self.record_loss(cx, sequence);
                 }
             }
@@ -1974,6 +2063,7 @@ impl StreamState {
                 // covered by the newer keyframe. Only an aged delta is a loss.
                 if why == Shed::Aged && current(encoder) {
                     self.stats.sender_shed += 1;
+                    self.ltr_refresh_lost(cx, sequence);
                     self.record_loss(cx, sequence);
                 }
             }
@@ -1997,6 +2087,104 @@ impl StreamState {
         self.keyframe_submitted_seq = 0;
         self.lost_seq = 0;
         self.last_recovery_ns = None;
+        self.ltr.reset_episode();
+    }
+
+    // -----------------------------------------------------------------------
+    // LTR (6.5).
+
+    /// The plan allows LTR refresh (confirmed caps and a client that acks).
+    fn plan_ltr(&self) -> bool {
+        self.plan.recovery.contains(&RecoveryStep::LtrRefresh)
+    }
+
+    /// A frame the sink may shed by rule 1: the encoder marked it discardable
+    /// and the plan tells the client so (temporal layers, 6.4).
+    fn discardable(&self, frame: &EncodedFrame) -> bool {
+        frame.discardable
+            && !frame.keyframe
+            && !frame.ltr.is_some_and(|ltr| ltr.refreshes())
+            && self.plan.extensions.contains(&FrameExtension::Discardable)
+    }
+
+    /// The next recovery can be an LTR refresh.
+    fn ltr_ready(&self) -> bool {
+        self.plan_ltr() && self.ltr.acked.is_some() && !self.ltr.escalate
+    }
+
+    /// Records the encoder's LTR output for `frame` of wire generation
+    /// `generation`; returns whether it is an LTR refresh. A refresh request
+    /// the encoder answered with a plain delta escalates the recovery to an
+    /// IDR.
+    fn note_ltr_output(&mut self, cx: &Shared, frame: &EncodedFrame, generation: u64) -> bool {
+        if !self.plan_ltr() {
+            return false;
+        }
+        if generation != self.ltr.generation {
+            // A new wire generation: the client knows none of the old marks.
+            self.ltr.reset_tokens();
+            self.ltr.generation = generation;
+        }
+        let ltr = frame.ltr.filter(|ltr| ltr.token != 0);
+        if let Some(ltr) = ltr.filter(LtrInfo::marks) {
+            if self.ltr.marked.len() == LTR_MARKS_KEPT {
+                self.ltr.marked.pop_front();
+            }
+            self.ltr.marked.push_back((ltr.token, frame.submit_seq));
+        }
+        let refresh = !frame.keyframe && ltr.is_some_and(|ltr| ltr.refreshes());
+        if frame.submit_seq == self.ltr.refresh_seq && !refresh && !frame.keyframe {
+            // Not honoured: the frame continues a broken chain.
+            self.ltr_refresh_lost(cx, frame.submit_seq);
+            self.record_loss(cx, frame.submit_seq);
+        }
+        refresh
+    }
+
+    /// The LTR refresh `seq` failed (not honoured, or lost before it was
+    /// written): the recovery escalates to an IDR, at once rather than at the
+    /// re-check timer (it is the episode's first IDR; later ones keep the
+    /// interval).
+    fn ltr_refresh_lost(&mut self, cx: &Shared, seq: u64) {
+        if seq == 0 || seq != self.ltr.refresh_seq {
+            return;
+        }
+        self.ltr.refresh_seq = 0;
+        self.ltr.escalate = true;
+        self.stats.ltr_refresh_failed += 1;
+        self.recovery_timer = None;
+        self.cancel_timers(|kind| *kind == TimerKind::Recovery);
+        if !self.recovery_posted {
+            self.recovery_posted = true;
+            self.post_internal(cx, Internal::Recover);
+        }
+    }
+
+    fn on_ltr_ack(&mut self, generation: u64, token: u32) {
+        let known = self
+            .ltr
+            .marked
+            .iter()
+            .rev()
+            .find(|(marked, _)| *marked == token)
+            .map(|(_, seq)| *seq);
+        let valid = self.plan_ltr()
+            && token != 0
+            && generation != 0
+            && generation == self.ltr.generation
+            && self.encoder.is_some();
+        match known {
+            Some(seq) if valid && seq > self.ltr.min_seq => {
+                if self.ltr.acked.is_some_and(|(_, held)| held >= seq) {
+                    // The same or an older one again (feedback repeats it).
+                    return;
+                }
+                self.ltr.acked = Some((token, seq));
+                self.ltr.pending_ack = Some(token);
+                self.stats.ltr_acks += 1;
+            }
+            _ => self.stats.ltr_acks_ignored += 1,
+        }
     }
 
     fn record_loss(&mut self, cx: &Shared, seq: u64) {
@@ -2005,7 +2193,8 @@ impl StreamState {
         }
         self.lost_seq = self.lost_seq.max(seq);
         self.recovery_needed = true;
-        if self.plan.pacing.immediate_recovery && !self.recovery_too_soon(cx) {
+        if self.plan.pacing.immediate_recovery && (self.ltr_ready() || !self.recovery_too_soon(cx))
+        {
             // The first recovery fires at once (6.5), on the next wake: the
             // event that reported the loss finishes first.
             if !self.recovery_posted && self.recovery_timer.is_none() {
@@ -2046,10 +2235,15 @@ impl StreamState {
     }
 
     /// A client keyframe request: a keyframe already submitted cannot satisfy it.
+    /// The client may have lost its references (a new decoder), so it gets an
+    /// IDR and acknowledges LTR frames again afterwards.
     fn request_recovery(&mut self, cx: &Arc<Shared>) {
         if cx.revoked() || self.closing || self.encoder.is_none() {
             return;
         }
+        self.ltr.acked = None;
+        self.ltr.pending_ack = None;
+        self.ltr.escalate = true;
         self.lost_seq = self.lost_seq.max(self.submitted_seq);
         self.recovery_needed = true;
         self.recover(cx);
@@ -2060,19 +2254,27 @@ impl StreamState {
             return;
         }
         let now = cx.clock.now_ns();
-        let too_soon = self.recovery_too_soon(cx);
+        // An LTR refresh is a delta: the IDR interval does not hold it back.
+        let ltr = self.ltr_ready();
+        let too_soon = !ltr && self.recovery_too_soon(cx);
         let pressured = cx.sink.state().backpressured;
-        // Immediate recovery: a keyframe submitted after the loss is already
-        // on its way; the timer re-checks that it was delivered.
-        let in_flight =
-            self.plan.pacing.immediate_recovery && self.keyframe_submitted_seq > self.lost_seq;
+        // Immediate recovery: a keyframe or refresh submitted after the loss is
+        // already on its way; the timer re-checks that it was delivered.
+        let in_flight = self.plan.pacing.immediate_recovery
+            && self.keyframe_submitted_seq.max(self.ltr.refresh_seq) > self.lost_seq;
         if too_soon || pressured || in_flight {
             self.schedule_recovery(cx);
             return;
         }
-        self.last_recovery_ns = Some(now);
         self.stats.recoveries += 1;
-        self.force_keyframe = true;
+        if ltr {
+            self.stats.ltr_refreshes += 1;
+            self.ltr.force_refresh = true;
+        } else {
+            self.last_recovery_ns = Some(now);
+            self.force_keyframe = true;
+            self.ltr.force_refresh = false;
+        }
         let restamp = self
             .time_anchor
             .map(|(host, local)| host.saturating_add(now.saturating_sub(local)));

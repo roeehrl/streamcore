@@ -120,6 +120,27 @@ impl StreamController {
             .post(Event::Command(Command::ClientFlush(frames)));
     }
 
+    /// The client decoded the LTR frame `token` of wire generation
+    /// `generation` (`videoFeedback`'s LTR ack, 9.4), on this stream's current
+    /// transport. The executor keeps the newest acknowledgement of a token the
+    /// current encoder marked; it enables an LTR refresh as the first recovery
+    /// step (6.5) and is passed to the encoder once. Acks of another
+    /// generation or of unknown tokens are counted and ignored. LTR is
+    /// acknowledged after decode, never on submit (5).
+    pub fn note_ltr_ack(&self, generation: u64, token: u32) {
+        self.shared
+            .post(Event::Command(Command::LtrAck { generation, token }));
+    }
+
+    /// The stream's frames now reach the client over another transport (a
+    /// path change or handover): LTR acknowledgements from the old one no
+    /// longer count, so the held one is cleared and recovery falls back to an
+    /// IDR until the client acknowledges again (6.5). A new encoder generation
+    /// clears it as well.
+    pub fn note_transport_changed(&self) {
+        self.shared.post(Event::Command(Command::TransportChanged));
+    }
+
     /// Post a `Stats` job to the observer queue.
     pub fn request_stats(&self) {
         self.shared.post(Event::Command(Command::Stats));
