@@ -623,3 +623,54 @@ fn a_recovery_held_by_backpressure_runs_when_the_sink_is_ready() {
     s.close();
     s.assert_clean();
 }
+
+#[test]
+fn a_frame_the_rate_control_skipped_is_not_a_loss() {
+    let s = Manual::new();
+    s.out.sync_receipts.store(true, Ordering::SeqCst);
+    s.start_running();
+    let encoder = s.encoder();
+    s.frame(1_000);
+    encoder.complete_all();
+    s.pump();
+    // Frame 2 is skipped while frame 3 follows: nothing references 2.
+    s.frame(2_000);
+    s.frame(3_000);
+    encoder.drop_output(2, DropReason::Skipped);
+    encoder.complete(3);
+    s.advance_ms(600);
+    let stats = s.controller.stats();
+    assert_eq!(
+        (stats.encoder_skipped, stats.recoveries),
+        (1, 0),
+        "no recovery"
+    );
+    assert!(
+        lock(&encoder.submits)
+            .iter()
+            .all(|o| o.submit_seq == 1 || !o.force_keyframe)
+    );
+    // The newest image skipped (a still screen): encoded again, as a delta.
+    s.frame(4_000);
+    encoder.drop_output(4, DropReason::Skipped);
+    s.pump();
+    assert_eq!(encoder.pending_seqs(), vec![5], "the last image again");
+    assert!(!lock(&encoder.submits).last().unwrap().force_keyframe);
+    encoder.complete(5);
+    s.pump();
+    // A skipped recovery keyframe leaves its loss: recovered again.
+    s.frame(6_000);
+    encoder.drop_output(6, DropReason::NoOutput);
+    s.pump();
+    let idr = *encoder.pending_seqs().last().unwrap();
+    assert!(lock(&encoder.submits).last().unwrap().force_keyframe);
+    encoder.drop_output(idr, DropReason::Skipped);
+    s.advance_ms(600);
+    let again = *encoder.pending_seqs().last().expect("recovered again");
+    assert!(again > idr);
+    assert!(lock(&encoder.submits).last().unwrap().force_keyframe);
+    encoder.complete_all();
+    s.pump();
+    s.close();
+    s.assert_clean();
+}

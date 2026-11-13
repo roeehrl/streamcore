@@ -637,6 +637,13 @@ pub enum DropReason {
     NoOutput,
     /// The encoder reported an error for this frame.
     Error { error: MediaError },
+    /// The encoder's rate control skipped the frame (VideoToolbox's
+    /// `kVTEncodeInfo_FrameDropped`): it was never encoded, so no later frame
+    /// references it and the chain is intact. Not a loss, unless it was a
+    /// recovery keyframe or LTR refresh (which is then sent again). Counted in
+    /// `encoder_drops` and `encoder_skipped`. Rate adaptation makes these more
+    /// likely on hard content at a low target (6.6).
+    Skipped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
@@ -955,6 +962,10 @@ pub struct StatsSnapshot {
     /// Canvas: the largest member age spread so far, µs.
     #[uniffi(default = 0)]
     pub canvas_age_spread_max_us: u64,
+    /// Frames the encoder's rate control skipped ([`DropReason::Skipped`]; also
+    /// in `encoder_drops`).
+    #[uniffi(default = 0)]
+    pub encoder_skipped: u64,
     /// Rate adaptation (6.6) is running.
     #[uniffi(default = false)]
     pub abr_active: bool,

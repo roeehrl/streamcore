@@ -2095,6 +2095,26 @@ impl StreamState {
                 self.submit_due(cx);
             }
             DropReason::Error { error } => self.on_encoder_error(cx, Some(seq), error),
+            DropReason::Skipped => {
+                self.stats.encoder_skipped += 1;
+                // Never encoded: nothing references it. A skipped recovery keyframe
+                // still leaves the loss it was for (sent again).
+                if seq == self.keyframe_submitted_seq {
+                    self.keyframe_submitted_seq = 0;
+                    self.record_loss(cx, seq);
+                } else if seq == self.submitted_seq
+                    && let Some(latest) = self.latest.as_mut().filter(|latest| !latest.pending)
+                {
+                    // The newest image was skipped: encode it again, so a still
+                    // screen still shows its last change (R2).
+                    latest.pending = true;
+                    latest.admitted = true;
+                    latest.restamp = self.time_anchor.map(|(host, local)| {
+                        host.saturating_add(cx.clock.now_ns().saturating_sub(local))
+                    });
+                }
+                self.submit_due(cx);
+            }
         }
     }
 
