@@ -1,5 +1,5 @@
 //! `ClientStream`'s decode policy on a fake decoder (STREAMCORE-VIDEO.md 5,
-//! 6.2, 6.5, 9.4): configuration and sessions, the two-frame bound, busy
+//! 6.2, 6.5, 9.4): configuration and sessions, the queue bound, busy
 //! decoders, stalls and failures, keyframe requests and their rate limit, LTR
 //! acknowledgement and wait, feedback and close.
 
@@ -109,6 +109,8 @@ fn the_effective_queue_bound_and_deep_decoders_are_reported() {
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
         (6, 1)
     );
+    // The depth in effect: declared 5 before any output.
+    assert_eq!((c.stats().depth, c.stats().learned_depth), (5, 0));
 }
 
 #[test]
@@ -280,7 +282,7 @@ fn a_decoder_three_deep_runs_without_flushes() {
         c.advance_ms(16);
     }
     let stats = c.stats();
-    assert_eq!(stats.learned_depth, 3);
+    assert_eq!((stats.learned_depth, stats.depth), (3, 3));
     // One frame of slack beyond the pipeline.
     assert_eq!(stats.queue_bound, 4);
     assert_eq!(stats.deep_decoder_sessions, 1);
@@ -895,7 +897,7 @@ fn feedback_reports_flushes_present_drops_and_loss() {
     // 1 was decoded, never presented; 5 only received.
     assert!(report.frames[0].decode_us != 0 && report.frames[0].present_us == 0);
     assert!(report.frames[2].decode_us == 0);
-    // A two-frame flush counts its frames.
+    // A queue bound flush counts its frames.
     c.key(5, 6);
     c.delta(5, 7);
     c.delta(5, 8);

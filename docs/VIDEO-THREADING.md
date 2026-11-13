@@ -392,8 +392,10 @@ session hung: its frames are dropped and it is re-created.
   recovery (below). A configure that fails with `Unsupported` or `InvalidSettings` fails the
   stream; another error drops the configuration (`reject_config`) until the host repeats it before
   its next keyframe.
-- **Queue bound (6.2).** When `max(2, DecoderInfo::max_queued)` frames already wait for the decoder
-  (accepted and not output, or held while it is busy), the next frame flushes them all.
+- **Queue bound (6.2).** When the queue bound's worth of frames already wait for the decoder
+  (accepted and not output, or held while it is busy), the next frame flushes them all. The bound
+  is `max(2, depth + 1)`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output (details below; `ClientStats::queue_bound`, and the depth in effect is
+  `ClientStats::depth`).
   `max_queued` is the decoder's pipeline depth (the inputs it needs before its first output) as
   the adapter knows it at configure time. Rust also learns each session's real depth: the samples
   it accepted, from its first keyframe, up to and including its first output
