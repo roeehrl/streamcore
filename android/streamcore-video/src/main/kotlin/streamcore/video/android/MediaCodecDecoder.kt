@@ -49,6 +49,8 @@ import uniffi.streamcore_video.YCbCrMatrix
 class MediaCodecDecoder(
     private val surface: Surface,
     private val tag: String = "StreamCoreVideo",
+    /** The MediaTek switches to set on a MediaTek decoder (A/B tests). */
+    private val mtkProfile: MtkProfile = MtkProfile.ALL,
 ) : StreamDecoder {
     private val lock = Any()
     private var codec: MediaCodec? = null
@@ -69,6 +71,11 @@ class MediaCodecDecoder(
     private var decodeCount = 0
     private var inputsBeforeFirstOutput = 0
     private var firstOutput = false
+
+    /** The key set or MediaTek profile in use, for diagnostics. */
+    @Volatile
+    var profileName: String = ""
+        private set
 
     /** The name of the decoder in use, for diagnostics. */
     @Volatile
@@ -108,7 +115,8 @@ class MediaCodecDecoder(
         if (candidates.isEmpty()) throw MediaException.Unsupported()
         for (candidate in candidates) {
             for (keys in KEY_SETS) {
-                val format = format(mime, parameters, color, keys)
+                val mtk = MtkProfile.isMediaTek(candidate.name)
+                val format = format(mime, parameters, color, keys, if (mtk) mtkProfile else MtkProfile.NONE)
                 val created = try {
                     MediaCodec.createByCodecName(candidate.name)
                 } catch (e: Exception) {
@@ -131,7 +139,9 @@ class MediaCodecDecoder(
                 }
                 synchronized(lock) { this.codec = created }
                 decoderName = candidate.name
-                val enabled = enableVendorLowLatency(created, keys)
+                val enabled = enableVendorLowLatency(created, keys) +
+                    if (mtk) enableMtkProfile(created, keys) else emptyList()
+                profileName = (if (mtk) "mtk ${mtkProfile.name.lowercase()}, " else "") + "keys ${keys.name}"
                 val accepted = acceptedKeys(created)
                 val confirmed = lowLatencyConfirmed(created, keys)
                 // A guess until the first output; ClientStream learns the real depth.
@@ -325,7 +335,11 @@ class MediaCodecDecoder(
             val seq = info.presentationTimeUs
             synchronized(lock) {
                 if (!firstOutput) {
-                    Log.i(tag, "first output after $inputsBeforeFirstOutput input(s): depth $inputsBeforeFirstOutput")
+                    Log.i(
+                        tag,
+                        "first output after $inputsBeforeFirstOutput input(s): depth $inputsBeforeFirstOutput " +
+                            "($decoderName, $profileName)",
+                    )
                 }
                 firstOutput = true
                 submitted.remove(seq)?.let {
@@ -367,7 +381,13 @@ class MediaCodecDecoder(
 
     private class KeySet(val name: String, val lowLatency: Boolean, val vendor: Boolean)
 
-    private fun format(mime: String, parameters: ParameterSets, color: ColorTags, keys: KeySet): MediaFormat =
+    private fun format(
+        mime: String,
+        parameters: ParameterSets,
+        color: ColorTags,
+        keys: KeySet,
+        mtk: MtkProfile,
+    ): MediaFormat =
         MediaFormat.createVideoFormat(mime, parameters.width, parameters.height).apply {
             parameters.csd.forEachIndexed { i, csd -> setByteBuffer("csd-$i", java.nio.ByteBuffer.wrap(csd)) }
             if (keys.lowLatency) {
@@ -376,6 +396,7 @@ class MediaCodecDecoder(
             }
             if (keys.vendor) {
                 for ((key, value) in VENDOR_LOW_LATENCY_KEYS) setInteger(key, value)
+                for (key in mtk.formatKeys()) setInteger(key, 1)
             }
             colorKeys(color)
         }
@@ -435,6 +456,34 @@ class MediaCodecDecoder(
         return set
     }
 
+    /**
+     * The [mtkProfile]'s parameters among those the codec lists (Android 12+), each set to 1 on
+     * its own; logs which were accepted. Returns them.
+     */
+    private fun enableMtkProfile(codec: MediaCodec, keys: KeySet): List<String> {
+        if (Build.VERSION.SDK_INT < 31 || !keys.vendor || mtkProfile == MtkProfile.NONE) return emptyList()
+        val supported = try {
+            codec.supportedVendorParameters
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        val accepted = ArrayList<String>()
+        for (name in mtkProfile.select(supported)) {
+            try {
+                if (codec.getParameterDescriptor(name)?.type != MediaFormat.TYPE_INTEGER) {
+                    Log.i(tag, "mtk ${mtkProfile.name.lowercase()}: $name is not an integer, skipped")
+                    continue
+                }
+                codec.setParameters(android.os.Bundle().apply { putInt(name, 1) })
+                accepted += name
+            } catch (e: Exception) {
+                Log.w(tag, "mtk ${mtkProfile.name.lowercase()}: $name refused: $e")
+            }
+        }
+        Log.i(tag, "mtk ${mtkProfile.name.lowercase()}: accepted ${accepted.ifEmpty { listOf("none") }}")
+        return accepted
+    }
+
     /** The low-latency keys the codec's input or output format reads back as 1. */
     private fun acceptedKeys(codec: MediaCodec): List<String> = try {
         val formats = listOf(codec.inputFormat, codec.outputFormat)
@@ -466,19 +515,15 @@ class MediaCodecDecoder(
 
         /**
          * Vendor low-latency switches set in the format: Qualcomm, Samsung Exynos, HiSilicon,
-         * Amlogic and others, and MediaTek. The MediaTek names are unverified candidates (the
-         * C2 names differ between releases): on Android 12+ [enableVendorLowLatency] also
-         * sets whatever low-latency parameter the codec itself lists, and the log names the
-         * keys that were read back.
+         * Amlogic and others. MediaTek decoders have no such key; their switches are the
+         * [MtkProfile]. On Android 12+ [enableVendorLowLatency] also sets whatever low-latency
+         * parameter the codec itself lists, and the log names the keys that were read back.
          */
         val VENDOR_LOW_LATENCY_KEYS = mapOf(
             "vendor.qti-ext-dec-low-latency.enable" to 1,
             "vendor.rtc-ext-dec-low-latency.enable" to 1,
             "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req" to 1,
             "vendor.low-latency.enable" to 1,
-            "vendor.mtk.vdec.lowlatency.mode" to 1,
-            "vendor.mtk.ext.vdec.low-latency.enable" to 1,
-            "vendor.mtk.vdec.low-latency.mode" to 1,
         )
 
         /** A vendor parameter name that switches low latency. */
