@@ -15,7 +15,11 @@
 //! else it waits in the latest slot, where a newer frame replaces it (drop
 //! before encode, D7).
 
+mod canvas_run;
+
 use crate::bounded::run_bounded_value;
+use crate::canvas::CanvasArrangement;
+use crate::controller::CanvasParts;
 use crate::error::{MediaError, codes};
 use crate::executor::*;
 use crate::pacing::{PermitGovernor, RefreshPacer};
@@ -50,6 +54,11 @@ pub(crate) enum Internal {
     Recover,
     /// Nothing to do: the wake arms a timer set during an inline frame drain.
     Arm,
+    /// Canvas: a composite surface was released while a compose waited for
+    /// the pool (3.9).
+    PoolReleased,
+    /// Canvas: every member has a first image (found during an inline drain).
+    CanvasReady,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -72,6 +81,12 @@ enum TimerKind {
     Pace,
     Op(OpToken),
     Command(OpToken),
+    /// Canvas: the first-image deadline (5 s).
+    FirstImage,
+    /// Canvas: re-observe the layout (every 250 ms).
+    Observe,
+    /// Canvas: the next composite is due (cadence).
+    Compose,
 }
 
 struct EncoderSlot {
@@ -197,6 +212,11 @@ pub(crate) struct StreamState {
     closed: Option<CloseOutcome>,
     pub(crate) keepalive: Option<Arc<Shared>>,
     stats: StatsSnapshot,
+    /// A combined canvas stream's members, compositor and policy state (3.9).
+    canvas: Option<canvas_run::CanvasRun>,
+    /// Inside an inline frame drain: only admission, compose, convert and
+    /// submit run; everything else is posted.
+    inline: bool,
 }
 
 const FAILURE_REBUILD_WINDOW_NS: u64 = 10_000_000_000;
@@ -205,7 +225,15 @@ const MAX_STOP_WAITERS: usize = 16;
 
 /// Rust is the single validator (2.5.8): nothing reaches native allocation
 /// unchecked.
-pub(crate) fn validate(spec: &CaptureSpec, plan: &StreamPlan) -> Result<(), MediaError> {
+///
+/// A `Canvas` target needs `layout` (a compositor, [`crate::StreamController::new_canvas`]);
+/// without one it is `Unsupported`, so a backend without a compositor keeps
+/// the consumer's own path.
+pub(crate) fn validate(
+    spec: &CaptureSpec,
+    plan: &StreamPlan,
+    layout: Option<&CanvasArrangement>,
+) -> Result<(), MediaError> {
     let dims = |w: u32, h: u32| (2..=8192).contains(&w) && (2..=8192).contains(&h);
     let fps = i64::from(plan.fps);
     if !dims(plan.encode_width, plan.encode_height)
@@ -223,18 +251,28 @@ pub(crate) fn validate(spec: &CaptureSpec, plan: &StreamPlan) -> Result<(), Medi
     {
         return Err(MediaError::InvalidSettings);
     }
-    if plan.convert == ConvertPath::Identity && spec.format != plan.encoder_input {
+    let canvas = matches!(spec.target, CaptureTarget::Canvas { .. });
+    if canvas && layout.is_none() {
+        return Err(MediaError::Unsupported);
+    }
+    // A canvas's spec format is its members'; the encoder reads the composite.
+    if plan.convert == ConvertPath::Identity && spec.format != plan.encoder_input && !canvas {
         return Err(MediaError::InvalidSettings);
     }
     match &spec.target {
         CaptureTarget::Region { rect, .. } if !valid_region(rect) => {
             return Err(MediaError::InvalidSettings);
         }
-        // The canvas policy is a later P1 slice.
-        CaptureTarget::Canvas { .. } => return Err(MediaError::Unsupported),
+        CaptureTarget::Canvas { display_ids } => {
+            let Some(layout) = layout else {
+                return Err(MediaError::Unsupported);
+            };
+            canvas_run::validate(spec, plan, display_ids, layout)?;
+        }
         CaptureTarget::App { app_id } if app_id.is_empty() => {
             return Err(MediaError::InvalidSettings);
         }
+        _ if layout.is_some() => return Err(MediaError::InvalidSettings),
         _ => {}
     }
     Ok(())
@@ -291,8 +329,10 @@ impl StreamState {
         plan: StreamPlan,
         timings: StreamTimings,
         backends: Backends,
+        canvas: Option<CanvasParts>,
     ) -> Self {
         let mut plan = plan;
+        let canvas = canvas.map(|parts| canvas_run::CanvasRun::new(parts, &plan));
         // A refresh outside 1–100 ms is no display mode: treated as unknown.
         plan.refresh_interval_ns = valid_refresh(plan.refresh_interval_ns);
         let pacer = RefreshPacer::new(interval_ns(plan.fps), plan.refresh_interval_ns.unwrap_or(0));
@@ -345,6 +385,8 @@ impl StreamState {
             closed: None,
             keepalive: None,
             stats: StatsSnapshot::default(),
+            canvas,
+            inline: false,
         }
     }
 
@@ -375,7 +417,9 @@ impl StreamState {
             Event::OpDone { op, error } => self.on_op_done(cx, op, error),
             Event::SourceGone { capture, reason } => self.on_source_gone(cx, capture, reason),
             Event::Layout { capture, layout } => {
-                if self.capture == Some(capture) && !self.closing {
+                if self.canvas.is_some() {
+                    self.on_member_layout(cx, capture);
+                } else if self.capture == Some(capture) && !self.closing {
                     self.layout_epoch += 1;
                     self.notify(
                         cx,
@@ -434,7 +478,9 @@ impl StreamState {
             status,
         } = event
         {
+            self.inline = true;
             self.on_frame(cx, capture, member, lease, info, status);
+            self.inline = false;
         }
     }
 
@@ -590,6 +636,7 @@ impl StreamState {
             }
             Command::Revoked => {
                 self.cancel_pace();
+                self.clear_canvas(cx);
                 self.latest = None;
                 self.recovery_needed = false;
                 self.recovery_timer = None;
@@ -610,7 +657,8 @@ impl StreamState {
         if self.command.is_some() || self.phase != StreamPhase::Idle || self.capture.is_some() {
             return self.reply(cx, op, Self::rejected(codes::BUSY));
         }
-        if let Err(error) = validate(&self.spec, &self.plan) {
+        let layout = self.canvas.as_ref().map(|run| run.layout().clone());
+        if let Err(error) = validate(&self.spec, &self.plan, layout.as_ref()) {
             return self.reply(cx, op, Self::rejected(error.wire_code(codes::CONFIG)));
         }
         self.crop_region = false;
@@ -632,6 +680,9 @@ impl StreamState {
         self.command = Some(op);
         self.set_timer(cx, self.timings.command_timeout_ns, TimerKind::Command(op));
         self.reset_stream_state();
+        if self.canvas.is_some() {
+            return self.start_canvas(cx);
+        }
         if let Err(error) = self.create_encoder(cx, true) {
             return self.finish_command(cx, Self::rejected(error.wire_code(codes::ENCODER)));
         }
@@ -645,7 +696,7 @@ impl StreamState {
         let port = Arc::new(CapturePort {
             executor: self.executor.clone(),
             backend: Arc::downgrade(&capture),
-            shape: std::sync::Mutex::new(None),
+            shape: std::sync::Mutex::new(Vec::new()),
         });
         cx.set_capture_port(&port);
         let events: Arc<dyn CaptureEvents> = port;
@@ -698,6 +749,11 @@ impl StreamState {
         let Some(id) = self.capture else {
             return self.reply(cx, op, Self::rejected(codes::MISSING));
         };
+        // A canvas's size and members are its layout's: changing them is a
+        // new stream (the consumer restarts it).
+        if self.canvas.is_some() && (size.is_some() || update.capture.region.is_some()) {
+            return self.reply(cx, op, Self::rejected(codes::CONFIG));
+        }
         if let (Some(region), CaptureTarget::Region { rect, .. }) =
             (update.capture.region, &mut self.spec.target)
         {
@@ -726,6 +782,9 @@ impl StreamState {
             self.plan.encode_width = w;
             self.plan.encode_height = h;
             self.schedule_recreate(cx);
+        }
+        if self.canvas.is_some() {
+            return self.update_canvas(cx, update.capture);
         }
         let Some(backends) = &self.backends else {
             return;
@@ -773,6 +832,9 @@ impl StreamState {
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
+        if self.canvas.is_some() {
+            return self.stop_canvas(cx);
+        }
         let Some(backends) = &self.backends else {
             return;
         };
@@ -785,6 +847,9 @@ impl StreamState {
     }
 
     fn on_op_done(&mut self, cx: &Arc<Shared>, token: OpToken, error: Option<MediaError>) {
+        if self.group_answer(cx, token, error.clone()) {
+            return;
+        }
         let Some(op) = self.op.filter(|op| op.token == token) else {
             self.stats.stale_events += 1;
             return;
@@ -802,19 +867,11 @@ impl StreamState {
                 } else if wants_stop(self) {
                     self.finish_command(cx, Self::rejected(codes::CANCELLED));
                     self.begin_stop(cx);
+                } else if self.canvas.is_some() {
+                    // Acknowledged once every member showed a first image.
+                    self.canvas_started(cx);
                 } else {
-                    if let Some(slot) = &self.encoder {
-                        let mut plan = self.plan.clone();
-                        plan.codec = slot.info.codec;
-                        self.notify(
-                            cx,
-                            ObserverJob::Started {
-                                plan,
-                                info: slot.info.clone(),
-                            },
-                        );
-                    }
-                    self.finish_command(cx, OpOutcome::Completed);
+                    self.announce_started(cx);
                     self.submit_due(cx);
                 }
             }
@@ -850,6 +907,7 @@ impl StreamState {
                     }
                     None => {
                         self.capture = None;
+                        self.forget_member_captures();
                         self.phase = StreamPhase::Idle;
                         self.stop_requested = false;
                         self.resolve_stops(cx, OpOutcome::Completed);
@@ -861,6 +919,23 @@ impl StreamState {
             }
             _ => self.stats.stale_events += 1,
         }
+    }
+
+    /// `Started` (with the codec actually created) and the start command's
+    /// `Completed`.
+    fn announce_started(&mut self, cx: &Arc<Shared>) {
+        if let Some(slot) = &self.encoder {
+            let mut plan = self.plan.clone();
+            plan.codec = slot.info.codec;
+            self.notify(
+                cx,
+                ObserverJob::Started {
+                    plan,
+                    info: slot.info.clone(),
+                },
+            );
+        }
+        self.finish_command(cx, OpOutcome::Completed);
     }
 
     fn on_op_timeout(&mut self, cx: &Arc<Shared>, token: OpToken) {
@@ -892,6 +967,9 @@ impl StreamState {
     }
 
     fn on_source_gone(&mut self, cx: &Arc<Shared>, capture: CaptureId, reason: SourceGone) {
+        if self.canvas.is_some() {
+            return self.on_member_gone(cx, capture, reason);
+        }
         if self.capture != Some(capture) || self.closing {
             self.stats.stale_events += 1;
             return;
@@ -920,6 +998,7 @@ impl StreamState {
         self.notify(cx, ObserverJob::Failed { code: code.into() });
         self.finish_command(cx, Self::rejected(code));
         self.cancel_pace();
+        self.clear_canvas(cx);
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -941,6 +1020,7 @@ impl StreamState {
         cx.work.close();
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
         self.cancel_pace();
+        self.clear_canvas(cx);
         self.latest = None;
         self.clear_recovery();
         self.teardown_encoder(cx);
@@ -970,9 +1050,12 @@ impl StreamState {
         self.finish_command(cx, Self::rejected(codes::CANCELLED));
         self.notify(cx, ObserverJob::Closed { outcome });
         self.teardown_encoder(cx);
+        self.clear_canvas(cx);
         self.latest = None;
         self.in_flight.clear();
         self.timers.clear();
+        // The compositor is native code: dropped with the other backends.
+        self.canvas = None;
         self.closed = Some(outcome);
         self.phase = StreamPhase::Closed;
         self.backends = None;
@@ -1002,6 +1085,9 @@ impl StreamState {
                     self.fail(cx, codes::TIMEOUT);
                 }
             }
+            TimerKind::FirstImage | TimerKind::Observe | TimerKind::Compose => {
+                self.on_canvas_timer(cx, token, kind);
+            }
         }
     }
 
@@ -1010,6 +1096,7 @@ impl StreamState {
 
     fn reset_stream_state(&mut self) {
         self.cancel_pace();
+        self.canvas_reset();
         self.pacer.reset();
         self.permits.reset();
         self.cancel_pace();
@@ -1027,7 +1114,7 @@ impl StreamState {
         let factory = backends.encoders.clone();
         let (color, source_format) = match &self.latest {
             Some(latest) => (latest.mapped, latest.info.format),
-            None => (self.plan.color_out, self.spec.format),
+            None => (self.plan.color_out, self.source_format()),
         };
         let input_format = match self.plan.convert {
             ConvertPath::Identity => source_format,
@@ -1188,6 +1275,8 @@ impl StreamState {
                 self.recover(cx);
             }
             Internal::Arm => {}
+            Internal::PoolReleased => self.on_pool_released(cx),
+            Internal::CanvasReady => self.canvas_ready(cx),
         }
     }
 
@@ -1312,6 +1401,9 @@ impl StreamState {
         info: SurfaceInfo,
         status: FrameStatus,
     ) {
+        if self.canvas.is_some() {
+            return self.on_member_frame(cx, capture, lease, info, status);
+        }
         self.stats.frames_received += 1;
         if status != FrameStatus::Complete
             || self.closing
@@ -1324,6 +1416,28 @@ impl StreamState {
             // The lease drops here and releases the surface.
             return;
         }
+        self.accept_image(cx, lease, info, true);
+    }
+
+    /// The source's format before any convert: a canvas's is its composite's.
+    fn source_format(&self) -> PixelFormat {
+        if self.canvas.is_some() {
+            self.plan.encoder_input
+        } else {
+            self.spec.format
+        }
+    }
+
+    /// A new image (a capture, or a composite) becomes the latest and is
+    /// submitted when due. `paced`: refresh-aligned admission decides; a
+    /// composite is due at once (the compose cadence paced it).
+    fn accept_image(
+        &mut self,
+        cx: &Arc<Shared>,
+        lease: SurfaceLease,
+        info: SurfaceInfo,
+        paced: bool,
+    ) {
         let output = match self.plan.convert {
             ConvertPath::Identity => info.format,
             ConvertPath::Convert => self.plan.encoder_input,
@@ -1331,7 +1445,14 @@ impl StreamState {
         let mapped = self.plan.color_mapping.map(info.color, info.format, output);
         self.time_anchor = Some((info.capture_ns, cx.clock.now_ns()));
         let format = info.format;
-        let admitted = self.admit(cx, &info);
+        let admitted = if paced {
+            self.admit(cx, &info)
+        } else {
+            if self.latest.as_ref().is_some_and(|latest| latest.pending) {
+                self.stats.frames_replaced += 1;
+            }
+            true
+        };
         self.latest = Some(Retained {
             lease: Arc::new(lease),
             info,

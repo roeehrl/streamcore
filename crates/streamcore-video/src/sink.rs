@@ -41,7 +41,9 @@ use streamcore_media::media::{
     FrameTiming as WireTiming, LtrInfo as WireLtr, MAX_FRAME_LENGTH, VIDEO_FLAG_EXTENSION,
     VIDEO_HEADER_LENGTH, VideoExtensions, VideoMetadata,
 };
-use streamcore_media::video_control::{FrameTimingReport, KIND_FRAME_TIMING};
+use streamcore_media::video_control::{
+    FrameTimingReport, KIND_FRAME_TIMING, KIND_LAYOUT_INFO, LayoutInfo,
+};
 use streamcore_transport::channel::SecureChannel;
 
 /// The sink's backlog, published after every change; read anywhere as a leaf
@@ -717,6 +719,41 @@ impl VideoSink {
             });
             inner.pump(core, now);
         })
+    }
+
+    /// `layoutInfo` (`0x15`, 9.4) on lane 0, under frames.v4 only: what the
+    /// frames of `info.epoch` show. On the executor. Returns whether it was
+    /// enqueued, and what happened to queued frames meanwhile.
+    pub(crate) fn send_layout(&self, info: LayoutInfo) -> (bool, Vec<SinkEvent>) {
+        let inner = &self.inner;
+        if !inner.frames_v4 {
+            return (false, Vec::new());
+        }
+        let info = LayoutInfo {
+            stream_id: inner.stream_id,
+            ..info
+        };
+        let Ok(body) = info.encode() else {
+            return (false, Vec::new());
+        };
+        let mut sent = false;
+        let events = inner.with_core(|core| {
+            if core.revoked {
+                return;
+            }
+            let mut message = Vec::with_capacity(5 + body.len());
+            message.push(KIND_LAYOUT_INFO);
+            message.extend((body.len() as u32).to_be_bytes());
+            message.extend(body);
+            // Odd ids: only the frames' own tickets report outcomes.
+            core.next_id += 2;
+            let ticket = SendTicket::new(inner.me.clone(), core.next_id + 1);
+            match inner.transport.enqueue(message, ticket) {
+                Ok(()) => sent = true,
+                Err(ticket) => ticket.disarm(),
+            }
+        });
+        (sent, events)
     }
 
     /// Stop enqueuing for good: queued frames are dropped. Once this returns,

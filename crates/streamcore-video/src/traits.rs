@@ -93,11 +93,25 @@ pub trait Converter: Send + Sync {
     fn release(&self, surface: SurfaceId);
 }
 
-/// Draws the latest lease per member into a pooled surface.
+/// Draws the latest lease per member into a pooled surface (3.9). Optional: a
+/// backend without one has no canvas ([`crate::StreamController::new`] refuses
+/// a `Canvas` target as `Unsupported`), and a consumer passes one to
+/// [`crate::StreamController::new_canvas`]. Rust keeps every policy (layout,
+/// tiles, group lifecycle, deadlines, cadence, input mapping); the compositor
+/// only draws.
 #[uniffi::export(rust, foreign)]
 pub trait Compositor: Send + Sync {
-    /// The pool holds at least permits + 2 surfaces.
+    /// Called on every start, before any member capture opens. The pool holds
+    /// at least `plan.pool_size` (permits + 2) surfaces of the plan's size.
     fn configure(&self, plan: CanvasPlan) -> Result<(), MediaError>;
+    /// Draw each member's surface into its tile (scaled to fit, the member's
+    /// colour converted to `plan.color`) and every gap black; records GPU work
+    /// and returns at once, like `convert`: Rust's hold on the member surfaces
+    /// ends when this returns, so GPU work that still reads one keeps it valid
+    /// itself. The composite is leased to Rust until `release`; its `fence`
+    /// says when the drawing is complete. `PoolExhausted` (or
+    /// `OutOfResources`) while every pool surface is leased: Rust retries when
+    /// it releases one.
     fn compose(&self, members: Vec<MemberSurface>) -> Result<ComposeResult, MediaError>;
     /// Thread-safe, non-blocking leaf call.
     fn release(&self, surface: SurfaceId);

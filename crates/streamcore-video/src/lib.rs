@@ -13,6 +13,7 @@
 
 pub mod bitstream;
 pub mod bounded;
+pub mod canvas;
 pub mod controller;
 pub mod error;
 pub(crate) mod executor;
@@ -29,7 +30,11 @@ pub mod types;
 pub mod threading {}
 
 pub use bounded::{run_bounded, run_bounded_value};
-pub use controller::{StreamController, StreamParts};
+pub use canvas::{
+    CanvasArrangement, CanvasDisplay, CanvasPoint, CanvasSize, NormalizedPoint,
+    canvas_input_target, canvas_nearest_member_point, canvas_size, canvas_tiles, canvas_validate,
+};
+pub use controller::{CanvasParts, StreamController, StreamParts};
 pub use error::{MediaError, codes};
 pub use executor::{
     Clock, MonotonicClock, NETWORK_THREAD_NAME, StreamPort, VideoSinkHandle, blocking_allowed,
