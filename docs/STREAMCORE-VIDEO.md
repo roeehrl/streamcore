@@ -1263,7 +1263,7 @@ covers. Consumer migrations follow their own plans.
 | Phase | How to back out |
 | --- | --- |
 | P0 | instrumentation is off by default; the typed ping/pong is a hard break, so revert by shipping the previous host and client builds together |
-| P1 | the reference host's Swift pipeline stays selectable at runtime (a host setting) until P2 passes on hardware; switching back needs no client change |
+| P1 | the reference host's Swift pipeline stays selectable at runtime (a host setting) until P2 passes on hardware; switching back needs no client change. The reference host has since removed its Swift pipeline (13 November 2026): StreamCore is its only video pipeline, and a stream StreamCore cannot run fails rather than falling back. The P2 flags below are its rollbacks |
 | P2 | `VideoSink` bounds, the delta age bound, the bulk bucket and ABR each sit behind a flag; frames.v4, the lane-0 kinds and the consumer control bump revert only by shipping the previous host and client together |
 | P3a/P3b | each USB provider sits behind a host kill switch; handover and park sit behind a flag whose off state is today's restart path |
 | P4–P7 | new backends are selectable; the previous backend or build stays available until the phase gate passes |
