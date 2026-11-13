@@ -757,7 +757,9 @@ payload's first bytes: on H.264 a sequence gap breaks the chain only if `frame_n
 reference picture, and an LTR refresh from a token the receiver decoded
 (`note_ltr_decoded`) restores it. The VideoToolbox H.264 encoder on Apple silicon marks every frame
 as an LTR candidate until acknowledgements arrive, and with a base layer at half the frame rate
-outputs layer-1 frames as non-reference pictures.
+outputs layer-1 frames as non-reference pictures. A recovery the sink's backpressure held back
+runs at the sink's next report that finds it ready (a write or a consumption), not at the 500 ms
+re-check, which stays as the fallback for a transport-side signal (`StatsSnapshot::recoveries_on_ready`).
 
 ### 6.6 Rate adaptation
 
@@ -767,6 +769,41 @@ queueing exceeds one frame, +5–8%/s otherwise, with a floor against bulk. Bitr
 then resolution (a new generation). The bitrate is `w·h·fps·(0.02 + 0.18q)` clamped to 2–80 Mbps,
 the config ceiling and the medium cap; a 100–200 ms rate window with a frame-level maximum QP keeps
 an IDR from blocking the link.
+
+**As shipped (P2).** `crates/streamcore-video/src/abr.rs` is the controller, a pure state
+machine with its own tests; the executor ticks it every 100 ms while
+`PacingPolicy::rate_adaptation` is on (off in `PacingPolicy::default()`; a consumer turns it on,
+and MyCNC's host does by default). Its inputs are the sink's unsent age, the smallest consumed-credit
+RTT of the last 300 ms over its 10 s minimum, the client's one-way delay (each frame's
+`videoFeedback` receive time minus its H5, so the clock offset cancels) over its 10 s minimum and
+its slope over 500 ms (`StreamController::note_client_feedback`), lost frames (refused, shed as
+aged, or missing in the client's bitmap) and, on QUIC, quinn's RTT over its minimum and its lost
+packets (`SecureChannel::link_stats`). Queueing above one frame interval on two ticks in a row (a
+single IDR crossing the link is not a link change), or new loss, multiplies the target by 0.85
+(of the smaller of the target and the measured rate) at most once per `max(250 ms, 2 × RTT)`;
+half a frame of queueing or a rising client delay holds; otherwise the target rises 6 % per
+second unless the encoder is application-limited (below half the target). The plan's rate and
+size are the ceiling; a tier's ceiling is the plan's bitrate scaled by its pixel rate, clamped to
+2–80 Mbit/s and the medium cap. A tier steps down when the target falls below its quality floor
+`w·h·fps·0.02`: the frame rate first (the pacer admits fewer frames; `RateUpdate::fps` is only a
+hint), through 90/60/45/30/20/15, then the size (3/4, then 1/2, on the convert path only; a new
+encoder generation). The target itself goes as low as 0.25 Mbit/s, so the lower tiers' floors
+are reachable. Steps back up go in reverse (size, then frame rate) after 5 s and 2 s without a
+decrease, once the target has room for the higher tier. While bulk is sent (`link_stats`'s bulk
+byte count grew within 1 s) the target keeps at least half of its rate when bulk began (40 % of a
+known capacity), with no tier step at that floor. The bulk bucket's video rate is the target
+while video is active (at least the measured rate). `RateUpdate::rate_window_ms` (150 ms) and,
+when the planner confirmed it (`EncoderCaps::max_frame_qp`), `RateUpdate::max_frame_qp` reach the
+encoder with every change and every new session. Measured on Apple silicon's low-latency H.264
+encoder: bit rate changes take effect within 0.5 s and within 2 %; the 150 ms window changes
+nothing measurable (the low-latency rate control already holds 150 ms windows to about 1.15× the
+budget except around an IDR, whose size neither setting limits); on incompressible content the
+encoder holds a low target by skipping frames (83 % at 2 Mbit/s), and a maximum QP of 51 halves
+the skips. A skipped frame is `DropReason::Skipped`, not a loss (6.7 cause c). On a simulated
+8 Mbit/s link the target settles at 7.6–7.7 Mbit/s with the sink's unsent age at most one frame
+(p95), also behind a 1 MiB send buffer where only the client delay and the credit RTT see the
+queue; with bulk competing on an estimated capacity it stays at the floor; on a 0.4 Mbit/s link
+1080p60 steps to 15 fps and then half size.
 
 ### 6.7 Skipped frames
 
