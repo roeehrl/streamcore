@@ -10,11 +10,15 @@
 //!
 //! Each stream has exactly one serial executor ([`StreamController`] over a
 //! [`SerialQueue`]); the threading and reentrancy rules are in [`threading`].
+//!
+//! On the viewing side, a [`ClientStream`] receives a stream and owns its decode
+//! policy (5); native code decodes and presents behind [`StreamDecoder`].
 
 pub mod abr;
 pub mod bitstream;
 pub mod bounded;
 pub mod canvas;
+pub mod client;
 pub mod controller;
 pub mod error;
 pub(crate) mod executor;
@@ -34,6 +38,13 @@ pub use bounded::{run_bounded, run_bounded_value};
 pub use canvas::{
     CanvasArrangement, CanvasDisplay, CanvasPoint, CanvasSize, NormalizedPoint,
     canvas_input_target, canvas_nearest_member_point, canvas_size, canvas_tiles, canvas_validate,
+};
+/// The design's name for [`StreamDecoder`]: Rust decoders may implement either.
+pub use client::StreamDecoder as Decoder;
+pub use client::{
+    ClientEvents, ClientJob, ClientParts, ClientPhase, ClientStats, ClientStream, ClientTimings,
+    DecodeResult, DecoderEvents, DecoderInfo, KeyframeReason, PresentMode, RecreateReason,
+    SampleMeta, StreamDecoder,
 };
 pub use controller::{CanvasParts, StreamController, StreamParts};
 pub use error::{MediaError, codes};
