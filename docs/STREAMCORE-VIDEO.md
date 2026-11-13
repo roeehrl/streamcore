@@ -230,8 +230,9 @@ ticks × 10⁹ / frequency, so WGC's 100 ns `SystemRelativeTime` × 100; `CLOCK_
 - Consumers of a surface wait on its fence on the GPU. `stop` and `reconfigure` clear every lease
   before the backend's stop completes; slot generations make a late release a no-op.
 - Trait records carry metadata only. Encoded bytes enter Rust once, through
-  `VideoSinkHandle.submit_encoded(token, bytes)`; `Decoder::decode` gets an opaque `SampleHandle`
-  whose bytes the adapter copies once (P0 rewording, 10).
+  `VideoSinkHandle.submit_encoded(token, bytes)`; `Decoder::decode` gets the sample's bytes
+  (as shipped in P4, a `Vec<u8>`: one copy across UniFFI; Rust keeps its own until the decoder
+  accepts the sample, so a `Busy` one can be retried) (P0 rewording, 10).
 
 ### 3.3 Capability negotiation and the stream plan
 
@@ -646,18 +647,30 @@ host has a CPU fallback (GDI/libyuv/MS software MFT, VT software, OpenH264), dec
 ## 5. Client decode and present
 
 ```rust
-pub trait Decoder: Send + Sync {
-    fn configure(&self, codec: Codec, config: SampleHandle, color: ColorTags, queue: Arc<dyn SerialQueue>,
+pub trait StreamDecoder: Send + Sync {   // `Decoder` in Rust; Swift has its own `Decoder`
+    fn configure(&self, codec: Codec, config: Vec<u8>, color: ColorTags, queue: Arc<dyn SerialQueue>,
                  events: Arc<dyn DecoderEvents>) -> Result<DecoderInfo, MediaError>;
-    fn decode(&self, sample: SampleHandle, meta: SampleMeta) -> DecodeResult;   // Accepted | Busy | Failed
-    fn flush(&self);
+    fn decode(&self, sample: Vec<u8>, meta: SampleMeta) -> DecodeResult;       // Accepted | Busy | Failed
+    fn flush(&self) -> InvalidateOutcome;                                      // bounded, 500 ms
     fn set_mode(&self, mode: PresentMode);                                     // Responsive | Smooth
-}   // DecoderEvents (post-only): decoded(seq, t_ns), presented(seq, t_ns, estimated), failed(error)
+    fn now_ns(&self) -> u64;                                                   // the clock of C3 and C5
+}   // DecoderEvents (post-only, also from inside decode): decoded(seq, c3_ns),
+    // presented(seq, c5_ns, estimated), input_ready(), failed(error, recoverable)
 ```
 
 The contract is R2: each frame is presented when decoded; if several wait for one vsync only the
 newest is shown (R4). Rust owns reassembly, `VideoReceiver`, the two-frame decoder-queue bound
 (then flush + keyframe request), feedback and clock sync.
+
+**As shipped (P4).** `ClientStream` (`crates/streamcore-video/src/client.rs`) is that Rust side:
+it takes lane-1 messages (`receive`, or the `next_message(channel)` receive loop), runs the
+receiver, configures, decodes, flushes and re-creates the decoder, requests keyframes through the
+consumer (`ClientEvents`, a post-only job queue; StreamCore has no lane-0 kind for them) at most
+twice per second, waits 150 ms for an LTR refresh while an acknowledged LTR is in use, re-creates
+a decoder with no output for 500 ms, and sends `videoFeedback` on lane 0 itself. A new wire
+generation is `flush()` then `configure()` on the same decoder, with that generation's colour
+tags read from its configuration (H.264: the SPS's VUI); the codec is fixed per stream. Its threading and policy are in
+[threading](VIDEO-THREADING.md#client).
 
 - **Apple:** today samples go straight into `AVSampleBufferDisplayLayer` (C5 an estimate). From P2
   `VTDecompressionSession` → the same layer (exact C3); P6 A/B-tests Metal + `CAMetalDisplayLink`
@@ -1180,7 +1193,7 @@ widens it unconditionally and senders emit the new kinds only when frames.v4 was
 
 - `videoFeedback` (client → host, about every 100 ms; every 20 ms in datagram mode): highest
   complete sequence, optional loss bitmap, consumed bytes, per-frame receive/decode/present times,
-  flushes, present drops, optional LTR ack.
+  flushes, present drops, optional LTR ack, whether the report's present times are estimates.
 - `videoNack` (datagram mode only): missing fragments of a frame.
 - `frameTiming` (host → client, sampled; every frame on USB): H5 and H6, which cannot be in the
   frame's own header, and the sink's backpressure flag (8.7 health rule).

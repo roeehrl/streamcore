@@ -333,6 +333,120 @@ windowed minimum of written → consumed.
 Consumer observers run only as jobs posted to the consumer's `ObserverQueue`, never on the
 executor, so an observer may call anything, including `close_and_wait`.
 
+## Client
+
+A `ClientStream` (`crates/streamcore-video/src/client.rs`) is the viewing side of a stream (design
+5): Rust receives the frames and owns every decode policy; the native decoder behind
+`StreamDecoder` (Android `MediaCodec`, Apple `VTDecompressionSession`) only decodes and presents.
+Every rule above applies to it unchanged; this section says what is specific.
+
+**Executor.** A client stream has its own executor of the same shape: a FIFO mailbox and a timer
+set, drained by one thread at a time on its `SerialQueue`, which calls the stream's `StreamPort`
+(`run`, `run_timer`) as a host stream's does, so one native queue class serves both. The stream
+state (the `VideoReceiver`, the decoder session, the frames waiting for it, recovery and feedback
+state) is moved out of its mutex for a drain. There is no inline drain: every frame is posted.
+
+**Inbound calls only post.** `ClientStream::receive` (one `TimedMessage` from
+`SecureChannel::receive_timed`) parses the envelope and header on the caller's thread, copies the
+sample once, posts and returns; it returns false, leaving the message to the consumer, for any
+other kind or stream. `next_message(channel)` is the receive loop for a consumer whose channel
+carries the stream: it hands this stream's video to `receive` and returns the first other message,
+so video bytes never leave Rust. The other `ClientStream` methods post, except
+`close_and_wait` (rule 6). `DecoderEvents` (`decoded`, `presented`, `input_ready`, `failed`) post
+and return in O(1) from any thread, **including synchronously from inside `decode`** (VideoToolbox
+decodes on the caller's thread): they take only the mailbox lock, never a lock a decoder caller
+holds, and `wake` runs after it is dropped. `decoded` also raises an atomic of its session (the
+newest output sequence) before it posts, so a frame decoded inside `decode`, or whose event still
+waits in the mailbox, no longer counts against the queue bound.
+
+**Outbound calls run only on the executor, during a drain:** `StreamDecoder` `configure`,
+`decode`, `flush`, `set_mode` and `now_ns`; `ClientEvents::post`; the lane-0 enqueue of
+`videoFeedback`; `SerialQueue::wake_after`. `ClientEvents::post` is the consumer's
+`ObserverQueue`: it only enqueues the `ClientJob`.
+
+**Sessions.** Each successful `configure` is a decoder session with its own `DecoderEvents` port;
+events carry the session, and a replaced session's events are counted as stale and ignored, as are
+events naming no waiting frame. A new wire generation is a new session: the executor calls
+`flush()` and then `configure()` again on the same `StreamDecoder` with the new configuration and
+the generation's colour tags. The codec is fixed per stream (`ClientParts::codec`); the colour is
+read from each configuration, because the host states it nowhere else: for H.264 the SPS's VUI
+`video_signal_type` (range, and the H.273 primaries, transfer and matrix when it has a colour
+description). A field the VUI leaves out or marks unspecified, and every field for HEVC (whose VUI
+is not parsed yet), takes `ClientParts::color`. `ClientJob::Configured` carries the tags used.
+Re-creation after a stall, a failure or a hung flush is the same `flush()` then `configure()`
+with the generation's configuration, followed by `VideoReceiver::require_keyframe` and a keyframe
+request. More than 3 re-creations (or failed configures) in 10 s fail the stream. After every
+`configure` the executor reads `now_ns()` once to map the decoder's clock (C3, C5) onto the
+StreamCore transport clock (`monotonic_now_us`, the clock of `TimedMessage` and of
+`videoFeedback`); the offset is only as exact as that one call.
+
+**`flush` is bounded** like `Encoder::invalidate`: it returns within
+`ClientTimings::flush_bound_ns` (500 ms); an adapter whose platform call has no timeout runs it
+with `run_bounded` (450 ms) and returns `TimedOut`. A flush that times out or overruns marks the
+session hung: its frames are dropped and it is re-created.
+
+**Policy.** On the executor, per received frame and event:
+
+- `VideoReceiver::accept_frame` (with the `ltr` TLV and the sample's first 256 bytes) decides:
+  `Configure` starts a session, `Decode` decodes, `Ignore` drops, `Recover` drops and starts
+  recovery (below). A configure that fails with `Unsupported` or `InvalidSettings` fails the
+  stream; another error drops the configuration (`reject_config`) until the host repeats it before
+  its next keyframe.
+- **Queue bound (6.2).** When `max(2, DecoderInfo::max_queued)` frames already wait for the decoder
+  (accepted and not output, or held while it is busy), the next frame flushes them all.
+  `max_queued` is the decoder's real pipeline depth (the inputs it needs before its first output).
+  The effective bound is `ClientStats::queue_bound`; a session deeper than 2 is a latency cost on
+  every frame (R2 wants zero reorder), counted in `ClientStats::deep_decoder_sessions`, and
+  adapters should prefer decoders with a depth of 2 or less. A keyframe
+  is then decoded; any other frame is dropped too, and a keyframe is requested (`QueueBound`).
+- **Busy.** After `DecodeResult::Busy` the executor holds the sample (Rust keeps a copy of every
+  sample until the decoder accepts it) and submits nothing more until `input_ready`, which submits
+  the newest held sample. A newer sample replaces a held discardable one, and a keyframe replaces
+  anything; replacing a held reference frame breaks the chain, so both are dropped and a keyframe
+  is requested (`Busy`).
+- **Refusals and failures.** `DecodeResult::Failed` drops the frame and requests a keyframe;
+  with `DeviceLost` it re-creates the session. `DecoderEvents::failed` with `recoverable` (or
+  `DeviceLost`) re-creates; otherwise the stream fails (`ClientJob::Failed`; frames are dropped
+  until the consumer closes it).
+- **Stall.** No output for `stall_ns` (500 ms) while frames wait re-creates the session
+  (`RecreateReason::Stalled`). The stall clock restarts at every output and when frames start
+  waiting after none did.
+- **Keyframe requests** go to the consumer (`ClientJob::RequestKeyframe`; StreamCore has no lane-0
+  kind for them) at most once per `keyframe_interval_ns` (500 ms, 6.5's two per second). A request
+  inside the interval is deferred to its end and sent then only if the chain is still broken; a
+  keyframe or an LTR refresh that restores the chain cancels it.
+- **LTR (6.5).** A frame's LTR mark is acknowledged only when the decoder reports it `decoded`,
+  never on submit: `VideoReceiver::note_ltr_decoded`, then the token in the next `videoFeedback`.
+  While an acknowledged LTR is in use on the current session and transport, a break waits
+  `ltr_wait_ns` (150 ms) for the host's LTR refresh before requesting a keyframe; a refresh from a
+  decoded token restores the chain in the receiver. A flush, a new session, a new generation or
+  `note_transport_changed` ends the LTR use.
+- **Feedback (9.4).** One `videoFeedback` goes out `feedback_interval_ns` (100 ms) after the first
+  change since the last report, never while nothing changes: the generation, the highest sequence
+  received, the payload bytes received, the frames flushed unshown (from the decoder queue, a busy
+  hold, a refusal or no output) and decoded but never presented (an older decoded frame when a
+  newer one is presented), the missing sequences as a loss bitmap, a newly decoded LTR token, and
+  up to 32 frames (the newest) with C1 (message complete), C3 (decoded) and C5 (presented). Each
+  frame is reported once, when nothing more will happen to it or one interval after its C1. A new
+  generation sends the old one's pending report first. With a frames.v4 channel
+  (`ClientParts::channel`) the executor enqueues it on lane 0 itself, as the host's sink writes
+  `frameTiming`; otherwise it posts the same enveloped bytes as `ClientJob::Feedback`. The loss
+  bitmap lists every sequence the client did not receive, including discardable frames the host's
+  sink shed: the host ignores sequences its sink shed when it uses the bitmap for rate adaptation
+  or recovery, and a missing discardable sequence does not break the chain (design 6.5). The
+  report's `c5_estimated` flag (`0x04`) says every entry's C5 is the platform's estimate
+  (`DecoderEvents::presented(.., estimated)`); a report never mixes estimated and measured C5, so
+  ready entries of the other kind go in a second report sent right after it (without the loss
+  bitmap and the LTR ack). `ClientStats::presented_estimated` counts them too.
+
+**Close.** `begin_close` posts `Close` and returns; the async `close()` (Kotlin `closeStream()`)
+also waits without blocking. On `Close` the executor flushes the decoder, drops every waiting frame
+and timer, posts `ClientJob::Closed` and drops its references to the decoder, the consumer's events
+and the channel; the mailbox then refuses posts, so late decoder events are dropped on their
+thread. Dropping a `ClientStream` without closing posts a close and keeps the executor alive until
+it is `Closed`. A panic in a drain posts `Failed` and `Closed` (`StopUnknown`) and abandons the
+stream.
+
 ## Tests
 
 `crates/streamcore-video/tests/`: `single_queue.rs` ports the reference host's single-queue
@@ -343,7 +457,13 @@ per-frame C ABI (layouts, a stream whose backends make every per-frame call thro
 UniFFI calls, admission, busy and failed submits, refused bytes, dead keys, compact frames, one
 wake per delivered frame); `sink.rs` the sink with its bounds on (R1 for an idle sink, every 6.4
 rule, `SinkState` and the pacer's gate, the consumed-credit RTT, refusals, revocation, rate inputs,
-`frameTiming`); `sink_loopback.rs` the sink on a real channel beside a bulk transfer.
+`frameTiming`); `sink_loopback.rs` the sink on a real channel beside a bulk transfer;
+`client_decode.rs` the client stream's policy on a fake decoder (sessions and generation changes,
+the generation's colour, the queue bound and deep decoders, busy decoders, events from inside
+`decode`, stale events, stalls, failures and
+the re-creation budget, keyframe requests and their rate limit, LTR acknowledgement and wait,
+feedback, close); `client_loopback.rs` a client stream on a real channel, its feedback arriving
+at the host.
 `StreamCoreVideo/` runs the Swift binding smoke test through the
 UniFFI calls and through the C ABI.
 

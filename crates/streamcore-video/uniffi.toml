@@ -18,3 +18,4 @@ package_name = "uniffi.streamcore_video"
 # async stream close is `closeStream()` in Kotlin.
 [bindings.kotlin.rename]
 "StreamController.close" = "closeStream"
+"ClientStream.close" = "closeStream"
