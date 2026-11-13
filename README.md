@@ -120,7 +120,9 @@ start the host, paste its connect line into the field at the bottom (or start th
 `adb shell am start -n streamcore.video.harness/.MainActivity --es connect '<connect line>'`) and
 tap Connect. The overlay shows the decoded frame rate, the queue bound, the decode time C2 → C3
 (p50, p95), drops and keyframe requests; everything is logged under the logcat tag
-`StreamCoreVideo` (`adb logcat -s StreamCoreVideo`).
+`StreamCoreVideo` (`adb logcat -s StreamCoreVideo`). On a MediaTek decoder, `--es mtk none|vpp|vilte|all` (default
+`all`) chooses which MediaTek switches are set (post-processing off, the ViLTE real-time mode,
+CPU boost); the log names the accepted ones and the depth each run saw.
 
 ## Licence
 

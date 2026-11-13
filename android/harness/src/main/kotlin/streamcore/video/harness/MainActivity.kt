@@ -27,6 +27,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import streamcore.video.android.HandlerSerialQueue
 import streamcore.video.android.MediaCodecDecoder
+import streamcore.video.android.MtkProfile
 import uniffi.streamcore_transport.ChannelPath
 import uniffi.streamcore_transport.ChannelTransport
 import uniffi.streamcore_transport.OperationCancellation
@@ -66,6 +67,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var line: EditText
     private lateinit var connect: Button
     private var surface: Surface? = null
+
+    /** `--es mtk none|vpp|vilte|all` (default all): the MediaTek switches to test. */
+    private var mtkProfile = MtkProfile.ALL
     private var session: Session? = null
     private var lastDecoded = 0uL
     private var lastStatsAt = 0L
@@ -105,6 +109,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         fullScreen()
         preferTopRefreshRate()
         intent?.getStringExtra("connect")?.let { line.setText(it) }
+        mtkProfile = MtkProfile.parse(intent?.getStringExtra("mtk"))
+        Log.i(TAG, "MediaTek profile: ${mtkProfile.name.lowercase()}")
         main.post(::refreshStats)
     }
 
@@ -221,7 +227,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         Log.i(TAG, "connected to ${channel.remoteAddress()}, frames.v4 ${channel.framesV4()}")
         val port = StreamPort()
         val queue = HandlerSerialQueue(port)
-        val decoder = MediaCodecDecoder(surface, TAG)
+        val decoder = MediaCodecDecoder(surface, TAG, mtkProfile)
         val stream = ClientStream(
             ClientParts(
                 streamId = STREAM_ID,
@@ -319,7 +325,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun format(stats: ClientStats, fps: Double, latency: Pair<Double, Double>?, decoder: MediaCodecDecoder) =
         buildString {
-            appendLine("decoder ${decoder.decoderName} (depth seen ${decoder.measuredDepth()})")
+            appendLine("decoder ${decoder.decoderName} (${decoder.profileName})")
+            appendLine("depth seen ${decoder.measuredDepth()}, learned ${stats.learnedDepth}")
             appendLine("decoded %.1f fps, total %d, presented %d".format(fps, stats.decoded.toLong(), stats.presented.toLong()))
             appendLine("queue bound ${stats.queueBound}, deep sessions ${stats.deepDecoderSessions}")
             if (latency != null) appendLine("decode C2→C3 p50 %.1f ms, p95 %.1f ms".format(latency.first, latency.second))
