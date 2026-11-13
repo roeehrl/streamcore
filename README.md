@@ -25,6 +25,7 @@ wire protocol will change.
 | `crates/streamcore-video` | The video control plane ([design](docs/STREAMCORE-VIDEO.md)): backend traits (UniFFI foreign traits), one serial executor per stream, lifecycle, latest-frame retention and recovery, and the per-frame C ABI for foreign backends (`include/streamcore_video_native.h`). P1 core; no platform backend yet. |
 | `StreamCoreInput/` | The input model's Swift package (XCFramework plus UniFFI bindings, built by a script below). |
 | `StreamCoreVideo/` | The video crate's Swift binding smoke test (`scripts/build-streamcore-video-apple.sh`). |
+| `android/` | The video client on Android (Gradle): the `streamcore-video` library (UniFFI bindings, `MediaCodecDecoder`, `HandlerSerialQueue`) and the `harness` bring-up app. |
 | `protocol/` | [`LANES.md`](protocol/LANES.md) (lane scheduling and limits), [`BINARY.md`](protocol/BINARY.md) (binary frame layouts), [`STREAM-CODES.md`](protocol/STREAM-CODES.md) (stream wire codes), [`input/`](protocol/input/README.md) (input fixtures every binding runs). |
 | `docs/` | [Secure channel](docs/SECURE-CHANNEL.md), [sessions](docs/SESSIONS.md), [capture pipeline](docs/CAPTURE-PIPELINE.md), [input model](docs/INPUT-MODEL.md), [input ownership](docs/INPUT-OWNERSHIP.md), [video design](docs/STREAMCORE-VIDEO.md), [video threading rules](docs/VIDEO-THREADING.md). |
 | `scripts/` | Input builds, the input change-log check, the scrub check and `ci.sh` (the Rust checks). |
@@ -73,11 +74,55 @@ Input model builds (see [docs/INPUT-MODEL.md](docs/INPUT-MODEL.md) for wiring th
 | Android | `bash scripts/build-streamcore-input-android.sh [abi…]` | An Android NDK (`ANDROID_NDK_HOME` or the newest in the SDK); installs `cargo-ndk` if missing | `target/streamcore-input-android/` (`jniLibs/<abi>/libstreamcore_input.so`, Kotlin bindings) |
 | Windows | `STREAMCORE_WINDOWS_HOST=<ssh host> bash scripts/build-streamcore-input-windows.sh` | A Windows PC over SSH with Git Bash, rustup and the Visual Studio C++ tools; or `STREAMCORE_INPUT_WINDOWS_CROSS=1` to cross-compile with `cargo-xwin` (no tests) | `target/streamcore-input-windows/{x64,arm64}/streamcore_input_ffi.dll` and `streamcore_input.h` |
 
+Video builds (see [docs/VIDEO-THREADING.md](docs/VIDEO-THREADING.md#builds-and-wiring) for wiring the client into an app):
+
+| Target | Command | Needs | Output |
+|---|---|---|---|
+| Apple | `bash scripts/build-streamcore-video-apple.sh` | macOS with Xcode; the script adds the five Apple Rust targets | `StreamCoreVideo/Artifacts/StreamCoreVideoFFI.xcframework` and Swift bindings; runs the Swift binding tests, compiles for iOS |
+| Android | `bash scripts/build-streamcore-video-android.sh [abi…]` | An Android NDK (`ANDROID_NDK_HOME` or the newest in the SDK); installs `cargo-ndk` if missing | `target/streamcore-video-android/` (`jniLibs/<abi>/libstreamcore_video.so`, Kotlin bindings for the video, media and transport crates); checks the bindings declare the client API |
+| Android app | `bash scripts/build-streamcore-video-android-app.sh` | The above, JDK 17 (`JAVA_HOME`, else Homebrew's `openjdk@17`) and the Android SDK with platform 36 | `android/harness/build/outputs/apk/debug/harness-debug.apk` (the `android/` Gradle project; compiles the generated Kotlin) |
+
 `python3 scripts/check-input-changes.py` fails a change to the input model that
 doesn't add an entry to `crates/streamcore-input/CHANGES.md`.
 `scripts/scrub-check.sh` fails on private host names, addresses, personal data and
 developer paths; it needs a private denylist outside the repository (see the script).
 `ci/local/linux.sh` runs `scripts/ci.sh` in a Linux container (Docker or Colima).
+
+## Example video host
+
+`crates/streamcore-video/examples/video_host.rs` is a platform-neutral host for bringing up
+clients: a real `StreamController` sending on a `SecureChannel`, a timer-driven capture and a
+synthetic encoder that loops a 60-frame 640×360 H.264 clip
+([`examples/data`](crates/streamcore-video/examples/data/README.md)). It runs on macOS, Windows
+and Linux:
+
+```sh
+cargo run --release -p streamcore-video --example video_host -- --listen <lan-ip>:7700 [--pair-port 7701] [--fps 60]
+```
+
+Give it the LAN address clients reach. It prints a connect line for each 120-second pairing
+window, `streamcore-video://<lan-ip>:7700?pair=7701&pin=<pin>&fp=<host fingerprint>`, which a
+client pairs and connects with (the Android harness in `android/` takes it pasted). The client
+advertises the `streamcore.video-demo.v1` capability; a `{"type":"keyframe"}` message of kind
+`0x01` asks for a keyframe (the encoder jumps to the clip's next IDR). The `video_client`
+example is a headless client for the same line: it pairs, connects and prints the decode
+counters without a device (its decoder only counts):
+
+```sh
+cargo run --release -p streamcore-video --example video_client -- '<connect line>' --seconds 10
+```
+
+Both are built, not run, by `cargo test`.
+
+The Android harness (`android/harness`, built by `scripts/build-streamcore-video-android-app.sh`):
+install `harness-debug.apk` (`adb install -r android/harness/build/outputs/apk/debug/harness-debug.apk`),
+start the host, paste its connect line into the field at the bottom (or start the app with
+`adb shell am start -n streamcore.video.harness/.MainActivity --es connect '<connect line>'`) and
+tap Connect. The overlay shows the decoded frame rate, the queue bound, the decode time C2 → C3
+(p50, p95), drops and keyframe requests; everything is logged under the logcat tag
+`StreamCoreVideo` (`adb logcat -s StreamCoreVideo`). On a MediaTek decoder, `--es mtk none|vpp|vilte|all` (default
+`all`) chooses which MediaTek switches are set (post-processing off, the ViLTE real-time mode,
+CPU boost); the log names the accepted ones and the depth each run saw.
 
 ## Licence
 

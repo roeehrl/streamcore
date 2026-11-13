@@ -392,18 +392,30 @@ session hung: its frames are dropped and it is re-created.
   recovery (below). A configure that fails with `Unsupported` or `InvalidSettings` fails the
   stream; another error drops the configuration (`reject_config`) until the host repeats it before
   its next keyframe.
-- **Queue bound (6.2).** When `max(2, DecoderInfo::max_queued)` frames already wait for the decoder
-  (accepted and not output, or held while it is busy), the next frame flushes them all.
-  `max_queued` is the decoder's real pipeline depth (the inputs it needs before its first output).
-  The effective bound is `ClientStats::queue_bound`; a session deeper than 2 is a latency cost on
+- **Queue bound (6.2).** When the queue bound's worth of frames already wait for the decoder
+  (accepted and not output, or held while it is busy), the next frame flushes them all. The bound
+  is `max(2, depth + 1)`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output (details below; `ClientStats::queue_bound`, and the depth in effect is
+  `ClientStats::depth`).
+  `max_queued` is the decoder's pipeline depth (the inputs it needs before its first output) as
+  the adapter knows it at configure time. Rust also learns each session's real depth: the samples
+  it accepted, from its first keyframe, up to and including its first output
+  (`ClientStats::learned_depth`); a flush restarts the count. The bound is then
+  `max(2, depth + 1)`, with the depth the larger of `max_queued` and the learned one: one frame
+  of slack beyond the decoder's pipeline, so one frame of arrival jitter (bursty Wi-Fi, a relay)
+  does not flush a decoder that always holds its depth; until the first output it is at least 4 (provisional), so
+  a decoder that needs a few inputs before it outputs anything is not flushed while it fills (a
+  decoder that never outputs is caught by the stall rule). The effective bound is
+  `ClientStats::queue_bound`; a session deeper than 2, declared or learned, is a latency cost on
   every frame (R2 wants zero reorder), counted in `ClientStats::deep_decoder_sessions`, and
   adapters should prefer decoders with a depth of 2 or less. A keyframe
   is then decoded; any other frame is dropped too, and a keyframe is requested (`QueueBound`).
 - **Busy.** After `DecodeResult::Busy` the executor holds the sample (Rust keeps a copy of every
-  sample until the decoder accepts it) and submits nothing more until `input_ready`, which submits
-  the newest held sample. A newer sample replaces a held discardable one, and a keyframe replaces
-  anything; replacing a held reference frame breaks the chain, so both are dropped and a keyframe
-  is requested (`Busy`).
+  sample until the decoder accepts it) and submits nothing more until `input_ready`. Later samples
+  wait behind it in order, as many as the queue bound leaves room for (held samples count as
+  waiting, so the bound above flushes beyond that); `input_ready` submits them in order until the
+  decoder is busy again. Nothing is skipped, so the reference chain stays intact. A keyframe that
+  arrives while samples wait makes them unnecessary: they are dropped (counted as flushed) and the
+  keyframe waits alone.
 - **Refusals and failures.** `DecodeResult::Failed` drops the frame and requests a keyframe;
   with `DeviceLost` it re-creates the session. `DecoderEvents::failed` with `recoverable` (or
   `DeviceLost`) re-creates; otherwise the stream fails (`ClientJob::Failed`; frames are dropped
@@ -446,6 +458,40 @@ and the channel; the mailbox then refuses posts, so late decoder events are drop
 thread. Dropping a `ClientStream` without closing posts a close and keeps the executor alive until
 it is `Closed`. A panic in a drain posts `Failed` and `Closed` (`StopUnknown`) and abandons the
 stream.
+
+### Builds and wiring
+
+| Platform | Script | Output |
+| --- | --- | --- |
+| Apple | `scripts/build-streamcore-video-apple.sh` | `StreamCoreVideo/Artifacts/StreamCoreVideoFFI.xcframework` and the Swift bindings in `StreamCoreVideo/Sources/StreamCoreVideo/Generated` |
+| Android | `scripts/build-streamcore-video-android.sh [abi…]` | `target/streamcore-video-android/jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libstreamcore_video.so` (API 28; 16 KB pages on the 64-bit ABIs), `target/streamcore-video-android/kotlin/uniffi/{streamcore_video,streamcore_media,streamcore_transport}/*.kt` |
+
+One library carries the scaffolding of all three crates (the video API uses `SecureChannel`,
+`TimedMessage` and `VideoWorkPermit`), and every generated Kotlin file loads it through JNA as
+`streamcore_video`. In an Android app: copy `jniLibs/*` to `src/main/jniLibs/` and
+`kotlin/uniffi/` to `src/main/kotlin/`; add JNA (`net.java.dev.jna:jna:5.19.1@aar`, as for the
+input model) and `org.jetbrains.kotlinx:kotlinx-coroutines-core` (the async calls:
+`ClientStream.nextMessage`, `closeStream`); keep `com.sun.jna.**` and `uniffi.**` in R8. The
+`.so` files are not stripped; the Android Gradle plugin strips them when it packages the app.
+The script checks that the bindings exist, load that library and declare `StreamDecoder`,
+`DecoderEvents`, `ClientEvents`, `ClientStream`, `SerialQueue` and `StreamPort`;
+`scripts/build-streamcore-video-android-app.sh` then compiles them in the Gradle project in
+`android/`. UniFFI's Kotlin objects are `AutoCloseable`, so exported `close` methods are renamed
+in Kotlin: `SecureChannel.closeChannel`, `SecureListener.closeListener`,
+`PairingService.closeService`, `VideoWorkQueue.closeQueue` (and `closeStream` as before).
+
+`android/` is the Android side (Gradle, minSdk 28): the library module `streamcore-video` bundles
+the script's output (its `syncStreamCoreVideo` task copies `target/streamcore-video-android` into
+`build/` before every build; nothing built is committed) with `MediaCodecDecoder`, the
+`StreamDecoder` below, and `HandlerSerialQueue`; the app module `harness` pairs with the example
+`video_host`'s connect line, decodes onto a full-screen `SurfaceView` and overlays the client's
+counters (logcat tag `StreamCoreVideo`). See the README's "Example video host".
+
+The Android adapter implements `SerialQueue` on the decode stream's `HandlerThread` (`wake` is
+`handler.post { port.run() }`, `wake_after` is `postDelayed` calling `port.runTimer(token)`) and
+`StreamDecoder` over an async `MediaCodec` on that thread's Looper; `decoded` is called from
+`onOutputBufferAvailable`, `presented` from the frame-rendered listener (measured C5, so
+`estimated` is false), and `now_ns` returns `System.nanoTime()`.
 
 ## Tests
 

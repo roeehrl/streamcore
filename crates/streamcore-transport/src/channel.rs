@@ -496,7 +496,10 @@ pub async fn listen_secure_with(
 }
 
 /// Connects with StreamCore's binary lanes only. Applications whose control
-/// messages pick a lane connect with [`connect_secure_with`].
+/// messages pick a lane connect with [`connect_secure_with`]. Exported to
+/// UniFFI so a native client that needs no lane policy of its own (the
+/// Android video harness) can connect without a Rust crate of its own.
+#[uniffi::export]
 pub async fn connect_secure(
     identity: Arc<PeerIdentity>,
     trusted_peer: Vec<u8>,

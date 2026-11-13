@@ -659,8 +659,9 @@ pub trait StreamDecoder: Send + Sync {   // `Decoder` in Rust; Swift has its own
 ```
 
 The contract is R2: each frame is presented when decoded; if several wait for one vsync only the
-newest is shown (R4). Rust owns reassembly, `VideoReceiver`, the two-frame decoder-queue bound
-(then flush + keyframe request), feedback and clock sync.
+newest is shown (R4). Rust owns reassembly, `VideoReceiver`, the decoder-queue bound (then flush +
+keyframe request), feedback and clock sync. As shipped the bound is `max(2, depth + 1)`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output
+([threading](VIDEO-THREADING.md#client)).
 
 **As shipped (P4).** `ClientStream` (`crates/streamcore-video/src/client.rs`) is that Rust side:
 it takes lane-1 messages (`receive`, or the `next_message(channel)` receive loop), runs the
@@ -701,7 +702,7 @@ adaptive 0–1 frame jitter buffer).
 | Written, not consumed by the peer | 32 MiB + 5 window, 64 messages per lane | ≤ max(2 frames, RTT × rate + 1 frame) | `VideoSink`, consumed-credit RTT |
 | Relayed media (adb, usbmux), all non-interactive lanes | unbounded below the lane windows | ≤ RTT × capacity + 1 fragment per connection | multiplexer (8.6) |
 | Kernel / quinn buffers | OS default / 10 MB | `TCP_NOTSENT_LOWAT` ≈ 1 frame (Windows: Rust-tracked queue, `SIO_TCP_INFO`, small `SO_SNDBUF`); quinn near BDP + 2 frames | transport |
-| Client: waiting for the decoder | renderer readiness | ≤ 2, then flush + keyframe request | Rust receiver |
+| Client: waiting for the decoder | renderer readiness | ≤ max(2, depth + 1) (depth: the larger of the declared and the learned decoder depth; 4 before the first output), then flush + keyframe request | Rust receiver |
 | Client: decoded, waiting to present | renderer internal | 1 (newest) at the next vsync | native renderer |
 
 The old per-connection limits stay as memory safety nets only.
