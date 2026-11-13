@@ -104,8 +104,10 @@ pub trait Compositor: Send + Sync {
     /// Called on every start, before any member capture opens. The pool holds
     /// at least `plan.pool_size` (permits + 2) surfaces of the plan's size.
     fn configure(&self, plan: CanvasPlan) -> Result<(), MediaError>;
-    /// Draw each member's surface into its tile (scaled to fit, the member's
-    /// colour converted to `plan.color`) and every gap black; records GPU work
+    /// Draw each member's surface into its tile (upright: a surface whose
+    /// `SurfaceInfo::rotation` is not `None` is turned by it; scaled to fit;
+    /// the member's colour converted to `plan.color`) and every gap black;
+    /// records GPU work
     /// and returns at once, like `convert`: Rust's hold on the member surfaces
     /// ends when this returns, so GPU work that still reads one keeps it valid
     /// itself. The composite is leased to Rust until `release`; its `fence`

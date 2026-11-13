@@ -587,16 +587,20 @@ as one group (a failed start stops only the members that started; a failed membe
 that member running, `StopFailed`), acknowledges the start only once every member delivered an
 image within 5 s (`stream.firstFrame`), observes the layout before allocating anything, when the
 first images are in and every 250 ms through `CaptureBackend::observe_layout`
-(`stream.layoutChanged`; a backend reports a mirrored display, or one whose rotation changed, as
-`None`), and fails on a blank, suspended or gone member (`stream.memberUnavailable`). A member
+(`stream.layoutChanged`: origin, size, scale or `DisplayLayout::rotation` differ; a mirrored or
+cloned display is `None`), and fails on a blank, suspended or gone member (`stream.memberUnavailable`). A member
 image marks the canvas dirty; a composite is drawn at most once per frame interval and is due for
 submit at once. `Compositor::configure` gets a pool of 5 (the largest permit target + 2);
 `PoolExhausted` (or `OutOfResources`) waits for Rust to release a composite (a fallback timer of
 one interval when Rust holds none). The composite's H0 and H1 are the newest changed member's;
 `StatsSnapshot` counts composites, pool waits and member images and reports the member age
 spread. Under frames.v4 each canvas start sends `layoutInfo` (the members' union filling the
-picture) for a new layout epoch, which frames carry in the `content` TLV when the plan selects
-`Content`. The compose call itself is UniFFI (one per composite), not part of the per-frame C ABI.
+picture, upright: its `rotation` is 0, since the compositor turns any member surface whose
+`SurfaceInfo::rotation` is set) for a new layout epoch, which frames carry in the `content` TLV
+when the plan selects `Content`. `DisplayLayout::rotation` is the clockwise turn from the panel's
+native scan-out to the desktop; its bounds are already rotated, so it serves layout comparison
+and input mapping, not the picture. A single target's rotation reaches the consumer as
+`layout_changed` (a new epoch), never as a gone source. The compose call itself is UniFFI (one per composite), not part of the per-frame C ABI.
 
 **Other consumer surfaces.** Consumer previews (one-shot stills, long edge ≤ 320 px) stay outside
 `streamcore-video` in v1. Audio keeps its own lane and path; only the handover (8.8) touches it.
