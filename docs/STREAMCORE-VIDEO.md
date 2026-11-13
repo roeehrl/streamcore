@@ -768,7 +768,11 @@ credit RTT above its windowed minimum, the client delay gradient, loss and quinn
 queueing exceeds one frame, +5–8%/s otherwise, with a floor against bulk. Bitrate first, then fps,
 then resolution (a new generation). The bitrate is `w·h·fps·(0.02 + 0.18q)` clamped to 2–80 Mbps,
 the config ceiling and the medium cap; a 100–200 ms rate window with a frame-level maximum QP keeps
-an IDR from blocking the link.
+an IDR from blocking the link. The 2 Mbps lower clamp applies to each tier's ceiling, not to the
+target: on a link slower than that, holding 2 Mbps would only grow the queue, so the target keeps
+falling (to 0.25 Mbps) and the frame rate and size step down instead. On VideoToolbox's low-latency
+H.264 encoder neither the rate window nor the maximum QP bounds an IDR's size (measured in P2), so
+an IDR can still take several frame intervals on a slow link; recovery prefers LTR refresh (6.5).
 
 **As shipped (P2).** `crates/streamcore-video/src/abr.rs` is the controller, a pure state
 machine with its own tests; the executor ticks it every 100 ms while
