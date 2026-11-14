@@ -180,7 +180,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
             on_source_gone: OnSourceGone::Fail,
             medium_cap_bps: None,
             adapter_luid: Some(luid),
-            refresh_interval_ns: None,
+            refresh_interval_ns: super::capture::refresh_interval_ns(output),
             pacing: streamcore_video::PacingPolicy::default(),
         },
         port,
@@ -274,7 +274,6 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     let in_window = |t: &FrameTrace| t.h1.is_some_and(|h| (measure_from..=end_at).contains(&h));
     let mut measured: Vec<FrameTrace> = frames.iter().filter(|t| in_window(t)).cloned().collect();
     let seconds = (end_at - measure_from) as f64 / 1e9;
-    let interval_ns = 1_000_000_000 / u64::from(options.fps);
 
     let synthetic_result = match log {
         Some(Ok(log)) => Some(synthetic_analysis(
@@ -333,11 +332,12 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         fps_captured: recorder.captured_between(measure_from, end_at) as f64 / seconds,
         fps_submitted: count(&|t| t.h3.is_some()) as f64 / seconds,
         fps_encoded: count(&|t| t.h4.is_some()) as f64 / seconds,
-        fps_sent: count(&|t| t.h5.is_some()) as f64 / seconds,
+        // The discard sink stamps no H5: nothing sent is measured.
+        fps_sent: None,
         counts: recorder.counts(),
         stream,
         stages: summarize_stages(measured.iter()),
-        r1_late_sends: count(&|t| t.stage("H4->H5").is_some_and(|d| d > interval_ns)),
+        r1_late_sends: None,
         synthetic: synthetic_result,
         encoded_mbps: encoded_bytes as f64 * 8.0 / 1e6 / seconds,
         keyframes: count(&|t| t.keyframe),

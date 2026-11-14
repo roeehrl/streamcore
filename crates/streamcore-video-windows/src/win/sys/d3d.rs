@@ -5,6 +5,13 @@ use super::com::Event;
 use std::ffi::c_void;
 use windows::Graphics::Capture::GraphicsCaptureItem;
 use windows::Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface};
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_ROTATION_ROTATE90, DISPLAYCONFIG_ROTATION_ROTATE180,
+    DISPLAYCONFIG_ROTATION_ROTATE270, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Foundation::{HMODULE, LUID};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -24,12 +31,16 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIOutput6,
 };
 use windows::Win32::Graphics::Gdi::{
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, HMONITOR,
+    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, HMONITOR, MONITORINFO,
 };
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
+};
 use windows::core::{Interface, PCWSTR, Result};
 
 pub fn luid_to_u64(l: LUID) -> u64 {
@@ -51,6 +62,8 @@ fn wide(s: &[u16]) -> String {
 #[derive(Clone, Debug)]
 pub struct OutputDesc {
     pub device_name: String,
+    /// The monitor's rectangle in physical desktop pixels, whatever the host process's DPI
+    /// awareness (read under a per-monitor-aware thread context; see `PhysicalPixels`).
     pub desktop: [i32; 4],
     pub attached: bool,
     /// HMONITOR value (process-local handle) for WGC's `CreateForMonitor`.
@@ -58,6 +71,113 @@ pub struct OutputDesc {
     pub bits_per_color: u32,
     pub color_space: i32,
     pub refresh_hz: Option<f64>,
+    /// The current mode's refresh rate as `QueryDisplayConfig` gives it (numerator,
+    /// denominator: 59.94 Hz stays 60000/1001); `None` if it could not be read.
+    pub refresh: Option<(u32, u32)>,
+    /// Clockwise rotation of the desktop image against the panel's native scan-out, in degrees
+    /// (0, 90, 180, 270), from the display path; 0 if it could not be read.
+    pub rotation_deg: u16,
+    /// The monitor's effective DPI (96 = 100 %); `None` if it could not be read.
+    pub dpi: Option<u32>,
+}
+
+/// Sets this thread's DPI awareness to per-monitor (v2) until dropped, so desktop coordinates
+/// read meanwhile are physical pixels. A host process may be DPI unaware or system aware, and
+/// Windows then reports a scaled display's rectangle in scaled units (a 3840x2160 display at
+/// 150 % reads as 2560x1440), while WGC delivers physical pixels.
+pub struct PhysicalPixels(DPI_AWARENESS_CONTEXT);
+
+impl PhysicalPixels {
+    pub fn new() -> Self {
+        // SAFETY: changes only this thread's awareness; the previous context is restored on drop.
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
+    }
+}
+
+impl Default for PhysicalPixels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PhysicalPixels {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: restores the context this thread had before `new`.
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+}
+
+/// The monitor rectangle in physical pixels (call under `PhysicalPixels`).
+fn monitor_rect(hmonitor: HMONITOR) -> Option<[i32; 4]> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..MONITORINFO::default()
+    };
+    // SAFETY: `info` is a valid MONITORINFO with cbSize set; a stale handle just fails.
+    let ok = unsafe { GetMonitorInfoW(hmonitor, &mut info) };
+    let r = info.rcMonitor;
+    ok.as_bool().then_some([r.left, r.top, r.right, r.bottom])
+}
+
+fn monitor_dpi(hmonitor: HMONITOR) -> Option<u32> {
+    let (mut x, mut y) = (0u32, 0u32);
+    // SAFETY: valid out pointers; a stale handle returns an error.
+    unsafe { GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.ok()?;
+    (x > 0).then_some(x)
+}
+
+/// The active display path whose source is the GDI device `device_name`: its refresh rate
+/// (numerator, denominator) and clockwise rotation in degrees.
+pub fn display_path(device_name: &str) -> Option<((u32, u32), u16)> {
+    let (mut paths, mut modes) = (0u32, 0u32);
+    // SAFETY: valid out pointers.
+    if unsafe { GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut paths, &mut modes) }
+        != ERROR_SUCCESS
+    {
+        return None;
+    }
+    let mut path_info = vec![DISPLAYCONFIG_PATH_INFO::default(); paths as usize];
+    let mut mode_info = vec![DISPLAYCONFIG_MODE_INFO::default(); modes as usize];
+    // SAFETY: the buffers hold `paths` and `modes` elements, the counts passed in; the call
+    // writes back how many it filled.
+    let r = unsafe {
+        QueryDisplayConfig(
+            QDC_ONLY_ACTIVE_PATHS,
+            &mut paths,
+            path_info.as_mut_ptr(),
+            &mut modes,
+            mode_info.as_mut_ptr(),
+            None,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return None;
+    }
+    path_info.truncate(paths as usize);
+    path_info.into_iter().find_map(|p| {
+        let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        name.header.size = std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+        name.header.adapterId = p.sourceInfo.adapterId;
+        name.header.id = p.sourceInfo.id;
+        // SAFETY: the header names a valid request type and the size of the enclosing struct.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0
+            || wide(&name.viewGdiDeviceName) != device_name
+        {
+            return None;
+        }
+        let t = p.targetInfo;
+        let refresh = (t.refreshRate.Numerator, t.refreshRate.Denominator);
+        let rotation = match t.rotation {
+            DISPLAYCONFIG_ROTATION_ROTATE90 => 90,
+            DISPLAYCONFIG_ROTATION_ROTATE180 => 180,
+            DISPLAYCONFIG_ROTATION_ROTATE270 => 270,
+            _ => 0,
+        };
+        Some((refresh, rotation))
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +212,7 @@ fn refresh_hz(device_name: &[u16]) -> Option<f64> {
 
 /// Every DXGI adapter with its outputs, in enumeration order.
 pub fn enumerate_adapters() -> Result<Vec<AdapterDesc>> {
+    let _physical = PhysicalPixels::new();
     // SAFETY: creates a factory object; no pointers involved.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
     let mut out = Vec::new();
@@ -122,14 +243,23 @@ pub fn enumerate_adapters() -> Result<Vec<AdapterDesc>> {
                 Err(_) => (0, -1),
             };
             let r = d.DesktopCoordinates;
+            let device_name = wide(&d.DeviceName);
+            let path = display_path(&device_name);
             outputs.push(OutputDesc {
-                device_name: wide(&d.DeviceName),
-                desktop: [r.left, r.top, r.right, r.bottom],
+                desktop: monitor_rect(d.Monitor).unwrap_or([r.left, r.top, r.right, r.bottom]),
                 attached: d.AttachedToDesktop.as_bool(),
                 hmonitor: d.Monitor.0 as usize,
                 bits_per_color: bits,
                 color_space: cs,
-                refresh_hz: refresh_hz(&d.DeviceName),
+                refresh_hz: path
+                    .and_then(|((num, den), _)| {
+                        (num > 0 && den > 0).then(|| f64::from(num) / f64::from(den))
+                    })
+                    .or_else(|| refresh_hz(&d.DeviceName)),
+                refresh: path.map(|(r, _)| r).filter(|(n, d)| *n > 0 && *d > 0),
+                rotation_deg: path.map_or(0, |(_, r)| r),
+                dpi: monitor_dpi(d.Monitor),
+                device_name,
             });
         }
         out.push(AdapterDesc {

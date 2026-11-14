@@ -269,8 +269,9 @@ natively:
 
 - **Windows:** QueryPerformanceCounter ticks × 10⁹ / QueryPerformanceFrequency. WGC's
   `SystemRelativeTime` is already in 100 ns units of that clock: multiply by 100.
-  Until WGC's `SystemRelativeTime` is checked on a native display (it was later than the
-  FrameArrived stamp in a remote-desktop session), Windows stages start at H1.
+  `SystemRelativeTime` (H0) is the composition's display time, which DWM reaches after handing
+  WGC the frame: on a native 60 Hz display H0 is up to about 12 ms after H1 under constant
+  redraw. H0 on Windows is therefore not earlier than H1, H3 or H4 in general.
 - **macOS:** `mach_absolute_time` × timebase (the clock of `SCStreamFrameInfo.displayTime` and the
   host `CMClock`). It stops during sleep; `mach_continuous_time` does not, and would not match
   ScreenCaptureKit's or VideoToolbox's timestamps.

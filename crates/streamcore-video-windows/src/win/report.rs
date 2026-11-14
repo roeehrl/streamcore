@@ -69,6 +69,8 @@ pub fn build() -> AdapterReport {
                 bits_per_color: o.bits_per_color,
                 color_space: colour_space_name(o.color_space),
                 refresh_hz: o.refresh_hz,
+                rotation_deg: o.rotation_deg,
+                dpi: o.dpi,
             });
             monitor_index += 1;
         }
@@ -108,7 +110,7 @@ pub fn print(r: &AdapterReport) {
         }
         for o in &a.outputs {
             println!(
-                "  monitor {}  {}  desktop {:?}  attached {}  {} bpc  {}  refresh {}",
+                "  monitor {}  {}  desktop {:?}  attached {}  {} bpc  {}  refresh {}  rotation {}  dpi {}",
                 o.monitor_index,
                 o.device_name,
                 o.desktop,
@@ -116,6 +118,8 @@ pub fn print(r: &AdapterReport) {
                 o.bits_per_color,
                 o.color_space,
                 o.refresh_hz.map_or("?".into(), |h| format!("{h} Hz")),
+                o.rotation_deg,
+                o.dpi.map_or("?".into(), |d| d.to_string()),
             );
         }
         if a.outputs.is_empty() {

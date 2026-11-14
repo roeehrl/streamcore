@@ -18,6 +18,10 @@ pub struct OutputInfo {
     pub bits_per_color: u32,
     pub color_space: String,
     pub refresh_hz: Option<f64>,
+    /// Clockwise rotation of the desktop against the panel, degrees.
+    pub rotation_deg: u16,
+    /// Effective DPI (96 = 100 %).
+    pub dpi: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,14 +149,16 @@ pub struct BenchReport {
     pub fps_captured: f64,
     pub fps_submitted: f64,
     pub fps_encoded: f64,
-    pub fps_sent: f64,
+    /// Frames pushed to a real `VideoSink` per second; `None` with the bench's discard sink,
+    /// which measures nothing.
+    pub fps_sent: Option<f64>,
     /// Recorder counters over the whole run.
     pub counts: Counts,
     /// The stream's own counters (`StreamController::stats`) at the end.
     pub stream: BTreeMap<String, u64>,
     pub stages: BTreeMap<String, Summary>,
-    /// R1: frames whose H4 -> H5 gap exceeded one frame interval.
-    pub r1_late_sends: u64,
+    /// R1: frames whose H4 -> H5 gap exceeded one frame interval; `None` with the discard sink.
+    pub r1_late_sends: Option<u64>,
     pub synthetic: Option<SyntheticResult>,
     pub encoded_mbps: f64,
     pub keyframes: u64,

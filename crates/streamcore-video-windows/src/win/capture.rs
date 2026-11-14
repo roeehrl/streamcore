@@ -11,6 +11,7 @@
 
 use super::surfaces::{Entry, Surfaces};
 use super::sys::com::{TimerPeriod, now_ns};
+use super::sys::d3d;
 use super::sys::d3d::{
     Gpu, OutputDesc, capture_item_for_monitor, enumerate_adapters, texture_from_surface,
     texture_size,
@@ -22,8 +23,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use streamcore_video::{
     CaptureBackend, CaptureCaps, CaptureEvents, CaptureId, CaptureSpec, CaptureTarget,
     CaptureTargetKind, CaptureUpdate, ColorPrimaries, ColorTags, CursorMode, DisplayLayout,
-    FrameStatus, GpuFence, MediaError, OpToken, PixelFormat, Rotation, SerialQueue, SourceCatalog,
-    SourceGone, SurfaceId, SurfaceInfo, SurfaceKind, TransferFunction, YCbCrMatrix,
+    DisplayRotation, FrameStatus, GpuFence, MediaError, OpToken, PixelFormat, Rotation,
+    SerialQueue, SourceCatalog, SourceGone, SurfaceId, SurfaceInfo, SurfaceKind, TransferFunction,
+    YCbCrMatrix,
 };
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
@@ -91,11 +93,25 @@ fn layout_of(display: u32, o: &OutputDesc, size: Option<SizeInt32>) -> DisplayLa
         display_id: display,
         pixel_width: w,
         pixel_height: h,
-        scale: 1.0,
+        scale: o.dpi.map_or(1.0, |dpi| f64::from(dpi) / 96.0),
         origin_x: o.desktop[0],
         origin_y: o.desktop[1],
-        rotation: streamcore_video::DisplayRotation::Identity, // TODO(P5): fill from QueryDisplayConfig targetInfo.rotation
+        rotation: match o.rotation_deg {
+            90 => DisplayRotation::Rotate90,
+            180 => DisplayRotation::Rotate180,
+            270 => DisplayRotation::Rotate270,
+            _ => DisplayRotation::Identity,
+        },
     }
+}
+
+/// A display's refresh interval in ns, read now from its active display path (the current
+/// mode's exact rate: 59.94 Hz is 16 683 350 ns, not 1/59). For `StreamPlan::refresh_interval_ns`,
+/// and for `StreamController::set_refresh_interval` after a mode change (`WM_DISPLAYCHANGE`).
+/// `None` when the path or its rate cannot be read: the stream then uses its target interval.
+pub fn refresh_interval_ns(output: &OutputDesc) -> Option<u64> {
+    let ((num, den), _) = d3d::display_path(&output.device_name)?;
+    crate::clock::interval_from_rational(num, den)
 }
 
 impl WgcCapture {

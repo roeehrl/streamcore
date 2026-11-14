@@ -7,7 +7,7 @@
 //!
 //! | Stamp | Point |
 //! | --- | --- |
-//! | H0 | source present: `Direct3D11CaptureFrame.SystemRelativeTime` |
+//! | H0 | the composition's display time: `Direct3D11CaptureFrame.SystemRelativeTime`. On a native display this is when the frame reaches the screen, and it can fall after H1: DWM hands WGC the frame before the refresh that shows it (about 12 ms later under constant redraw at 60 Hz, at H1 on an idle desktop) |
 //! | H1 | `FrameArrived` handler entry, on the executor thread |
 //! | H2c | convert recorded: `VideoProcessorBlt` and the fence `Signal` returned (CPU) |
 //! | H2 | convert GPU-complete: the fence reached the frame's value (a waiting thread stamps it) |
@@ -42,6 +42,14 @@ pub struct FrameTrace {
     pub keyframe: bool,
 }
 
+/// `to - from` when `to` is not before `from`; `None` otherwise.
+fn ordered(from: Option<u64>, to: Option<u64>) -> Option<u64> {
+    match (from, to) {
+        (Some(a), Some(b)) => b.checked_sub(a),
+        _ => None,
+    }
+}
+
 fn delta(from: Option<u64>, to: Option<u64>) -> Option<u64> {
     match (from, to) {
         (Some(a), Some(b)) => Some(b.saturating_sub(a)),
@@ -52,6 +60,7 @@ fn delta(from: Option<u64>, to: Option<u64>) -> Option<u64> {
 /// The stage rows a report prints, in order.
 pub const STAGES: &[(&str, &str)] = &[
     ("H0->H1", "capture: present -> FrameArrived"),
+    ("H1->H0", "FrameArrived -> on screen (H0 after H1)"),
     ("H1->H2c", "admission + convert recorded (CPU)"),
     ("H1->H2", "FrameArrived -> convert GPU-complete"),
     ("H2c->H3", "submit: permit/NeedInput wait + ProcessInput"),
@@ -70,7 +79,9 @@ impl FrameTrace {
     /// The named stage's duration, if both stamps exist. Reversed stamps give 0.
     pub fn stage(&self, name: &str) -> Option<u64> {
         match name {
-            "H0->H1" => delta(self.h0, self.h1),
+            // H0 and H1 come in either order on Windows: each row counts only its own order.
+            "H0->H1" => ordered(self.h0, self.h1),
+            "H1->H0" => ordered(self.h1, self.h0),
             "H1->H2c" => delta(self.h1, self.h2c),
             "H1->H2" => delta(self.h1, self.h2),
             "H2c->H3" => delta(self.h2c, self.h3),
