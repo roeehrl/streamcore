@@ -13,21 +13,47 @@
 //!   reported missing) and, on QUIC, quinn's lost packets and its RTT above
 //!   its windowed minimum.
 //!
-//! Queueing is the largest of the delay inputs. Above one frame interval (or
-//! on new loss) the target drops to ×0.85 of the smaller of the target and
-//! the measured video rate, at most once per `max(250 ms, 2 × RTT)`; between
-//! half a frame and a frame, or while the client delay grows, it holds;
-//! otherwise it rises by 6 % per second (6.6: 5–8 %/s), unless the encoder
-//! is application-limited (a still screen proves nothing about the link).
+//! Queueing is the largest of the delay inputs. The stream's own evidence is
+//! the sink's unsent age above one frame interval for two ticks, the sink's
+//! gate holding at least 30 % of submissions over the last second, or lost
+//! frames; delays measured across the link (credit RTT, QUIC RTT, client
+//! delay) must stay above one frame for three ticks, and lost QUIC packets
+//! count only with more than half a frame of queueing (quinn resends them, and
+//! on Wi-Fi most are radio loss or a delay spike past its threshold). On
+//! congestion the target drops to ×0.85 of the smaller of the target and the
+//! measured video rate, never by more than half, at most once per
+//! `max(250 ms, 2 × RTT)`; between half a frame and a frame, or while the
+//! client delay grows, it holds; otherwise it rises by 6 % per second (6.6:
+//! 5–8 %/s).
+//!
+//! Application-limited (the encoder produces less than half the target while
+//! the sink's gate seldom holds it and nothing waits in the sink): a still
+//! screen proves nothing about the link and cannot fill a link queue, so it
+//! does not ramp, and delays and QUIC loss hold instead of decreasing. Only a
+//! lost frame decreases it, from the target and without a tier step. Measured
+//! in P2 on Wi-Fi: a 22 kbit/s stream (one marker window) was cut to 0.85 ×
+//! 22 kbit/s, that is the 0.25 Mbit/s floor and 15 fps, by the first burst of
+//! QUIC loss, and never climbed back.
+//!
+//! Recovery: when a decrease comes while the target is flat (at the plan's
+//! rate, or held), the link changed under a rate it carried; after a second
+//! without a decrease the target climbs back to that rate at 50 % per second.
+//! A decrease that comes while climbing found the link's ceiling: 6 % per
+//! second goes beyond it. The stream's own queue on the way back lowers the
+//! rate to climb back to below where it came.
 //!
 //! The ladder is bitrate, then frame rate, then resolution (a new encoder
 //! generation): a step down happens when the target falls below the current
-//! tier's quality floor (`w·h·fps·0.02`), a step up (in the reverse order)
-//! once the target has room for the next tier (at least twice its floor, or
-//! this tier's ceiling) after a quiet period. The bitrate of a tier is
-//! `w·h·fps·(0.02 + 0.18q)`; the plan's bitrate is that at full size, so each
-//! tier's ceiling scales the plan's bitrate by its pixel rate, clamped to
-//! 2–80 Mbit/s and the medium cap.
+//! tier's quality floor (`w·h·fps·0.02`), only on the stream's own evidence
+//! and only while the target limits the encoder (delays across the link stop
+//! at the floor; an application-limited stream keeps its frame rate). A step
+//! up (in the reverse order) comes after a quiet period once the target has
+//! room for the next tier (at least twice its floor, or this tier's ceiling),
+//! or, application-limited, once the encoder's rate scaled by the higher
+//! tier's pixel rate still leaves it application-limited. The bitrate of a
+//! tier is `w·h·fps·(0.02 + 0.18q)`; the plan's bitrate is that at full size,
+//! so each tier's ceiling scales the plan's bitrate by its pixel rate, clamped
+//! to 2–80 Mbit/s and the medium cap.
 //!
 //! The floor against bulk: when bulk transfer starts competing, the target
 //! keeps at least half of what it was (and, with a known link capacity, 40 %
@@ -78,6 +104,26 @@ const RESOLUTION_UP_QUIET_NS: u64 = 5_000_000_000;
 const APP_LIMITED: f64 = 0.5;
 /// The measured video rate is a one-second window: it means nothing earlier.
 const RATE_WARMUP_NS: u64 = 1_000_000_000;
+/// The sink's own queue (unsent age) must last this long before a decrease:
+/// two ticks, so a single IDR crossing the link is not a link change.
+const SINK_PERSIST_NS: u64 = 100_000_000;
+/// The delays measured across the link (credit RTT, QUIC RTT, the client's
+/// one-way delay) must last longer: Wi-Fi power save, scans and retries
+/// raise them for a tick or two whatever the stream sends.
+const EXTERNAL_PERSIST_NS: u64 = 200_000_000;
+/// The span over which the sink's gate is judged (the measured rate's window).
+const GATE_WINDOW_NS: u64 = 1_000_000_000;
+/// At least this share of frame submissions held by the sink's gate: the link,
+/// not the content, limits the stream.
+const GATED_SHARE: f64 = 0.3;
+/// One decrease never takes more than this share of the target away: the
+/// measured rate of a nearly still screen is no measure of the link.
+const MAX_CUT: f64 = 0.5;
+/// Quiet time before the target climbs back quickly to its rate before the
+/// last episode.
+const RECOVERY_QUIET_NS: u64 = 1_000_000_000;
+/// The increase per second while recovering to that rate.
+const RECOVERY_PER_SECOND: f64 = 0.5;
 
 /// What the controller adapts: the plan's encode size, frame rate and bitrate
 /// (the full tier), and whether resolution steps are possible (the stream
@@ -118,6 +164,11 @@ pub struct AbrSample {
     pub bulk_active: bool,
     /// The link capacity, when known (not the sink's estimate).
     pub capacity_bps: Option<u64>,
+    /// Frames submitted to the encoder so far, cumulative.
+    pub encoded_frames: u64,
+    /// Submissions the sink's gate held so far (6.2: something unsent, or the
+    /// unconsumed bound reached), cumulative.
+    pub sink_held: u64,
 }
 
 /// The controller's output.
@@ -136,7 +187,9 @@ pub enum AbrState {
     Increase,
     Hold,
     Decrease,
-    /// Application-limited: the encoder produces well below the target.
+    /// Application-limited: the encoder produces well below the target and
+    /// the sink's gate seldom holds it, so the stream cannot be what fills a
+    /// link queue: delay and transport loss hold rather than decrease.
     AppLimited,
 }
 
@@ -193,8 +246,16 @@ pub struct AbrController {
     link_lost: u64,
     bulk_floor: Option<f64>,
     first_tick_ns: Option<u64>,
-    /// The previous tick saw queueing above one frame.
-    queued: bool,
+    /// Since when the sink's own queue has been above one frame.
+    sink_over_since: Option<u64>,
+    /// Since when a delay measured across the link has been above one frame.
+    external_over_since: Option<u64>,
+    /// (host time, encoded, held) per tick over the gate window.
+    gate: VecDeque<(u64, u64, u64)>,
+    /// The target before the current decrease episode, to climb back to.
+    recover_to: Option<f64>,
+    /// When the target last rose.
+    last_increase_ns: Option<u64>,
     state: AbrState,
     queueing_ns: u64,
     decreases: u64,
@@ -224,7 +285,11 @@ impl AbrController {
             link_lost: 0,
             bulk_floor: None,
             first_tick_ns: None,
-            queued: false,
+            sink_over_since: None,
+            external_over_since: None,
+            gate: VecDeque::new(),
+            recover_to: None,
+            last_increase_ns: None,
             state: AbrState::Increase,
             queueing_ns: 0,
             decreases: 0,
@@ -370,20 +435,38 @@ impl AbrController {
             .client_excess
             .filter(|(at, _)| now.saturating_sub(*at) <= CLIENT_STALE_NS)
             .map_or(0, |(_, excess)| excess);
-        let queueing = sample
-            .unsent_age_ns
-            .max(credit_excess)
-            .max(link_excess)
-            .max(client_excess);
+        let external = credit_excess.max(link_excess).max(client_excess);
+        let queueing = sample.unsent_age_ns.max(external);
         self.queueing_ns = queueing;
-        let loss =
-            sample.lost_frames > self.lost_frames || sample.link_lost_packets > self.link_lost;
+        let frame_loss = sample.lost_frames > self.lost_frames;
+        // A lost QUIC packet is retransmitted; on Wi-Fi most are radio loss or
+        // a delay spike past quinn's threshold, not a queue. It counts only
+        // with a queue of its own.
+        let link_loss = sample.link_lost_packets > self.link_lost && queueing > interval / 2;
         self.lost_frames = self.lost_frames.max(sample.lost_frames);
         self.link_lost = self.link_lost.max(sample.link_lost_packets);
         let growing = self
             .client_gradient()
             .is_some_and(|slope| slope > GRADIENT_HOLD)
             && client_excess > 0;
+
+        // The sink's gate over the last second: a link-limited stream has
+        // most of its submissions held, a still screen almost none.
+        self.gate
+            .push_back((now, sample.encoded_frames, sample.sink_held));
+        while self
+            .gate
+            .front()
+            .is_some_and(|(at, _, _)| now.saturating_sub(*at) > GATE_WINDOW_NS)
+        {
+            self.gate.pop_front();
+        }
+        let gated = self.gate.front().is_some_and(|&(_, encoded, held)| {
+            let encoded = sample.encoded_frames.saturating_sub(encoded) as f64;
+            let held = sample.sink_held.saturating_sub(held) as f64;
+            held > 0.0 && held >= (encoded + held) * GATED_SHARE
+        });
+        let below_target = (video_bps as f64) < self.target * APP_LIMITED;
 
         // The floor against bulk.
         if sample.bulk_active {
@@ -404,28 +487,78 @@ impl AbrController {
             .unwrap_or(0)
             .min(1_000_000_000);
         let gap = DECREASE_GAP_NS.max(rtt.saturating_mul(2));
-        // Queueing must persist over two ticks: a single IDR crossing the link
-        // queues briefly and is not a link change. Loss acts at once.
-        let over = queueing > interval;
-        let persistent = over && self.queued;
-        self.queued = over;
-        if persistent || loss {
+        // Queueing must persist: the sink's own for two ticks, delays measured
+        // across the link for three. Frame loss acts at once.
+        let since = |slot: &mut Option<u64>, over: bool| {
+            if over {
+                now.saturating_sub(*slot.get_or_insert(now))
+            } else {
+                *slot = None;
+                0
+            }
+        };
+        let sink_over = sample.unsent_age_ns > interval;
+        let sink_for = since(&mut self.sink_over_since, sink_over);
+        let external_for = since(&mut self.external_over_since, external > interval);
+        let sink_queue = sink_over && sink_for >= SINK_PERSIST_NS;
+        let external_queue = external > interval && external_for >= EXTERNAL_PERSIST_NS;
+        // The stream's own evidence: frames wait in the sink, the sink's gate
+        // holds the encoder, or frames are lost. Delays measured across the
+        // link and lost QUIC packets may be anyone's (Wi-Fi especially).
+        let own = sink_queue || gated || frame_loss;
+        // Far below its target with nothing of its own queued, a stream is
+        // not what fills a link queue: only lost frames (the video itself
+        // broke) move its target.
+        let app_limited = below_target && !sink_queue && !gated;
+        let congested = if app_limited {
+            frame_loss
+        } else {
+            sink_queue || external_queue || frame_loss || link_loss
+        };
+        if congested {
             let due = self
                 .last_decrease_ns
                 .is_none_or(|last| now.saturating_sub(last) >= gap);
             if due {
-                self.decrease(now, video_bps);
+                self.decrease(now, video_bps, !app_limited, own);
             } else {
                 self.state = AbrState::Hold;
             }
-        } else if over || queueing > interval / 2 || growing {
+        } else if app_limited {
+            self.state = AbrState::AppLimited;
+            if queueing <= interval / 2 {
+                self.step_up_app_limited(now, video_bps);
+            }
+        } else if queueing > interval / 2 || growing {
             self.state = AbrState::Hold;
-        } else if (video_bps as f64) < self.target * APP_LIMITED {
+        } else if below_target {
+            // Held by the sink's gate without a queue to show for it: no
+            // evidence for more.
             self.state = AbrState::AppLimited;
         } else {
             self.state = AbrState::Increase;
-            let factor = 1.0 + INCREASE_PER_SECOND * elapsed as f64 / 1e9;
-            self.target = (self.target * factor).min(self.cap(self.fps_index, self.scale_index));
+            let quiet = self
+                .last_decrease_ns
+                .is_none_or(|last| now.saturating_sub(last) >= RECOVERY_QUIET_NS);
+            let per_second = match self.recover_to {
+                Some(to) if quiet && self.target < to => RECOVERY_PER_SECOND,
+                _ => INCREASE_PER_SECOND,
+            };
+            let factor = 1.0 + per_second * elapsed as f64 / 1e9;
+            let mut target = self.target * factor;
+            if let Some(to) = self.recover_to {
+                if per_second == RECOVERY_PER_SECOND {
+                    target = target.min(to.max(self.target));
+                }
+                if target >= to {
+                    self.recover_to = None;
+                }
+            }
+            let target = target.min(self.cap(self.fps_index, self.scale_index));
+            if target > self.target {
+                self.last_increase_ns = Some(now);
+            }
+            self.target = target;
             self.step_up(now);
         }
         let floor = self.floor_abs();
@@ -437,16 +570,44 @@ impl AbrController {
         (after != before).then_some(after)
     }
 
-    fn decrease(&mut self, now: u64, video_bps: u64) {
+    /// ×0.85 of the smaller of the target and the measured rate, never below
+    /// half the target.
+    ///
+    /// `binding`: the target limits the encoder (else the measured rate is
+    /// the content's, not the link's, and the frame rate stays: fewer frames
+    /// would not lower a rate the target does not limit). `own`: the stream's
+    /// own evidence (sink queue, gate, lost frames). Only that steps the
+    /// frame rate and size down below the tier's quality floor, and only that
+    /// lowers the rate to climb back to; delays measured across the link
+    /// stop at the tier's floor.
+    fn decrease(&mut self, now: u64, video_bps: u64, binding: bool, own: bool) {
+        let before = self.target;
+        // Climbing when the queue came: the climb found the link's ceiling,
+        // and only 6 % per second goes beyond it again. Flat when it came (at
+        // the plan's rate, or held): the link changed under a rate it carried,
+        // and the target climbs back to that rate quickly once it is quiet.
+        // The stream's own queue again on that way back lowers the rate to
+        // climb back to below where it came.
+        let climbing = self
+            .last_increase_ns
+            .is_some_and(|at| now.saturating_sub(at) < RECOVERY_QUIET_NS);
+        self.recover_to = match self.recover_to {
+            Some(to) if own && climbing => Some(to.min(before * DECREASE)),
+            Some(to) => Some(to),
+            None if climbing => None,
+            None => Some(before),
+        };
         self.state = AbrState::Decrease;
         self.decreases += 1;
         self.last_decrease_ns = Some(now);
-        let base = if video_bps > 0 {
+        let base = if video_bps > 0 && binding {
             self.target.min(video_bps as f64)
         } else {
             self.target
         };
-        self.target = (base * DECREASE).min(self.target);
+        self.target = (base * DECREASE)
+            .min(self.target)
+            .max(self.target * MAX_CUT);
         if let Some(bulk) = self.bulk_floor
             && self.target <= bulk
         {
@@ -455,6 +616,14 @@ impl AbrController {
             return;
         }
         self.target = self.target.max(MIN_TARGET_BPS as f64);
+        if !binding {
+            return;
+        }
+        if !own {
+            let floor = self.floor(self.fps_index, self.scale_index);
+            self.target = self.target.max(floor.min(before));
+            return;
+        }
         // Below this tier's quality floor: the frame rate, then the resolution.
         while self.target < self.floor(self.fps_index, self.scale_index) {
             if self.fps_index + 1 < self.fps_levels.len() {
@@ -469,28 +638,60 @@ impl AbrController {
         }
     }
 
+    /// The quiet period before a tier steps back up: the resolution's when
+    /// the size is down (it costs an IDR), else the frame rate's.
+    fn quiet_enough(&self, now: u64) -> bool {
+        let quiet_since = self.last_decrease_ns.unwrap_or(0).max(self.last_step_ns);
+        let quiet = now.saturating_sub(quiet_since);
+        if self.scale_index > 0 {
+            quiet >= RESOLUTION_UP_QUIET_NS
+        } else {
+            quiet >= FPS_UP_QUIET_NS
+        }
+    }
+
     /// Back up the ladder in reverse: the resolution first (it went down
     /// last), then the frame rate, each after a quiet period and only once the
     /// target has room for the higher tier.
     fn step_up(&mut self, now: u64) {
-        let quiet_since = self.last_decrease_ns.unwrap_or(0).max(self.last_step_ns);
-        let quiet = now.saturating_sub(quiet_since);
+        if !self.quiet_enough(now) {
+            return;
+        }
         let room = |this: &Self, fps_index: usize, scale_index: usize| {
             let need = (this.floor(fps_index, scale_index) * 2.0)
                 .min(this.cap(this.fps_index, this.scale_index));
             this.target >= need
         };
         if self.scale_index > 0 {
-            if quiet >= RESOLUTION_UP_QUIET_NS && room(self, self.fps_index, self.scale_index - 1) {
+            if room(self, self.fps_index, self.scale_index - 1) {
                 self.scale_index -= 1;
                 self.tier_changes += 1;
                 self.last_step_ns = now;
             }
-        } else if self.fps_index > 0
-            && quiet >= FPS_UP_QUIET_NS
-            && room(self, self.fps_index - 1, self.scale_index)
-        {
+        } else if self.fps_index > 0 && room(self, self.fps_index - 1, self.scale_index) {
             self.fps_index -= 1;
+            self.tier_changes += 1;
+            self.last_step_ns = now;
+        }
+    }
+
+    /// An application-limited stream on a lower tier steps back up when the
+    /// higher tier's rate, scaled from what the encoder produces now by the
+    /// pixel rate, still leaves the encoder application-limited: the target's
+    /// quality floor matters only where the target limits the encoder.
+    fn step_up_app_limited(&mut self, now: u64, video_bps: u64) {
+        if (self.scale_index == 0 && self.fps_index == 0) || !self.quiet_enough(now) {
+            return;
+        }
+        let (fps_index, scale_index) = if self.scale_index > 0 {
+            (self.fps_index, self.scale_index - 1)
+        } else {
+            (self.fps_index - 1, self.scale_index)
+        };
+        let ratio = self.pixel_rate(fps_index, scale_index)
+            / self.pixel_rate(self.fps_index, self.scale_index).max(1.0);
+        if video_bps as f64 * ratio < self.target * APP_LIMITED {
+            (self.fps_index, self.scale_index) = (fps_index, scale_index);
             self.tier_changes += 1;
             self.last_step_ns = now;
         }
@@ -609,6 +810,19 @@ mod tests {
         sample.now_ns
     }
 
+    /// Three ticks 100 ms apart that all see `sample`'s delay across the link
+    /// (it must persist longer than the sink's own queue); returns the time
+    /// of the third.
+    fn delayed(abr: &mut AbrController, mut sample: AbrSample) -> u64 {
+        for _ in 0..2 {
+            abr.tick(&sample);
+            assert_ne!(abr.state(), AbrState::Decrease, "two ticks are not enough");
+            sample.now_ns += 100 * MS;
+        }
+        abr.tick(&sample);
+        sample.now_ns
+    }
+
     #[test]
     fn queueing_above_one_frame_multiplies_by_0_85() {
         let mut abr = AbrController::new(hd());
@@ -649,13 +863,13 @@ mod tests {
     fn decreases_follow_the_measured_rate_and_keep_a_gap() {
         let mut abr = AbrController::new(hd());
         let now = warm(&mut abr, 13 * MBPS);
-        let mut sample = idle(now + 100 * MS, 8 * MBPS);
+        let mut sample = idle(now + 100 * MS, 9 * MBPS);
         sample.unsent_age_ns = 40 * MS;
         let now = queued(&mut abr, sample);
         assert_eq!(
             abr.target().bitrate_bps,
-            6_800_000,
-            "0.85 × the measured 8 Mbit/s"
+            7_650_000,
+            "0.85 × the measured 9 Mbit/s"
         );
         // 100 ms later the queue is still there: within the gap it holds.
         sample.now_ns = now + 100 * MS;
@@ -689,12 +903,13 @@ mod tests {
         sample.unsent_age_ns = 40 * MS;
         let mut now = queued(&mut abr, sample);
         let start = abr.target().bitrate_bps as f64;
-        for _ in 0..10 {
+        // The first second after a decrease (later, the recovery is faster).
+        for _ in 0..9 {
             now += 100 * MS;
             abr.tick(&idle(now, abr.target().bitrate_bps));
         }
         let after = abr.target().bitrate_bps as f64;
-        let rate = after / start - 1.0;
+        let rate = (after / start).powf(1.0 / 0.9) - 1.0;
         assert!((0.05..=0.08).contains(&rate), "{rate} per second");
     }
 
@@ -721,15 +936,16 @@ mod tests {
         let mut sample = idle(now + 100 * MS, 13 * MBPS);
         // 2 ms is the minimum; 30 ms is 28 ms of queue, more than a frame.
         sample.credit_rtt_ns = Some(30 * MS);
-        queued(&mut abr, sample);
+        delayed(&mut abr, sample);
         assert_eq!(abr.state(), AbrState::Decrease);
         // A high RTT from the start is no queue: it is the minimum.
         let mut abr = AbrController::new(hd());
         let mut sample = idle(100 * MS, 13 * MBPS);
         sample.credit_rtt_ns = Some(30 * MS);
-        abr.tick(&sample);
-        sample.now_ns += 100 * MS;
-        abr.tick(&sample);
+        for _ in 0..3 {
+            abr.tick(&sample);
+            sample.now_ns += 100 * MS;
+        }
         assert_ne!(abr.state(), AbrState::Decrease);
     }
 
@@ -756,16 +972,17 @@ mod tests {
         abr.tick(&idle(now + 200 * MS, 13 * MBPS));
         assert!(abr.client_gradient().unwrap() > GRADIENT_HOLD);
         assert_eq!(abr.state(), AbrState::Hold);
-        // 25 ms over the minimum, in two reports: decrease.
-        abr.note_client_delay(now + 300 * MS, &frames(300_000, &|_| 28_000));
-        abr.tick(&idle(now + 300 * MS, 13 * MBPS));
-        abr.note_client_delay(now + 400 * MS, &frames(400_000, &|_| 28_000));
-        abr.tick(&idle(now + 400 * MS, 13 * MBPS));
+        // 25 ms over the minimum, in three reports: decrease.
+        for at in [300, 400, 500] {
+            abr.note_client_delay(now + at * MS, &frames(at * 1_000, &|_| 28_000));
+            abr.tick(&idle(now + at * MS, 13 * MBPS));
+        }
         assert_eq!(abr.state(), AbrState::Decrease);
         // A stale report counts no more.
         let mut abr2 = abr.clone();
-        abr2.tick(&idle(now + 2_000 * MS, 13 * MBPS));
-        abr2.tick(&idle(now + 2_100 * MS, 13 * MBPS));
+        for at in [2_000, 2_100, 2_200] {
+            abr2.tick(&idle(now + at * MS, 13 * MBPS));
+        }
         assert_ne!(abr2.state(), AbrState::Decrease);
     }
 
@@ -794,17 +1011,25 @@ mod tests {
         sample.now_ns += 400 * MS;
         abr.tick(&sample);
         assert_ne!(abr.state(), AbrState::Decrease);
-        // QUIC loss, and the QUIC RTT above its minimum.
+        // Lost QUIC packets alone are radio loss: quinn resends them.
         sample.now_ns += 400 * MS;
         sample.link_lost_packets = 3;
         abr.tick(&sample);
+        assert_ne!(abr.state(), AbrState::Decrease);
+        // With a queue of more than half a frame they are congestion.
+        sample.now_ns += 400 * MS;
+        sample.link_lost_packets = 6;
+        sample.unsent_age_ns = 10 * MS;
+        abr.tick(&sample);
         assert_eq!(abr.state(), AbrState::Decrease);
+        sample.unsent_age_ns = 0;
+        // The QUIC RTT above its minimum.
         sample.now_ns += 400 * MS;
         sample.link_rtt_ns = Some(5 * MS);
         abr.tick(&sample);
         sample.now_ns += 400 * MS;
         sample.link_rtt_ns = Some(40 * MS);
-        queued(&mut abr, sample);
+        delayed(&mut abr, sample);
         assert_eq!(abr.state(), AbrState::Decrease);
     }
 
@@ -991,5 +1216,237 @@ mod tests {
         assert_eq!(tiers, 0, "no fps or resolution flapping");
         assert!(low as f64 >= capacity * 0.6, "low {low}");
         assert!(high as f64 <= capacity * 1.15, "high {high}");
+    }
+    /// 1024 × 832 at 60 fps, the plan of the physical P2 runs (7.9 Mbit/s).
+    fn marker_plan() -> AbrConfig {
+        AbrConfig {
+            width: 1024,
+            height: 832,
+            fps: 60,
+            bitrate_bps: 7_923_302,
+            medium_cap_bps: None,
+            resolution_steps: false,
+        }
+    }
+
+    /// A small deterministic generator for the replays.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// The Wi-Fi of the physical P2 runs (Mac host, iPad client): a QUIC RTT
+    /// that sits near 0.7 ms and jumps to 5–20 ms for one to four ticks a few
+    /// times a second, the client's one-way delay and the credit RTT jumping
+    /// with it (up to 36 ms of queueing), quinn counting hundreds of lost
+    /// packets in bursts during the jumps, and the sink's gate holding a frame
+    /// now and then while credits are late. The traces keep only the end
+    /// values of the counters, so the series is generated to match their
+    /// ranges. `video_bps` is the encoder's output: 22 kbit/s for the marker
+    /// window, which the runs measured.
+    fn wifi_replay(
+        abr: &mut AbrController,
+        seconds: u64,
+        video_bps: impl Fn(&AbrController) -> u64,
+    ) {
+        let mut rng = Lcg(0x5eed);
+        let mut now = 0;
+        let mut spike = 0u64;
+        let (mut lost, mut encoded, mut held) = (0u64, 0u64, 0u64);
+        let mut h5_us = 0u64;
+        for _ in 0..seconds * 10 {
+            now += 100 * MS;
+            if spike == 0 && rng.below(100) < 15 {
+                spike = 1 + rng.below(4);
+            }
+            let (rtt_us, excess_us) = if spike > 0 {
+                spike -= 1;
+                lost += 5 + rng.below(60);
+                held += rng.below(2);
+                (5_000 + rng.below(15_000), 2_000 + rng.below(34_000))
+            } else {
+                (600 + rng.below(300), rng.below(800))
+            };
+            encoded += 6;
+            let frames: Vec<(u64, u64)> = (0..6)
+                .map(|_| {
+                    h5_us += 16_667;
+                    (h5_us, h5_us + 3_000_000 + 1_500 + excess_us)
+                })
+                .collect();
+            abr.note_client_delay(now, &frames);
+            abr.tick(&AbrSample {
+                now_ns: now,
+                unsent_age_ns: 0,
+                credit_rtt_ns: Some((2_000 + excess_us) * 1_000),
+                link_rtt_ns: Some(rtt_us * 1_000),
+                link_lost_packets: lost,
+                lost_frames: 0,
+                video_bps: video_bps(abr),
+                bulk_active: false,
+                capacity_bps: None,
+                encoded_frames: encoded,
+                sink_held: held,
+            });
+        }
+    }
+
+    #[test]
+    fn wifi_delay_spikes_and_radio_loss_leave_a_still_screen_alone() {
+        // The P2 failure: the marker stream (22 kbit/s against a 7.9 Mbit/s
+        // target) was cut to 0.85 × 22 kbit/s, that is the 0.25 Mbit/s floor
+        // and 15 fps, by the first loss burst, and never came back.
+        let mut abr = AbrController::new(marker_plan());
+        wifi_replay(&mut abr, 45, |_| 22_000);
+        assert_eq!(abr.decreases(), 0, "an application-limited stream holds");
+        assert_eq!(abr.tier_changes(), 0);
+        assert_eq!(
+            abr.target(),
+            AbrTarget {
+                bitrate_bps: 7_923_302,
+                fps: 60,
+                width: 1024,
+                height: 832
+            }
+        );
+    }
+
+    #[test]
+    fn a_full_rate_stream_on_the_same_wifi_comes_back_within_seconds() {
+        // Content that uses the whole target sees the same spikes as queues
+        // of its own: it decreases, and climbs back to its rate before each
+        // episode quickly instead of at 6 % per second.
+        let mut abr = AbrController::new(marker_plan());
+        wifi_replay(&mut abr, 30, |abr| abr.target().bitrate_bps);
+        assert!(abr.decreases() > 0, "the spikes are real queues here");
+        let mut now = 30_000 * MS;
+        for _ in 0..80 {
+            now += 100 * MS;
+            abr.tick(&idle(now, abr.target().bitrate_bps));
+        }
+        let target = abr.target();
+        assert_eq!(target.fps, 60);
+        assert!(
+            target.bitrate_bps as f64 >= 7_923_302.0 * 0.95,
+            "back near the plan in 8 s: {target:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_limited_stream_far_below_its_target_still_decreases() {
+        // The sink's gate holds most submissions: the link, not the content,
+        // keeps the measured rate low, so the delay is the stream's own.
+        let mut abr = AbrController::new(hd());
+        let mut now = warm(&mut abr, 13 * MBPS);
+        let (mut encoded, mut held) = (0, 0);
+        for _ in 0..30 {
+            now += 100 * MS;
+            encoded += 2;
+            held += 4;
+            let mut sample = idle(now, 2 * MBPS);
+            sample.credit_rtt_ns = Some(60 * MS);
+            sample.encoded_frames = encoded;
+            sample.sink_held = held;
+            abr.tick(&sample);
+        }
+        assert!(abr.decreases() >= 4, "{}", abr.decreases());
+        assert!(abr.target().bitrate_bps < 3 * MBPS, "{:?}", abr.target());
+    }
+
+    #[test]
+    fn one_decrease_takes_at_most_half_the_target() {
+        let mut abr = AbrController::new(hd());
+        let now = warm(&mut abr, 13 * MBPS);
+        // Gate-held (so not application-limited) at a tenth of the target.
+        let mut sample = idle(now + 100 * MS, MBPS);
+        sample.unsent_age_ns = 40 * MS;
+        sample.encoded_frames = 1;
+        sample.sink_held = 5;
+        abr.tick(&sample);
+        sample.now_ns += 100 * MS;
+        sample.encoded_frames = 2;
+        sample.sink_held = 10;
+        abr.tick(&sample);
+        assert_eq!(abr.state(), AbrState::Decrease);
+        assert_eq!(abr.target().bitrate_bps, 13_700_000 / 2);
+    }
+
+    #[test]
+    fn a_lost_frame_still_decreases_an_application_limited_stream_but_keeps_its_tier() {
+        let mut abr = AbrController::new(hd());
+        let now = warm(&mut abr, 13 * MBPS);
+        let mut sample = idle(now + 100 * MS, 20_000);
+        for lost in 1..=20 {
+            sample.now_ns += 300 * MS;
+            sample.lost_frames = lost;
+            abr.tick(&sample);
+        }
+        assert_eq!(abr.decreases(), 20);
+        assert_eq!(
+            abr.target().fps,
+            60,
+            "fewer frames would not lower its rate"
+        );
+        assert_eq!(abr.tier_changes(), 0);
+    }
+
+    #[test]
+    fn a_re_queue_on_the_way_back_lowers_the_recovery_point() {
+        // A link that really dropped to 6 Mbit/s: the fast climb back stops
+        // where the queue came back, then 6 % per second probes beyond.
+        let mut abr = AbrController::new(hd());
+        let capacity = 6.0 * MBPS as f64;
+        let mut queue_bits = 0.0f64;
+        let mut now = warm(&mut abr, 13_700_000);
+        let mut high = 0;
+        for tick in 0..600 {
+            now += 100 * MS;
+            let rate = abr.target().bitrate_bps as f64;
+            queue_bits = (queue_bits + (rate - capacity) * 0.1).max(0.0);
+            let mut sample = idle(now, rate as u64);
+            sample.unsent_age_ns = (queue_bits / capacity * 1e9) as u64;
+            abr.tick(&sample);
+            if tick > 200 {
+                high = high.max(abr.target().bitrate_bps);
+            }
+        }
+        assert!(high as f64 <= capacity * 1.15, "high {high}");
+    }
+
+    #[test]
+    fn an_application_limited_stream_steps_back_up_its_tiers() {
+        // A real squeeze took the stream to 15 fps; then the screen went
+        // still: the frame rate comes back although the target stays low,
+        // because the encoder now needs a fraction of it.
+        let mut config = hd();
+        config.resolution_steps = false;
+        let mut abr = AbrController::new(config);
+        let mut now = 0;
+        for _ in 0..200 {
+            now += 300 * MS;
+            let mut sample = idle(now, abr.target().bitrate_bps);
+            sample.unsent_age_ns = 100 * MS;
+            abr.tick(&sample);
+        }
+        assert_eq!(abr.target().fps, MIN_FPS);
+        let low = abr.target().bitrate_bps;
+        for _ in 0..300 {
+            now += 100 * MS;
+            abr.tick(&idle(now, 20_000));
+        }
+        assert_eq!(abr.state(), AbrState::AppLimited);
+        assert_eq!(abr.target().fps, 60);
+        assert_eq!(abr.target().bitrate_bps, low, "no evidence for more rate");
     }
 }
