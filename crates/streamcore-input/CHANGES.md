@@ -12,6 +12,20 @@ Pad needs to act when it re-pins. Entries before the move to this repository nam
 commits and pull requests in MyCNC's core repository, where the input model lived
 until then.
 
+## 2026-11-15 Rebelle preset: Fit and Reset rotation use keypad 0
+
+The built-in Rebelle preset's Fit (⌘0) and Reset rotation (⌘⌥0) keys now send the
+numeric keypad's 0 (`named` "keypad0") instead of the main row's "0" (`char` "0",
+`hid` 39). Pad resolves a shortcut by its character, and on a French AZERTY keyboard
+the main row types "0" only with Shift, so they went out as ⌘⇧à and ⌘⌥⇧à and Rebelle
+ignored them. Rebelle matches the typed character with exact modifiers and accepts a
+keypad digit for it (a user on AZERTY confirmed keypad 4 selects smudge where Shift+4
+does not), so the keypad key works on every layout. The fixture copy in
+`protocol/input/fixtures/presets/builtin/` changed with it. Size − and Size + keep `[`
+and `]`: no key types those on AZERTY without ⌥⇧, so French users rebind them in
+Rebelle or resize with ⌘+drag. **Pad doesn't need to act beyond re-pinning:** users
+who edited their Rebelle profile keep their own copy and don't get this change.
+
 ## 2026-11-02 Rebelle preset: zoom in is Cmd = (`5753560`)
 
 The built-in Rebelle preset's `fallbacks.zoomIn` is now ⌘= (`char` "=", `hid` 46,
