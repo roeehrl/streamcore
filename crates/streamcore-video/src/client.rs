@@ -50,16 +50,18 @@ const LOSS_KEPT: usize = LossBitmap::MAX_BYTES * 8;
 /// fail the stream.
 const RECREATE_BUDGET: usize = 3;
 const RECREATE_WINDOW_NS: u64 = 10_000_000_000;
-/// The queue bound until a session's depth is learned (see
-/// [`DEPTH_WINDOW_OUTPUTS`]): generous, so a decoder that needs a few inputs before it
-/// outputs anything is not flushed while it fills.
-const PROVISIONAL_QUEUE_BOUND: u8 = 4;
 /// Frames of arrival-jitter slack in the queue bound beyond
-/// `max(queue_bound, depth + 1)`: a burst of two frames while one decodes
-/// must not flush, since a flush costs every frame until the next keyframe
-/// (up to the host's keyframe interval) where the slack costs at most two
-/// frame intervals of queueing.
-const QUEUE_JITTER_SLACK: u8 = 2;
+/// `max(queue_bound, depth + 1)`: a burst of frames while one decodes must
+/// not flush, since a flush costs every frame until the next keyframe (up to
+/// the host's keyframe interval) where the slack costs at most three frame
+/// intervals of queueing. Measured on a hardware decoder one deep at 60 fps
+/// over USB: a bound of 4 (slack 2) ran clean for about 30 s, then one
+/// disturbance started a loop of flushes it never left (each recovery
+/// keyframe decodes slower and overran the bound again); a bound of 5 never
+/// did. The slack also keeps the bound generous before the depth is learned
+/// (at least 5), so a decoder that needs a few inputs before its first
+/// output is not flushed while it fills.
+const QUEUE_JITTER_SLACK: u8 = 3;
 /// Outputs at the start of a session left out of depth learning: a decoder's
 /// first outputs after a configure are slow (a cold start), so more inputs
 /// pile up before them than its pipeline holds.
@@ -96,10 +98,10 @@ pub struct DecoderInfo {
     /// for a low-latency decoder). Rust also learns the real depth from the
     /// session's steady state (`ClientStats::learned_depth`), which then
     /// replaces this one, so an adapter that cannot know it reports its best
-    /// guess. The decoder queue bound is `max(2, depth + 1) + 2` with the
-    /// depth in effect (6.2):
-    /// two frames of arrival-jitter slack beyond the pipeline; at least 4
-    /// until the depth is learned. A depth above 2 is a latency cost on every frame (R2
+    /// guess. The decoder queue bound is `max(2, depth + 1) + 3` with the
+    /// depth in effect (6.2): three frames of arrival-jitter slack beyond
+    /// the pipeline; until the depth is learned this declared one is the
+    /// floor. A depth above 2 is a latency cost on every frame (R2
     /// wants zero reorder and no pipeline): adapters should prefer a decoder
     /// with a depth of 2 or less, and Rust counts such sessions
     /// (`ClientStats::deep_decoder_sessions`).
@@ -227,9 +229,9 @@ pub struct ClientStats {
     pub ltr_acks: u64,
     /// Decoder sessions configured.
     pub sessions: u64,
-    /// The current session's decoder queue bound: `max(2, depth + 1) + 2`,
-    /// or the provisional bound (at least 4) until the session's depth is
-    /// learned (0 before the first session).
+    /// The current session's decoder queue bound: `max(2, depth + 1) + 3`,
+    /// on the declared depth until the session's depth is learned (0 before
+    /// the first session).
     pub queue_bound: u32,
     /// The current session's depth in effect: `learned_depth` once learned,
     /// `DecoderInfo::max_queued` until then. Frames a decoder this deep holds back are its
@@ -325,9 +327,9 @@ pub enum ClientJob {
 pub struct ClientTimings {
     /// Frames waiting for the decoder (accepted and not decoded, or held while
     /// it is busy) before a flush and a keyframe request (6.2: 2). The bound
-    /// is `max(queue_bound, depth + 1) + 2` (two frames of arrival-jitter
+    /// is `max(queue_bound, depth + 1) + 3` (three frames of arrival-jitter
     /// slack), with the learned depth, or `DecoderInfo::max_queued` until it
-    /// is learned (and then at least 4).
+    /// is learned.
     pub queue_bound: u8,
     /// No decoder output for this long while frames wait re-creates the
     /// decoder (500 ms).
@@ -1614,24 +1616,17 @@ impl ClientState {
         self.in_flight.iter().filter(|f| f.seq > output).count() + self.held.len()
     }
 
-    /// `max(2, depth + 1) + 2` with the depth in effect ([`Self::depth`]): one frame
-    /// beyond the decoder's pipeline plus [`QUEUE_JITTER_SLACK`], so a burst
-    /// of two frames while one decodes does not flush it, and a sustained
-    /// backlog still does. Until the depth is learned the declared depth
-    /// stands in for it, and the bound is at least
-    /// [`PROVISIONAL_QUEUE_BOUND`].
+    /// `max(2, depth + 1) + 3` with the depth in effect ([`Self::depth`]):
+    /// one frame beyond the decoder's pipeline plus [`QUEUE_JITTER_SLACK`],
+    /// so a burst of frames while one decodes does not flush it, and a
+    /// sustained backlog still does. Until the depth is learned the declared
+    /// depth stands in for it (the floor).
     fn queue_bound(&self) -> usize {
-        let depth = self.depth();
         let bound = self
             .timings
             .queue_bound
-            .max(depth.saturating_add(1))
+            .max(self.depth().saturating_add(1))
             .saturating_add(QUEUE_JITTER_SLACK);
-        let bound = if self.learned_depth.is_some() {
-            bound
-        } else {
-            bound.max(PROVISIONAL_QUEUE_BOUND)
-        };
         usize::from(bound)
     }
 
