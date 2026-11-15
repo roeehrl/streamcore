@@ -235,7 +235,15 @@ async fn recovered_tcp_retries_while_a_quic_blackhole_is_pending() {
         }
     });
     let server = tokio::spawn(async move {
-        let mut accepted = listener.accept().await.unwrap();
+        // Any local process may connect to a loopback port (a local app that
+        // probes newly opened ports with HTTP made this test flaky): a failed
+        // handshake is that connection's alone, so wait for the bridged one.
+        let mut accepted = loop {
+            match listener.accept().await {
+                Ok(session) => break session,
+                Err(error) => eprintln!("ignoring a failed incoming handshake: {error:?}"),
+            }
+        };
         assert_eq!(
             accepted.receive().await.unwrap(),
             b"one application message"
@@ -292,11 +300,30 @@ async fn cancelling_a_tcp_race_stops_further_retry_connections() {
     }
     task.abort();
     assert!(task.await.is_err_and(|error| error.is_cancelled()));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(750), gate.accept())
-            .await
-            .is_err()
-    );
+    // The kernel completes a TCP handshake on its own: a retry whose connect
+    // was issued just before the abort can still sit in the accept backlog.
+    // Drain those, then no new retry may arrive. A retry opens with a TLS
+    // handshake record; any other local process may connect to a loopback
+    // port too (a local app that probes newly opened ports with HTTP made this
+    // test flaky), so only a connection that starts a TLS handshake counts.
+    while tokio::time::timeout(Duration::from_millis(50), gate.accept())
+        .await
+        .is_ok()
+    {}
+    let quiet_until = tokio::time::Instant::now() + Duration::from_millis(750);
+    while let Ok(accepted) = tokio::time::timeout_at(quiet_until, gate.accept()).await {
+        let (mut connection, _) = accepted.unwrap();
+        let mut first = [0u8; 1];
+        let read = tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::io::AsyncReadExt::read(&mut connection, &mut first),
+        )
+        .await;
+        assert!(
+            !matches!(read, Ok(Ok(1)) if first[0] == 0x16),
+            "a TLS retry connected after the dial was cancelled"
+        );
+    }
 }
 
 #[tokio::test]
