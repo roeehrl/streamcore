@@ -446,25 +446,26 @@ fn video_feedback_fixture_is_exact() {
             bits: vec![0b0000_0101],
         }),
         ltr_ack: Some(9),
+        c5_estimated: true,
         frames: vec![FramePresentation {
             sequence: 0x30,
             receive_us: 10,
             decode_us: 11,
-            present_us: 0,
+            present_us: 12,
         }],
     };
     let mut fixture = vec![7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0];
     fixture.extend([0x30, 0, 0, 0, 0, 0, 0, 0]);
     fixture.extend([6, 5, 4, 3, 2, 1, 0, 0]);
     fixture.extend([1, 0, 0, 0, 2, 0, 0, 0]);
-    fixture.push(3); // loss bitmap and LTR ack present
+    fixture.push(7); // loss bitmap and LTR ack present, C5 estimated
     fixture.extend([0x2e, 0, 0, 0, 0, 0, 0, 0, 1, 0b0000_0101]);
     fixture.extend([9, 0, 0, 0]);
     fixture.push(1);
     fixture.extend([0x30, 0, 0, 0, 0, 0, 0, 0]);
     fixture.extend([10, 0, 0, 0, 0, 0, 0, 0]);
     fixture.extend([11, 0, 0, 0, 0, 0, 0, 0]);
-    fixture.extend([0; 8]);
+    fixture.extend([12, 0, 0, 0, 0, 0, 0, 0]);
     assert_eq!(feedback.encode().unwrap(), fixture);
     assert_eq!(VideoFeedback::decode(&fixture).unwrap(), feedback);
     validate_video_control(0x12, &fixture).unwrap();
@@ -478,16 +479,28 @@ fn video_feedback_fixture_is_exact() {
     let minimal = VideoFeedback {
         loss: None,
         ltr_ack: None,
+        c5_estimated: false,
         frames: vec![],
         ..feedback.clone()
     };
     let bytes = minimal.encode().unwrap();
     assert_eq!(bytes.len(), 38);
+    assert_eq!(bytes[36], 0);
     assert_eq!(VideoFeedback::decode(&bytes).unwrap(), minimal);
+    // The estimated flag alone (`0x04`).
+    let estimated = VideoFeedback {
+        c5_estimated: true,
+        ..minimal.clone()
+    };
+    let estimated_bytes = estimated.encode().unwrap();
+    assert_eq!(estimated_bytes[36], 0x04);
+    assert_eq!(VideoFeedback::decode(&estimated_bytes).unwrap(), estimated);
     // Unknown flag bits, zero generation, an empty bitmap, too many frames.
-    let mut flags = bytes.clone();
-    flags[36] = 4;
-    assert!(VideoFeedback::decode(&flags).is_err());
+    for unknown in [0x08, 0x10, 0x80] {
+        let mut flags = bytes.clone();
+        flags[36] = unknown;
+        assert!(VideoFeedback::decode(&flags).is_err());
+    }
     for bad in [
         VideoFeedback {
             generation: 0,
