@@ -395,13 +395,18 @@ session hung: its frames are dropped and it is re-created.
   its next keyframe.
 - **Queue bound (6.2).** When the queue bound's worth of frames already wait for the decoder
   (accepted and not output, or held while it is busy), the next frame flushes them all. The bound
-  is `max(2, depth + 1) + 2`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output (details below; `ClientStats::queue_bound`, and the depth in effect is
+  is `max(2, depth + 1) + 2`, with the learned depth, or the declared `max_queued` until it is learned (and then at least 4, provisional) (details below; `ClientStats::queue_bound`, and the depth in effect is
   `ClientStats::depth`).
   `max_queued` is the decoder's pipeline depth (the inputs it needs before its first output) as
-  the adapter knows it at configure time. Rust also learns each session's real depth: the samples
-  it accepted, from its first keyframe, up to and including its first output
-  (`ClientStats::learned_depth`); a flush restarts the count. The bound is then
-  `max(2, depth + 1) + 2`, with the depth the larger of `max_queued` and the learned one: one
+  the adapter knows it at configure time. Rust also learns each session's real depth from its
+  steady state (`ClientStats::learned_depth`): at each output it notes the samples the decoder
+  holds (accepted from its first keyframe and not output, the one being output included, less any
+  it skipped), and the depth is the smallest of those at outputs 6 to 35. The first five are left
+  out because a decoder's first outputs after a configure are slow: inputs pile up before them, so
+  the first output alone read a depth of 2 to 5 on a decoder one deep at 60 fps. Arrival jitter only
+  adds to what a decoder holds, so the minimum is its pipeline. A flush before then starts over,
+  and a new session learns again. The bound is then
+  `max(2, depth + 1) + 2`, with the learned depth in place of the declared guess: one
   frame beyond the decoder's pipeline plus two frames of arrival-jitter slack, so a burst of two
   frames while one decodes (bursty Wi-Fi, a relay, USB) does not flush a decoder that always holds
   its depth, while a decoder that falls behind for good still flushes. One frame of slack was not
@@ -410,7 +415,7 @@ session hung: its frames are dropped and it is re-created.
   the next keyframe (up to the host's keyframe interval), where the slack costs at most two frame
   intervals of queueing (at 60 fps and depth 3, a bound of 6 is about 100 ms). The rule counts
   frames rather than ages because the frame rate is not fixed (ABR, adaptive permits, a still
-  screen sends nothing). Until the first output the bound is at least 4 (provisional), so
+  screen sends nothing). Until the depth is learned the bound is at least 4 (provisional), so
   a decoder that needs a few inputs before it outputs anything is not flushed while it fills (a
   decoder that never outputs is caught by the stall rule). The effective bound is
   `ClientStats::queue_bound`; a session deeper than 2, declared or learned, is a latency cost on

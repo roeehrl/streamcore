@@ -226,11 +226,11 @@ fn a_frame_before_the_configuration_requests_a_keyframe() {
 fn more_than_four_waiting_frames_flush_and_request_a_keyframe() {
     let c = Client::new();
     c.config(5);
-    // The first output teaches the stream the decoder's depth (1): bound
-    // max(2, 1 + 1) + 2 = 4.
+    // Until the depth is learned the bound is provisional: 4, as much as
+    // max(2, 1 + 1) + 2 for a decoder one deep.
     c.key(5, 1);
     c.output(1);
-    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (1, 4));
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
     for seq in 2..=5 {
         c.delta(5, seq);
     }
@@ -305,6 +305,98 @@ fn a_decoder_three_deep_runs_without_flushes() {
     assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
 }
 
+/// A cold start: the first outputs after a configure come late, so inputs
+/// pile up before them. The depth is learned from the steady state after it,
+/// not from the first output.
+#[test]
+fn a_cold_start_does_not_inflate_the_learned_depth() {
+    let c = Client::new();
+    c.config(5);
+    // Four inputs before the first output, then one output per input but
+    // still three behind for the rest of the cold start...
+    c.key(5, 1);
+    for seq in 2..=4 {
+        c.delta(5, seq);
+    }
+    c.output(1);
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
+    // ...then the decoder catches up and outputs each input at once.
+    c.output(2);
+    c.output(3);
+    c.output(4);
+    let mut seq = 4;
+    for _ in 0..40 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+        c.advance_ms(16);
+    }
+    let stats = c.stats();
+    // One deep: bound max(2, 1 + 1) + 2.
+    assert_eq!((stats.learned_depth, stats.depth), (1, 1));
+    assert_eq!(stats.queue_bound, 4);
+    assert_eq!(stats.deep_decoder_sessions, 0);
+    assert_eq!(stats.queue_flushes, 0);
+}
+
+/// The declared depth is the adapter's guess: the learned one replaces it.
+#[test]
+fn the_learned_depth_replaces_the_declared_guess() {
+    let c = Client::new();
+    *lock(&c.decoder.max_queued) = 2;
+    c.config(5);
+    // max(2, 2 + 1) + 2 on the guess until the depth is learned.
+    assert_eq!((c.stats().depth, c.stats().queue_bound), (2, 5));
+    c.key(5, 1);
+    c.output(1);
+    for seq in 2..=40 {
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    let stats = c.stats();
+    assert_eq!(
+        (stats.learned_depth, stats.depth, stats.queue_bound),
+        (1, 1, 4)
+    );
+}
+
+/// Until the window after the cold start is full the bound stays
+/// provisional, and a flush starts learning again.
+#[test]
+fn learning_waits_for_the_window_and_restarts_after_a_flush() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    let mut seq = 1;
+    // 34 outputs: the cold start and all but one of the window.
+    for _ in 0..33 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    assert_eq!(c.stats().learned_depth, 0);
+    // A backlog flushes before the window fills: learning starts over.
+    for _ in 0..5 {
+        seq += 1;
+        c.delta(5, seq);
+    }
+    assert_eq!(c.stats().queue_flushes, 1);
+    seq += 1;
+    c.key(5, seq);
+    c.output(seq);
+    for _ in 0..33 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    assert_eq!(c.stats().learned_depth, 0);
+    seq += 1;
+    c.delta(5, seq);
+    c.output(seq);
+    assert_eq!(c.stats().learned_depth, 1);
+}
+
 /// The rule the slack is for: on a decoder two or three deep, frames that
 /// arrive in pairs while one decodes (bursty Wi-Fi, a relay, USB) never
 /// flush; a decoder that falls behind for good still does.
@@ -319,9 +411,17 @@ fn bursts_of_two_do_not_flush_and_a_sustained_backlog_does() {
             c.delta(5, seq);
         }
         c.output(1);
-        assert_eq!(c.stats().learned_depth, depth as u32);
+        // Steady state until the depth is learned.
         let mut seq = depth;
         let mut out = 1;
+        for _ in 0..40 {
+            seq += 1;
+            c.delta(5, seq);
+            out += 1;
+            c.output(out);
+            c.advance_ms(16);
+        }
+        assert_eq!(c.stats().learned_depth, depth as u32);
         let mut input = |c: &Client| {
             seq += 1;
             c.delta(5, seq);

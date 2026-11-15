@@ -50,8 +50,8 @@ const LOSS_KEPT: usize = LossBitmap::MAX_BYTES * 8;
 /// fail the stream.
 const RECREATE_BUDGET: usize = 3;
 const RECREATE_WINDOW_NS: u64 = 10_000_000_000;
-/// The queue bound until a session's first output, when its depth is not
-/// known yet: generous, so a decoder that needs a few inputs before it
+/// The queue bound until a session's depth is learned (see
+/// [`DEPTH_WINDOW_OUTPUTS`]): generous, so a decoder that needs a few inputs before it
 /// outputs anything is not flushed while it fills.
 const PROVISIONAL_QUEUE_BOUND: u8 = 4;
 /// Frames of arrival-jitter slack in the queue bound beyond
@@ -60,6 +60,13 @@ const PROVISIONAL_QUEUE_BOUND: u8 = 4;
 /// (up to the host's keyframe interval) where the slack costs at most two
 /// frame intervals of queueing.
 const QUEUE_JITTER_SLACK: u8 = 2;
+/// Outputs at the start of a session left out of depth learning: a decoder's
+/// first outputs after a configure are slow (a cold start), so more inputs
+/// pile up before them than its pipeline holds.
+const DEPTH_COLD_OUTPUTS: u64 = 5;
+/// Outputs after the cold start whose smallest occupancy is the learned
+/// depth.
+const DEPTH_WINDOW_OUTPUTS: u64 = 30;
 
 // ---------------------------------------------------------------------------
 // Records.
@@ -87,11 +94,12 @@ pub struct DecoderInfo {
     /// The decoder's pipeline depth as far as the adapter knows it at
     /// configure time: the inputs it needs before its first output (0 or 1
     /// for a low-latency decoder). Rust also learns the real depth from the
-    /// session's first output (`ClientStats::learned_depth`), so an adapter
-    /// that cannot know it reports its best guess. The decoder queue bound
-    /// is `max(2, depth + 1) + 2` with the larger of the two depths (6.2):
+    /// session's steady state (`ClientStats::learned_depth`), which then
+    /// replaces this one, so an adapter that cannot know it reports its best
+    /// guess. The decoder queue bound is `max(2, depth + 1) + 2` with the
+    /// depth in effect (6.2):
     /// two frames of arrival-jitter slack beyond the pipeline; at least 4
-    /// until the first output. A depth above 2 is a latency cost on every frame (R2
+    /// until the depth is learned. A depth above 2 is a latency cost on every frame (R2
     /// wants zero reorder and no pipeline): adapters should prefer a decoder
     /// with a depth of 2 or less, and Rust counts such sessions
     /// (`ClientStats::deep_decoder_sessions`).
@@ -220,18 +228,19 @@ pub struct ClientStats {
     /// Decoder sessions configured.
     pub sessions: u64,
     /// The current session's decoder queue bound: `max(2, depth + 1) + 2`,
-    /// or the provisional bound (at least 4) until the session's first output
-    /// (0 before the first session).
+    /// or the provisional bound (at least 4) until the session's depth is
+    /// learned (0 before the first session).
     pub queue_bound: u32,
-    /// The current session's depth in effect: the larger of
-    /// `DecoderInfo::max_queued` and `learned_depth` (the declared one until
-    /// the first output). Frames a decoder this deep holds back are its
+    /// The current session's depth in effect: `learned_depth` once learned,
+    /// `DecoderInfo::max_queued` until then. Frames a decoder this deep holds back are its
     /// built-in latency.
     #[uniffi(default = 0)]
     pub depth: u32,
-    /// The current session's pipeline depth as learned from its first
-    /// output: the samples it accepted, from its first keyframe, up to and
-    /// including the first one it output (0 until then).
+    /// The current session's pipeline depth as learned from its steady
+    /// state: the fewest samples it held (accepted and not output, the one
+    /// being output included) at any of its outputs 6 to 35, leaving out the
+    /// slow first outputs after a configure (0 until then; a flush before
+    /// then starts over).
     pub learned_depth: u32,
     /// Sessions whose decoder pipeline is deeper than 2, as declared
     /// (`DecoderInfo::max_queued`) or learned: each holds frames back, a
@@ -317,9 +326,8 @@ pub struct ClientTimings {
     /// Frames waiting for the decoder (accepted and not decoded, or held while
     /// it is busy) before a flush and a keyframe request (6.2: 2). The bound
     /// is `max(queue_bound, depth + 1) + 2` (two frames of arrival-jitter
-    /// slack), with the depth the larger of
-    /// `DecoderInfo::max_queued` and the learned one (at least 4 until the
-    /// session's first output).
+    /// slack), with the learned depth, or `DecoderInfo::max_queued` until it
+    /// is learned (and then at least 4).
     pub queue_bound: u8,
     /// No decoder output for this long while frames wait re-creates the
     /// decoder (500 ms).
@@ -958,14 +966,48 @@ struct SessionCounters {
     /// frame decoded inside `decode` (or while its event waits in the
     /// mailbox) no longer counts against the queue bound.
     output: AtomicU64,
-    /// Samples the session holds counted towards its depth: raised by the
-    /// executor before each `decode` from the session's first keyframe (and
-    /// lowered again when it is not accepted), reset by a flush.
+    /// Samples the session accepted, counted towards its depth: raised by
+    /// the executor before each `decode` from the session's first keyframe
+    /// (and lowered again when it is not accepted) until the depth is
+    /// learned, reset by a flush.
     accepted: AtomicU64,
-    /// `accepted` when the session's first output arrived (0: none yet),
-    /// taken by the port at the output itself, so a sample accepted while
-    /// the event waits in the mailbox does not count.
-    depth: AtomicU64,
+    /// Outputs while learning, counted by the port at the output itself.
+    outputs: AtomicU64,
+    /// Accepted samples the decoder never output (it skipped them): they
+    /// left its pipeline without an output.
+    skipped: AtomicU64,
+    /// The smallest occupancy (samples accepted and not yet output,
+    /// including the one being output) seen at an output inside the window
+    /// after the cold start: the depth once the window is full. A decoder
+    /// `d` deep holds `d` at every output, and arrival jitter only adds to
+    /// that, so the minimum is the pipeline. `u64::MAX`: none yet.
+    min_occupancy: AtomicU64,
+}
+
+impl SessionCounters {
+    fn new() -> Self {
+        Self {
+            min_occupancy: AtomicU64::new(u64::MAX),
+            ..Self::default()
+        }
+    }
+
+    /// Learning starts again (a flush emptied the pipeline).
+    fn restart(&self) {
+        self.accepted.store(0, Ordering::Release);
+        self.outputs.store(0, Ordering::Release);
+        self.skipped.store(0, Ordering::Release);
+        self.min_occupancy.store(u64::MAX, Ordering::Release);
+    }
+
+    /// The learned depth once the window is full.
+    fn steady_depth(&self) -> Option<u64> {
+        if self.outputs.load(Ordering::Acquire) < DEPTH_COLD_OUTPUTS + DEPTH_WINDOW_OUTPUTS {
+            return None;
+        }
+        let min = self.min_occupancy.load(Ordering::Acquire);
+        (min != u64::MAX).then_some(min.max(1))
+    }
 }
 
 /// One decoder session's [`DecoderEvents`]: holds the executor weakly and
@@ -986,15 +1028,19 @@ impl DecoderPort {
 
 impl DecoderEvents for DecoderPort {
     fn decoded(&self, seq: u64, c3_ns: u64) {
-        self.counters.output.fetch_max(seq, Ordering::AcqRel);
-        let accepted = self.counters.accepted.load(Ordering::Acquire);
+        let counters = &self.counters;
+        counters.output.fetch_max(seq, Ordering::AcqRel);
+        let accepted = counters.accepted.load(Ordering::Acquire);
         if accepted > 0 {
-            let _ = self.counters.depth.compare_exchange(
-                0,
-                accepted,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let before = counters.outputs.fetch_add(1, Ordering::AcqRel);
+            let gone = before + counters.skipped.load(Ordering::Acquire);
+            let occupancy = accepted.saturating_sub(gone);
+            let n = before + 1;
+            if n > DEPTH_COLD_OUTPUTS && n <= DEPTH_COLD_OUTPUTS + DEPTH_WINDOW_OUTPUTS {
+                counters
+                    .min_occupancy
+                    .fetch_min(occupancy, Ordering::AcqRel);
+            }
         }
         self.post(ClientEvent::Decoded {
             session: self.session,
@@ -1101,7 +1147,8 @@ struct ClientState {
     clock_offset_ns: i128,
     /// The current session's counters (shared with its port).
     counters: Arc<SessionCounters>,
-    /// The current session's learned depth (`None` until its first output).
+    /// The current session's learned depth (`None` until the window after
+    /// the cold start is full).
     learned_depth: Option<u8>,
     in_flight: VecDeque<InFlight>,
     /// Samples waiting, in order, while the decoder is busy.
@@ -1180,7 +1227,7 @@ impl ClientState {
             live: false,
             info: None,
             clock_offset_ns: 0,
-            counters: Arc::default(),
+            counters: Arc::new(SessionCounters::new()),
             learned_depth: None,
             in_flight: VecDeque::new(),
             held: VecDeque::new(),
@@ -1511,7 +1558,7 @@ impl ClientState {
         self.session += 1;
         self.live = false;
         self.busy = false;
-        self.counters = Arc::default();
+        self.counters = Arc::new(SessionCounters::new());
         self.learned_depth = None;
         self.stats.learned_depth = 0;
         let port: Arc<dyn DecoderEvents> = Arc::new(DecoderPort {
@@ -1567,16 +1614,14 @@ impl ClientState {
         self.in_flight.iter().filter(|f| f.seq > output).count() + self.held.len()
     }
 
-    /// `max(2, depth + 1) + 2` once the session output a frame, with the
-    /// depth the larger of `max_queued` and the learned one: one frame
+    /// `max(2, depth + 1) + 2` with the depth in effect ([`Self::depth`]): one frame
     /// beyond the decoder's pipeline plus [`QUEUE_JITTER_SLACK`], so a burst
     /// of two frames while one decodes does not flush it, and a sustained
-    /// backlog still does. Before the first output the declared depth stands
-    /// in for the learned one, and the bound is at least
+    /// backlog still does. Until the depth is learned the declared depth
+    /// stands in for it, and the bound is at least
     /// [`PROVISIONAL_QUEUE_BOUND`].
     fn queue_bound(&self) -> usize {
-        let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
-        let depth = declared.max(self.learned_depth.unwrap_or(0));
+        let depth = self.depth();
         let bound = self
             .timings
             .queue_bound
@@ -1590,13 +1635,17 @@ impl ClientState {
         usize::from(bound)
     }
 
-    /// The session output a frame: its depth is the samples it had accepted
-    /// (from its first keyframe) when its first output arrived.
+    /// The session output a frame: once the window after the cold start is
+    /// full, its depth is the smallest occupancy seen at an output there
+    /// (see [`SessionCounters::min_occupancy`]). Until then the bound stays
+    /// provisional.
     fn learn_depth(&mut self) {
         if self.learned_depth.is_some() {
             return;
         }
-        let depth = self.counters.depth.load(Ordering::Acquire).max(1);
+        let Some(depth) = self.counters.steady_depth() else {
+            return;
+        };
         let depth = u8::try_from(depth).unwrap_or(u8::MAX);
         self.learned_depth = Some(depth);
         self.stats.learned_depth = u32::from(depth);
@@ -1608,10 +1657,12 @@ impl ClientState {
         self.stats.depth = u32::from(self.depth());
     }
 
-    /// The depth in effect: the larger of the declared and the learned one.
+    /// The depth in effect: the learned one once the window is full (it
+    /// measures this session), the declared one (the adapter's guess) until
+    /// then.
     fn depth(&self) -> u8 {
         let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
-        declared.max(self.learned_depth.unwrap_or(0))
+        self.learned_depth.unwrap_or(declared)
     }
 
     /// A frame the receiver passed: the queue bound, then the busy hold, then
@@ -1764,7 +1815,7 @@ impl ClientState {
         let dropped = self.waiting() as u64;
         // A flushed decoder fills again: learning restarts at the next keyframe.
         if self.learned_depth.is_none() {
-            self.counters.accepted.store(0, Ordering::Release);
+            self.counters.restart();
         }
         for entry in std::mem::take(&mut self.in_flight) {
             self.finish(entry.generation, entry.seq);
@@ -1920,6 +1971,11 @@ impl ClientState {
         // Frames accepted before it got no output.
         let skipped: Vec<_> = self.in_flight.drain(..index).collect();
         if !skipped.is_empty() {
+            if self.learned_depth.is_none() {
+                self.counters
+                    .skipped
+                    .fetch_add(skipped.len() as u64, Ordering::AcqRel);
+            }
             self.count_flushed(skipped.len() as u64);
             for entry in skipped {
                 self.finish(entry.generation, entry.seq);
