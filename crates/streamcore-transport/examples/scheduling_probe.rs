@@ -79,12 +79,22 @@ async fn serve(listener: Arc<SecureListener>) -> Result<()> {
             result = sessions.join_next(), if !sessions.is_empty() => {
                 // Peer closure/protocol failure is scoped to that connection.
                 // Ending the listener here can cancel a later measured peer.
-                match result.ok_or("missing session")?? {
-                    Ok(()) => {},
-                    Err(error) => eprintln!("probe peer ended: {error}"),
+                match result.ok_or("missing session")? {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => eprintln!("probe peer ended: {error}"),
+                    Err(error) => eprintln!("probe peer task ended: {error}"),
                 }
             }
-            session = listener.accept(), if sessions.len() < 2 => { sessions.spawn(echo(session?)); }
+            session = listener.accept(), if sessions.len() < 2 => match session {
+                Ok(session) => { sessions.spawn(echo(session)); }
+                // The listener itself closed: stop serving.
+                Err(ChannelError::Closed) => return Err(ChannelError::Closed.into()),
+                // A handshake that failed is that connection's alone. Returning
+                // here dropped `sessions` and aborted the live echo with it, so
+                // the measured peer saw its channel close mid-run (a stray
+                // handshake right after a QUIC round, about one self-test in two).
+                Err(error) => eprintln!("probe accept failed: {error}"),
+            },
         }
     }
 }
