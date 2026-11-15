@@ -167,8 +167,7 @@
             "type": "shortcut",
             "shortcut": {
               "key": {
-                "char": "0",
-                "hid": 39
+                "named": "keypad0"
               },
               "modifiers": 8
             }
@@ -181,8 +180,7 @@
             "type": "shortcut",
             "shortcut": {
               "key": {
-                "char": "0",
-                "hid": 39
+                "named": "keypad0"
               },
               "modifiers": 12
             }
