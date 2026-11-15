@@ -54,6 +54,12 @@ const RECREATE_WINDOW_NS: u64 = 10_000_000_000;
 /// known yet: generous, so a decoder that needs a few inputs before it
 /// outputs anything is not flushed while it fills.
 const PROVISIONAL_QUEUE_BOUND: u8 = 4;
+/// Frames of arrival-jitter slack in the queue bound beyond
+/// `max(queue_bound, depth + 1)`: a burst of two frames while one decodes
+/// must not flush, since a flush costs every frame until the next keyframe
+/// (up to the host's keyframe interval) where the slack costs at most two
+/// frame intervals of queueing.
+const QUEUE_JITTER_SLACK: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Records.
@@ -83,9 +89,9 @@ pub struct DecoderInfo {
     /// for a low-latency decoder). Rust also learns the real depth from the
     /// session's first output (`ClientStats::learned_depth`), so an adapter
     /// that cannot know it reports its best guess. The decoder queue bound
-    /// is `max(2, depth + 1)` with the larger of the two depths (6.2): one
-    /// frame of slack beyond the pipeline; at least 4 until the first
-    /// output. A depth above 2 is a latency cost on every frame (R2
+    /// is `max(2, depth + 1) + 2` with the larger of the two depths (6.2):
+    /// two frames of arrival-jitter slack beyond the pipeline; at least 4
+    /// until the first output. A depth above 2 is a latency cost on every frame (R2
     /// wants zero reorder and no pipeline): adapters should prefer a decoder
     /// with a depth of 2 or less, and Rust counts such sessions
     /// (`ClientStats::deep_decoder_sessions`).
@@ -213,8 +219,8 @@ pub struct ClientStats {
     pub ltr_acks: u64,
     /// Decoder sessions configured.
     pub sessions: u64,
-    /// The current session's decoder queue bound: `max(2, depth + 1)`, or
-    /// the provisional bound (at least 4) until the session's first output
+    /// The current session's decoder queue bound: `max(2, depth + 1) + 2`,
+    /// or the provisional bound (at least 4) until the session's first output
     /// (0 before the first session).
     pub queue_bound: u32,
     /// The current session's depth in effect: the larger of
@@ -310,7 +316,8 @@ pub enum ClientJob {
 pub struct ClientTimings {
     /// Frames waiting for the decoder (accepted and not decoded, or held while
     /// it is busy) before a flush and a keyframe request (6.2: 2). The bound
-    /// is `max(queue_bound, depth + 1)`, with the depth the larger of
+    /// is `max(queue_bound, depth + 1) + 2` (two frames of arrival-jitter
+    /// slack), with the depth the larger of
     /// `DecoderInfo::max_queued` and the learned one (at least 4 until the
     /// session's first output).
     pub queue_bound: u8,
@@ -1560,23 +1567,25 @@ impl ClientState {
         self.in_flight.iter().filter(|f| f.seq > output).count() + self.held.len()
     }
 
-    /// `max(2, depth + 1)` once the session output a frame, with the depth
-    /// the larger of `max_queued` and the learned one: one frame of slack
-    /// beyond the decoder's pipeline, so one frame of arrival jitter does
-    /// not flush it. Before the first output, at least
+    /// `max(2, depth + 1) + 2` once the session output a frame, with the
+    /// depth the larger of `max_queued` and the learned one: one frame
+    /// beyond the decoder's pipeline plus [`QUEUE_JITTER_SLACK`], so a burst
+    /// of two frames while one decodes does not flush it, and a sustained
+    /// backlog still does. Before the first output the declared depth stands
+    /// in for the learned one, and the bound is at least
     /// [`PROVISIONAL_QUEUE_BOUND`].
     fn queue_bound(&self) -> usize {
         let declared = self.info.as_ref().map_or(0, |info| info.max_queued);
-        let bound = match self.learned_depth {
-            Some(depth) => self
-                .timings
-                .queue_bound
-                .max(declared.max(depth).saturating_add(1)),
-            None => self
-                .timings
-                .queue_bound
-                .max(declared.saturating_add(1))
-                .max(PROVISIONAL_QUEUE_BOUND),
+        let depth = declared.max(self.learned_depth.unwrap_or(0));
+        let bound = self
+            .timings
+            .queue_bound
+            .max(depth.saturating_add(1))
+            .saturating_add(QUEUE_JITTER_SLACK);
+        let bound = if self.learned_depth.is_some() {
+            bound
+        } else {
+            bound.max(PROVISIONAL_QUEUE_BOUND)
         };
         usize::from(bound)
     }

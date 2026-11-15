@@ -394,15 +394,22 @@ session hung: its frames are dropped and it is re-created.
   its next keyframe.
 - **Queue bound (6.2).** When the queue bound's worth of frames already wait for the decoder
   (accepted and not output, or held while it is busy), the next frame flushes them all. The bound
-  is `max(2, depth + 1)`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output (details below; `ClientStats::queue_bound`, and the depth in effect is
+  is `max(2, depth + 1) + 2`, with the depth the larger of the declared `max_queued` and the learned depth, and a provisional 4 before the first output (details below; `ClientStats::queue_bound`, and the depth in effect is
   `ClientStats::depth`).
   `max_queued` is the decoder's pipeline depth (the inputs it needs before its first output) as
   the adapter knows it at configure time. Rust also learns each session's real depth: the samples
   it accepted, from its first keyframe, up to and including its first output
   (`ClientStats::learned_depth`); a flush restarts the count. The bound is then
-  `max(2, depth + 1)`, with the depth the larger of `max_queued` and the learned one: one frame
-  of slack beyond the decoder's pipeline, so one frame of arrival jitter (bursty Wi-Fi, a relay)
-  does not flush a decoder that always holds its depth; until the first output it is at least 4 (provisional), so
+  `max(2, depth + 1) + 2`, with the depth the larger of `max_queued` and the learned one: one
+  frame beyond the decoder's pipeline plus two frames of arrival-jitter slack, so a burst of two
+  frames while one decodes (bursty Wi-Fi, a relay, USB) does not flush a decoder that always holds
+  its depth, while a decoder that falls behind for good still flushes. One frame of slack was not
+  enough on a hardware decoder two or three deep at 60 fps: a decode near 20 ms (p95) with two
+  arrivals close together flushed about twice a second, and each flush costs every frame until
+  the next keyframe (up to the host's keyframe interval), where the slack costs at most two frame
+  intervals of queueing (at 60 fps and depth 3, a bound of 6 is about 100 ms). The rule counts
+  frames rather than ages because the frame rate is not fixed (ABR, adaptive permits, a still
+  screen sends nothing). Until the first output the bound is at least 4 (provisional), so
   a decoder that needs a few inputs before it outputs anything is not flushed while it fills (a
   decoder that never outputs is caught by the stall rule). The effective bound is
   `ClientStats::queue_bound`; a session deeper than 2, declared or learned, is a latency cost on
