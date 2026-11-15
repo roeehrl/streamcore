@@ -801,18 +801,30 @@ RTT of the last 300 ms over its 10 s minimum, the client's one-way delay (each f
 `videoFeedback` receive time minus its H5, so the clock offset cancels) over its 10 s minimum and
 its slope over 500 ms (`StreamController::note_client_feedback`), lost frames (refused, shed as
 aged, or missing in the client's bitmap) and, on QUIC, quinn's RTT over its minimum and its lost
-packets (`SecureChannel::link_stats`). Queueing above one frame interval on two ticks in a row (a
-single IDR crossing the link is not a link change), or new loss, multiplies the target by 0.85
-(of the smaller of the target and the measured rate) at most once per `max(250 ms, 2 × RTT)`;
-half a frame of queueing or a rising client delay holds; otherwise the target rises 6 % per
-second unless the encoder is application-limited (below half the target). The plan's rate and
+packets (`SecureChannel::link_stats`), plus the encoded and sink-held submission counts. The
+sink's unsent age above one frame interval on two ticks in a row (a single IDR crossing the link
+is not a link change), a delay measured across the link above one frame on three (Wi-Fi raises
+those for a tick or two whatever the stream sends), or new lost frames multiply the target by
+0.85 (of the smaller of the target and the measured rate, never cutting more than half) at most
+once per `max(250 ms, 2 × RTT)`; lost QUIC packets count only with more than half a frame of
+queueing; half a frame of queueing or a rising client delay holds; otherwise the target rises 6 %
+per second unless the encoder is below half the target. Application-limited (below half the
+target while the sink's gate held under 30 % of submissions in the last second and nothing waits
+in the sink), delays and QUIC loss hold instead of decreasing, and a lost frame decreases from
+the target without a tier step: in the P2 Wi-Fi runs a 22 kbit/s marker stream was otherwise cut
+to the 0.25 Mbit/s floor and 15 fps by its first burst of QUIC loss, for good. After a decrease
+that came while the target was flat, a second without one climbs back to that rate at 50 % per
+second; one that came while climbing found the ceiling, and the stream's own queue on the way
+back lowers the rate to climb back to. The plan's rate and
 size are the ceiling; a tier's ceiling is the plan's bitrate scaled by its pixel rate, clamped to
 2–80 Mbit/s and the medium cap. A tier steps down when the target falls below its quality floor
-`w·h·fps·0.02`: the frame rate first (the pacer admits fewer frames; `RateUpdate::fps` is only a
+`w·h·fps·0.02` on the stream's own evidence (sink queue, gate, lost frames) while the target
+limits the encoder (delays across the link stop at the floor): the frame rate first (the pacer admits fewer frames; `RateUpdate::fps` is only a
 hint), through 90/60/45/30/20/15, then the size (3/4, then 1/2, on the convert path only; a new
 encoder generation). The target itself goes as low as 0.25 Mbit/s, so the lower tiers' floors
 are reachable. Steps back up go in reverse (size, then frame rate) after 5 s and 2 s without a
-decrease, once the target has room for the higher tier. While bulk is sent (`link_stats`'s bulk
+decrease, once the target has room for the higher tier (application-limited: once the
+encoder's rate scaled by the higher tier's pixel rate still leaves it below half the target). While bulk is sent (`link_stats`'s bulk
 byte count grew within 1 s) the target keeps at least half of its rate when bulk began (40 % of a
 known capacity), with no tier step at that floor. The bulk bucket's video rate is the target
 while video is active (at least the measured rate). `RateUpdate::rate_window_ms` (150 ms) and,

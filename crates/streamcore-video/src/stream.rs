@@ -2517,6 +2517,8 @@ impl StreamState {
             bulk_active,
             capacity_bps: (!sink.capacity_estimated && sink.capacity_bps != 0)
                 .then_some(sink.capacity_bps),
+            encoded_frames: self.stats.encoded,
+            sink_held: self.stats.sink_held,
         };
         let changed = self.abr.as_mut().and_then(|abr| abr.tick(&sample));
         if let Some(target) = changed {
