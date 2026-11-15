@@ -67,6 +67,9 @@ async fn channels_over(
 struct Received {
     /// (sequence, arrival µs) of each video payload.
     video: Vec<(u64, u64)>,
+    /// (presentation µs, arrival µs) of each video payload, where a test
+    /// needs to match arrivals to the frames it sent.
+    video_pts: Vec<(u64, u64)>,
     bulk: usize,
     bulk_done_us: Option<u64>,
     frame_timing: usize,
@@ -229,10 +232,12 @@ fn p95(values: &mut [u64]) -> u64 {
 }
 
 /// The P2 scheduling gate (9.6, 11): with rate adaptation on, a 60 fps stream's
-/// frames keep arriving at most 1.5 frame intervals apart (p95) while a real
-/// bulk transfer runs, on TLS/TCP and on QUIC.
+/// frames are delayed by the transport at most half a frame interval more than
+/// its best case (p95) while a real bulk transfer runs, on TLS/TCP and on
+/// QUIC. Measured per frame from send to arrival, so the test host's own timer
+/// jitter (which moves both) is not counted against the transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn video_gaps_stay_within_one_and_a_half_frames_under_a_real_transfer() {
+async fn video_added_delay_stays_within_half_a_frame_under_a_real_transfer() {
     set_transport_tuning(TransportTuning {
         bulk_token_bucket: true,
         ..TransportTuning::default()
@@ -258,6 +263,8 @@ async fn video_gaps_stay_within_one_and_a_half_frames_under_a_real_transfer() {
                             if packet.metadata.flags != 2 {
                                 r.video
                                     .push((packet.metadata.sequence, message.complete_us));
+                                r.video_pts
+                                    .push((packet.metadata.pts_micros, message.complete_us));
                             }
                         }
                         0x40 => {
@@ -334,31 +341,53 @@ async fn video_gaps_stay_within_one_and_a_half_frames_under_a_real_transfer() {
             .filter(|at| *at > bulk_start && *at <= bulk_end)
             .collect();
         let mut gaps: Vec<u64> = arrivals.windows(2).map(|w| w[1] - w[0]).collect();
+        let gap_p95 = p95(&mut gaps);
+        // What the transport adds to each frame: its arrival less the moment
+        // the test sent it (frame n has pts n × 16 667 µs, sent at
+        // `sent_at[n - 1]`), less the smallest such delay. The producer's own
+        // timer jitter on a loaded test host moves send and arrival together,
+        // so it cancels out here, where it did not in the arrival gaps.
+        let delays: Vec<u64> = r
+            .video_pts
+            .iter()
+            .filter(|(_, at)| *at > bulk_start && *at <= bulk_end)
+            .filter_map(|(pts, at)| {
+                let n = (pts + 8_333) / 16_667;
+                let sent = *sent_at.get(usize::try_from(n).ok()?.checked_sub(1)?)?;
+                at.checked_sub(sent)
+            })
+            .collect();
+        let floor = delays.iter().copied().min().unwrap_or(0);
+        let mut added: Vec<u64> = delays.iter().map(|d| d - floor).collect();
+        let added_p95 = p95(&mut added);
         let sends: Vec<u64> = sent_at
             .iter()
             .copied()
             .filter(|at| *at > bulk_start && *at <= bulk_end)
             .collect();
         let mut send_gaps: Vec<u64> = sends.windows(2).map(|w| w[1] - w[0]).collect();
-        let gap_p95 = p95(&mut gaps);
         let send_p95 = p95(&mut send_gaps);
         let stats = s.controller.stats();
         eprintln!(
-            "{name}: {} frames during {} µs of bulk; arrival gap p95 {gap_p95} µs (send gap p95 \
-             {send_p95} µs, max {} µs); target {} bit/s, {} decreases",
+            "{name}: {} frames during {} µs of bulk; added delay p95 {added_p95} µs over a \
+             {floor} µs floor (arrival gap p95 {gap_p95} µs, send gap p95 {send_p95} µs); \
+             target {} bit/s, {} decreases",
             arrivals.len(),
             bulk_end - bulk_start,
-            gaps.last().unwrap(),
             stats.abr_target_bps,
             stats.abr_decreases
         );
         assert!(arrivals.len() >= 10, "video flowed during bulk");
-        // 1.5 × 16.667 ms. The producer's own timer jitter is in the number:
-        // allow it on top (a loaded test host), never more than 2 frames.
-        let allowed = 25_000 + send_p95.saturating_sub(16_667);
+        assert_eq!(
+            delays.len(),
+            arrivals.len(),
+            "every arrival matched its send"
+        );
+        // Half a frame interval: video queued behind bulk shows up here at
+        // once, while the test host's own timer jitter does not.
         assert!(
-            gap_p95 <= allowed.min(33_334),
-            "arrival gap p95 {gap_p95} µs (allowed {allowed})"
+            added_p95 <= 8_000,
+            "transport-added delay p95 {added_p95} µs (floor {floor} µs)"
         );
         assert_eq!(stats.packets_refused, 0);
         s.close();
