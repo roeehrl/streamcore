@@ -41,6 +41,7 @@ import uniffi.streamcore_video.ClientJob
 import uniffi.streamcore_video.ClientParts
 import uniffi.streamcore_video.ClientStats
 import uniffi.streamcore_video.ClientStream
+import uniffi.streamcore_video.ClientTimings
 import uniffi.streamcore_video.Codec
 import uniffi.streamcore_video.ColorPrimaries
 import uniffi.streamcore_video.ColorTags
@@ -70,6 +71,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     /** `--es mtk none|vpp|vilte|all` (default all): the MediaTek switches to test. */
     private var mtkProfile = MtkProfile.ALL
+    private var queueBound: Int? = null
     private var session: Session? = null
     private var lastDecoded = 0uL
     private var lastStatsAt = 0L
@@ -111,6 +113,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         intent?.getStringExtra("connect")?.let { line.setText(it) }
         mtkProfile = MtkProfile.parse(intent?.getStringExtra("mtk"))
         Log.i(TAG, "MediaTek profile: ${mtkProfile.name.lowercase()}")
+        // A test knob (`--ei qbound N`): `ClientTimings.queueBound`, the floor
+        // under `depth + 1` before the jitter slack.
+        queueBound = intent?.getIntExtra("qbound", 0)?.takeIf { it > 0 }
+        queueBound?.let { Log.i(TAG, "queue bound floor $it") }
         main.post(::refreshStats)
     }
 
@@ -239,7 +245,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 decoder = decoder,
                 events = Jobs(channel),
                 channel = channel,
-                timings = null,
+                timings = queueBound?.let {
+                    ClientTimings(
+                        queueBound = it.toUByte(),
+                        stallNs = 500_000_000uL,
+                        ltrWaitNs = 150_000_000uL,
+                        keyframeIntervalNs = 500_000_000uL,
+                        feedbackIntervalNs = 100_000_000uL,
+                        flushBoundNs = 500_000_000uL,
+                    )
+                },
             ),
         )
         // The receive loop: video stays in Rust; anything else is logged.
