@@ -99,17 +99,17 @@ fn the_effective_queue_bound_and_deep_decoders_are_reported() {
     c.config(5);
     c.key(5, 1);
     c.output(1);
-    // max(2, 1 + 1) + 2.
+    // Provisional on the declared depth (1): max(2, 1 + 1) + 3.
     assert_eq!(
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
-        (4, 0)
+        (5, 0)
     );
     *lock(&c.decoder.max_queued) = 5;
     c.config(6);
-    // max(2, 5 + 1) + 2.
+    // max(2, 5 + 1) + 3.
     assert_eq!(
         (c.stats().queue_bound, c.stats().deep_decoder_sessions),
-        (8, 1)
+        (9, 1)
     );
     // The depth in effect: declared 5 before any output.
     assert_eq!((c.stats().depth, c.stats().learned_depth), (5, 0));
@@ -226,31 +226,31 @@ fn a_frame_before_the_configuration_requests_a_keyframe() {
 fn more_than_four_waiting_frames_flush_and_request_a_keyframe() {
     let c = Client::new();
     c.config(5);
-    // The first output teaches the stream the decoder's depth (1): bound
-    // max(2, 1 + 1) + 2 = 4.
+    // Until the depth is learned the bound is provisional on the declared
+    // depth (1): max(2, 1 + 1) + 3 = 5.
     c.key(5, 1);
     c.output(1);
-    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (1, 4));
-    for seq in 2..=5 {
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 5));
+    for seq in 2..=6 {
         c.delta(5, seq);
     }
-    // Four wait; a fifth delta flushes them and itself.
+    // Five wait; a sixth delta flushes them and itself.
     assert_eq!(c.decoder.flushes(), 0);
-    c.delta(5, 6);
+    c.delta(5, 7);
     assert_eq!(c.decoder.flushes(), 1);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5]);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6]);
     assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::QueueBound]);
     let stats = c.stats();
-    assert_eq!((stats.queue_flushes, stats.flushed), (1, 5));
+    assert_eq!((stats.queue_flushes, stats.flushed), (1, 6));
     // Deltas until the keyframe are dropped (the request is not repeated
     // inside the interval).
-    c.delta(5, 7);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5]);
-    c.key(5, 8);
-    c.output(8);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 8]);
+    c.delta(5, 8);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6]);
+    c.key(5, 9);
+    c.output(9);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6, 9]);
     // Late outputs of the flushed frames name nothing.
-    c.decoder.decoded(5);
+    c.decoder.decoded(6);
     c.queue.pump();
     assert_eq!(c.stats().decoded, 2);
 }
@@ -259,15 +259,16 @@ fn more_than_four_waiting_frames_flush_and_request_a_keyframe() {
 fn until_the_first_output_the_bound_is_provisional() {
     let c = Client::new();
     c.config(5);
-    assert_eq!(c.stats().queue_bound, 4);
-    // Four inputs without an output are not a backlog yet.
+    // On the declared depth (1): max(2, 1 + 1) + 3.
+    assert_eq!(c.stats().queue_bound, 5);
+    // Five inputs without an output are not a backlog yet.
     c.key(5, 1);
-    for seq in 2..=4 {
+    for seq in 2..=5 {
         c.delta(5, seq);
     }
     assert_eq!(c.decoder.flushes(), 0);
-    // A fifth is.
-    c.delta(5, 5);
+    // A sixth is.
+    c.delta(5, 6);
     assert_eq!(c.decoder.flushes(), 1);
 }
 
@@ -287,8 +288,8 @@ fn a_decoder_three_deep_runs_without_flushes() {
     }
     let stats = c.stats();
     assert_eq!((stats.learned_depth, stats.depth), (3, 3));
-    // One frame beyond the pipeline plus two of jitter slack.
-    assert_eq!(stats.queue_bound, 6);
+    // One frame beyond the pipeline plus three of jitter slack.
+    assert_eq!(stats.queue_bound, 7);
     assert_eq!(stats.deep_decoder_sessions, 1);
     assert_eq!((stats.queue_flushes, stats.flushed), (0, 0));
     assert!(c.jobs.keyframe_requests().is_empty());
@@ -302,7 +303,99 @@ fn a_decoder_three_deep_runs_without_flushes() {
     assert_eq!(c.stats().decoded, 120);
     // A new session learns again.
     c.config(6);
-    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 4));
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 5));
+}
+
+/// A cold start: the first outputs after a configure come late, so inputs
+/// pile up before them. The depth is learned from the steady state after it,
+/// not from the first output.
+#[test]
+fn a_cold_start_does_not_inflate_the_learned_depth() {
+    let c = Client::new();
+    c.config(5);
+    // Four inputs before the first output, then one output per input but
+    // still three behind for the rest of the cold start...
+    c.key(5, 1);
+    for seq in 2..=4 {
+        c.delta(5, seq);
+    }
+    c.output(1);
+    assert_eq!((c.stats().learned_depth, c.stats().queue_bound), (0, 5));
+    // ...then the decoder catches up and outputs each input at once.
+    c.output(2);
+    c.output(3);
+    c.output(4);
+    let mut seq = 4;
+    for _ in 0..40 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+        c.advance_ms(16);
+    }
+    let stats = c.stats();
+    // One deep: bound max(2, 1 + 1) + 3.
+    assert_eq!((stats.learned_depth, stats.depth), (1, 1));
+    assert_eq!(stats.queue_bound, 5);
+    assert_eq!(stats.deep_decoder_sessions, 0);
+    assert_eq!(stats.queue_flushes, 0);
+}
+
+/// The declared depth is the adapter's guess: the learned one replaces it.
+#[test]
+fn the_learned_depth_replaces_the_declared_guess() {
+    let c = Client::new();
+    *lock(&c.decoder.max_queued) = 2;
+    c.config(5);
+    // The guess is the floor until the depth is learned: max(2, 2 + 1) + 3.
+    assert_eq!((c.stats().depth, c.stats().queue_bound), (2, 6));
+    c.key(5, 1);
+    c.output(1);
+    for seq in 2..=40 {
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    let stats = c.stats();
+    assert_eq!(
+        (stats.learned_depth, stats.depth, stats.queue_bound),
+        (1, 1, 5)
+    );
+}
+
+/// Until the window after the cold start is full the bound stays
+/// provisional, and a flush starts learning again.
+#[test]
+fn learning_waits_for_the_window_and_restarts_after_a_flush() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    let mut seq = 1;
+    // 34 outputs: the cold start and all but one of the window.
+    for _ in 0..33 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    assert_eq!(c.stats().learned_depth, 0);
+    // A backlog flushes before the window fills: learning starts over.
+    for _ in 0..6 {
+        seq += 1;
+        c.delta(5, seq);
+    }
+    assert_eq!(c.stats().queue_flushes, 1);
+    seq += 1;
+    c.key(5, seq);
+    c.output(seq);
+    for _ in 0..33 {
+        seq += 1;
+        c.delta(5, seq);
+        c.output(seq);
+    }
+    assert_eq!(c.stats().learned_depth, 0);
+    seq += 1;
+    c.delta(5, seq);
+    c.output(seq);
+    assert_eq!(c.stats().learned_depth, 1);
 }
 
 /// The rule the slack is for: on a decoder two or three deep, frames that
@@ -319,9 +412,17 @@ fn bursts_of_two_do_not_flush_and_a_sustained_backlog_does() {
             c.delta(5, seq);
         }
         c.output(1);
-        assert_eq!(c.stats().learned_depth, depth as u32);
+        // Steady state until the depth is learned.
         let mut seq = depth;
         let mut out = 1;
+        for _ in 0..40 {
+            seq += 1;
+            c.delta(5, seq);
+            out += 1;
+            c.output(out);
+            c.advance_ms(16);
+        }
+        assert_eq!(c.stats().learned_depth, depth as u32);
         let mut input = |c: &Client| {
             seq += 1;
             c.delta(5, seq);
@@ -349,11 +450,11 @@ fn bursts_of_two_do_not_flush_and_a_sustained_backlog_does() {
         }
         let stats = c.stats();
         assert_eq!(stats.queue_flushes, 0, "depth {depth}");
-        assert_eq!(stats.queue_bound, depth as u32 + 3, "depth {depth}");
+        assert_eq!(stats.queue_bound, depth as u32 + 4, "depth {depth}");
         assert!(c.jobs.keyframe_requests().is_empty(), "depth {depth}");
         // Sustained overload: arrivals keep coming, outputs stop. From
-        // `depth - 1` waiting, the fifth arrival finds the bound full.
-        for _ in 0..4 {
+        // `depth - 1` waiting, the sixth arrival finds the bound full.
+        for _ in 0..5 {
             input(&c);
         }
         assert_eq!(c.stats().queue_flushes, 0, "depth {depth}");
@@ -373,17 +474,17 @@ fn a_keyframe_over_the_bound_flushes_without_a_request() {
     c.config(5);
     c.key(5, 1);
     c.output(1);
-    for seq in 2..=5 {
+    for seq in 2..=6 {
         c.delta(5, seq);
     }
-    c.key(5, 6);
+    c.key(5, 7);
     assert_eq!(c.decoder.flushes(), 1);
-    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6]);
-    assert!(c.jobs.keyframe_requests().is_empty());
-    assert_eq!(c.stats().flushed, 4);
-    c.output(6);
-    c.delta(5, 7);
     assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6, 7]);
+    assert!(c.jobs.keyframe_requests().is_empty());
+    assert_eq!(c.stats().flushed, 5);
+    c.output(7);
+    c.delta(5, 8);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 #[test]
@@ -391,12 +492,12 @@ fn the_decoders_declared_depth_raises_the_bound() {
     let c = Client::new();
     *lock(&c.decoder.max_queued) = 4;
     c.config(5);
-    // max(2, 4 + 1) + 2 = 7.
-    for seq in 1..=7 {
+    // max(2, 4 + 1) + 3 = 8.
+    for seq in 1..=8 {
         c.sample(5, seq, seq == 1, Default::default());
     }
     assert_eq!(c.decoder.flushes(), 0);
-    c.delta(5, 8);
+    c.delta(5, 9);
     assert_eq!(c.decoder.flushes(), 1);
 }
 
@@ -473,13 +574,13 @@ fn a_full_wait_while_busy_is_a_queue_bound_flush() {
     c.config(5);
     c.key(5, 1);
     c.output(1);
-    // Bound 4: one held and three more waiting, a fifth flushes.
+    // Bound 5: one held and four more waiting, a sixth flushes.
     c.decoder.answer(DecodeResult::Busy);
-    for seq in 2..=5 {
+    for seq in 2..=6 {
         c.delta(5, seq);
     }
     assert_eq!(c.stats().queue_flushes, 0);
-    c.delta(5, 6);
+    c.delta(5, 7);
     assert_eq!(c.stats().queue_flushes, 1);
     assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::QueueBound]);
 }
@@ -779,11 +880,11 @@ fn a_hung_flush_recreates_the_session() {
     c.config(5);
     c.key(5, 1);
     c.output(1);
-    for seq in 2..=5 {
+    for seq in 2..=6 {
         c.delta(5, seq);
     }
     *lock(&c.decoder.flush_outcome) = InvalidateOutcome::TimedOut;
-    c.delta(5, 6);
+    c.delta(5, 7);
     let stats = c.stats();
     assert_eq!(stats.flush_timeouts, 1);
     assert_eq!(stats.recreates, 1);
@@ -969,12 +1070,12 @@ fn feedback_reports_flushes_present_drops_and_loss() {
     assert!(report.frames[2].decode_us == 0);
     // A queue bound flush counts its frames.
     c.key(5, 6);
-    for seq in 7..=10 {
+    for seq in 7..=11 {
         c.delta(5, seq);
     }
     c.advance_ms(100);
     let report = c.feedback().pop().unwrap();
-    assert_eq!(report.flushes, 5);
+    assert_eq!(report.flushes, 6);
     assert_eq!(report.loss, None);
 }
 

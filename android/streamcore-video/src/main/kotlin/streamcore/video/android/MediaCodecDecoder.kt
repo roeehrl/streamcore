@@ -271,7 +271,10 @@ class MediaCodecDecoder(
         return at(0.5) to at(0.95)
     }
 
-    /** Inputs the current decoder took before its first output: its real pipeline depth. */
+    /**
+     * Inputs the current decoder took before its first output. A cold start inflates it, so it is
+     * an upper bound on the pipeline depth; ClientStream learns the depth from the steady state.
+     */
     fun measuredDepth(): Int = synchronized(lock) { inputsBeforeFirstOutput }
 
     /** Release the decoder (off the caller's thread: a release can block). */
@@ -337,7 +340,7 @@ class MediaCodecDecoder(
                 if (!firstOutput) {
                     Log.i(
                         tag,
-                        "first output after $inputsBeforeFirstOutput input(s): depth $inputsBeforeFirstOutput " +
+                        "first output after $inputsBeforeFirstOutput input(s) " +
                             "($decoderName, $profileName)",
                     )
                 }

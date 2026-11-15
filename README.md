@@ -123,7 +123,7 @@ tap Connect. The overlay shows the decoded frame rate, the queue bound, the deco
 `StreamCoreVideo` (`adb logcat -s StreamCoreVideo`). On a MediaTek decoder, `--es mtk none|vpp|vilte|all` (default
 `all`) chooses which MediaTek switches are set (post-processing off, the ViLTE real-time mode,
 CPU boost); the log names the accepted ones and the depth each run saw. For queue-bound A/B tests,
-`--ei qbound N` sets `ClientTimings::queue_bound` (the floor under `depth + 1`, before the two
+`--ei qbound N` sets `ClientTimings::queue_bound` (the floor under `depth + 1`, before the three
 frames of jitter slack).
 
 ## Licence

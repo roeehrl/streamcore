@@ -341,7 +341,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private fun format(stats: ClientStats, fps: Double, latency: Pair<Double, Double>?, decoder: MediaCodecDecoder) =
         buildString {
             appendLine("decoder ${decoder.decoderName} (${decoder.profileName})")
-            appendLine("depth ${stats.depth} (learned ${stats.learnedDepth}, seen ${decoder.measuredDepth()})")
+            appendLine("depth ${stats.depth} (learned ${stats.learnedDepth}, first output after ${decoder.measuredDepth()})")
             appendLine("decoded %.1f fps, total %d, presented %d".format(fps, stats.decoded.toLong(), stats.presented.toLong()))
             appendLine("queue bound ${stats.queueBound}, deep sessions ${stats.deepDecoderSessions}")
             if (latency != null) appendLine("decode C2→C3 p50 %.1f ms, p95 %.1f ms".format(latency.first, latency.second))
