@@ -261,14 +261,15 @@ fn until_the_first_output_the_bound_is_provisional() {
     c.config(5);
     // On the declared depth (1): max(2, 1 + 1) + 3.
     assert_eq!(c.stats().queue_bound, 5);
-    // Five inputs without an output are not a backlog yet.
+    // Behind a keyframe that has not come out yet the bound doubles: ten
+    // inputs without an output are not a backlog yet.
     c.key(5, 1);
-    for seq in 2..=5 {
+    for seq in 2..=10 {
         c.delta(5, seq);
     }
     assert_eq!(c.decoder.flushes(), 0);
-    // A sixth is.
-    c.delta(5, 6);
+    // An eleventh is.
+    c.delta(5, 11);
     assert_eq!(c.decoder.flushes(), 1);
 }
 
@@ -398,6 +399,99 @@ fn learning_waits_for_the_window_and_restarts_after_a_flush() {
     assert_eq!(c.stats().learned_depth, 1);
 }
 
+/// Over the bound, a discardable frame (nothing references it) is left out on
+/// its own: no flush, no keyframe request, and the chain goes on.
+#[test]
+fn a_discardable_frame_over_the_bound_is_skipped_not_flushed() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    // Bound 5 (depth 1 declared): five deltas wait, none output.
+    for seq in 2..=6 {
+        c.delta(5, seq);
+    }
+    c.discardable(5, 7);
+    let stats = c.stats();
+    assert_eq!((stats.queue_flushes, stats.discardable_skipped), (0, 1));
+    assert!(c.jobs.keyframe_requests().is_empty());
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6]);
+    // The decoder catches up and the next frame decodes as usual.
+    c.output(6);
+    c.delta(5, 8);
+    assert_eq!(c.decoder.decode_seqs(), [1, 2, 3, 4, 5, 6, 8]);
+    assert_eq!(c.stats().queue_flushes, 0);
+}
+
+/// Discardable frames held while the decoder is busy go first, before a flush.
+#[test]
+fn held_discardable_frames_go_before_a_flush() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    c.decoder.answer(DecodeResult::Busy);
+    // Bound 5: deltas and discardable frames held in order.
+    c.delta(5, 2);
+    c.discardable(5, 3);
+    c.delta(5, 4);
+    c.discardable(5, 5);
+    c.delta(5, 6);
+    // A sixth would flush; the two discardable ones go instead.
+    c.delta(5, 7);
+    let stats = c.stats();
+    assert_eq!((stats.queue_flushes, stats.discardable_skipped), (0, 2));
+    assert!(c.jobs.keyframe_requests().is_empty());
+}
+
+/// A keyframe decodes slower than the frames around it. While it is in the
+/// decoder, and until what queued behind it drains, the bound doubles, so the
+/// frames that pile up behind it do not flush it and ask for another keyframe
+/// that would do the same (a loop of flushes at the keyframe interval). After
+/// that the normal bound holds again.
+#[test]
+fn a_slow_keyframe_gets_leeway_then_the_bound_is_back() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    // A later keyframe that takes long: eight frames queue behind it, over the
+    // bound of 5 but within twice it.
+    c.key(5, 2);
+    for seq in 3..=10 {
+        c.delta(5, seq);
+    }
+    assert_eq!(c.stats().queue_flushes, 0);
+    // It comes out, and the decoder drains below the bound.
+    for seq in 2..=7 {
+        c.output(seq);
+    }
+    c.delta(5, 11);
+    assert_eq!(c.stats().queue_flushes, 0);
+    // The normal bound again: 8 to 12 make five waiting, and 13 flushes.
+    c.delta(5, 12);
+    assert_eq!(c.stats().queue_flushes, 0);
+    c.delta(5, 13);
+    assert_eq!(c.stats().queue_flushes, 1);
+    assert_eq!(c.jobs.keyframe_requests(), [KeyframeReason::QueueBound]);
+}
+
+/// A decoder that stops behind a keyframe still flushes, at twice the bound.
+#[test]
+fn a_keyframe_backlog_beyond_twice_the_bound_still_flushes() {
+    let c = Client::new();
+    c.config(5);
+    c.key(5, 1);
+    c.output(1);
+    c.key(5, 2);
+    for seq in 3..=11 {
+        c.delta(5, seq);
+    }
+    assert_eq!(c.stats().queue_flushes, 0);
+    c.delta(5, 12);
+    assert_eq!(c.stats().queue_flushes, 1);
+}
+
 /// The rule the slack is for: on a decoder two or three deep, frames that
 /// arrive in pairs while one decodes (bursty Wi-Fi, a relay, USB) never
 /// flush; a decoder that falls behind for good still does.
@@ -492,12 +586,14 @@ fn the_decoders_declared_depth_raises_the_bound() {
     let c = Client::new();
     *lock(&c.decoder.max_queued) = 4;
     c.config(5);
-    // max(2, 4 + 1) + 3 = 8.
-    for seq in 1..=8 {
-        c.sample(5, seq, seq == 1, Default::default());
+    // max(2, 4 + 1) + 3 = 8, once the keyframe is out.
+    c.key(5, 1);
+    c.output(1);
+    for seq in 2..=9 {
+        c.delta(5, seq);
     }
     assert_eq!(c.decoder.flushes(), 0);
-    c.delta(5, 9);
+    c.delta(5, 10);
     assert_eq!(c.decoder.flushes(), 1);
 }
 
@@ -1068,14 +1164,15 @@ fn feedback_reports_flushes_present_drops_and_loss() {
     // 1 was decoded, never presented; 5 only received.
     assert!(report.frames[0].decode_us != 0 && report.frames[0].present_us == 0);
     assert!(report.frames[2].decode_us == 0);
-    // A queue bound flush counts its frames.
+    // A queue bound flush counts its frames (behind a keyframe not yet out,
+    // the bound is doubled to 10).
     c.key(5, 6);
-    for seq in 7..=11 {
+    for seq in 7..=16 {
         c.delta(5, seq);
     }
     c.advance_ms(100);
     let report = c.feedback().pop().unwrap();
-    assert_eq!(report.flushes, 6);
+    assert_eq!(report.flushes, 11);
     assert_eq!(report.loss, None);
 }
 

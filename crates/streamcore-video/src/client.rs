@@ -264,6 +264,11 @@ pub struct ClientStats {
     pub feedback_posted: u64,
     /// `videoFeedback` messages the channel refused.
     pub feedback_refused: u64,
+    /// Discardable frames (the `discardable` TLV: no later frame references
+    /// them) dropped one at a time when the decoder queue was over its bound,
+    /// instead of a flush and a keyframe request.
+    #[uniffi(default = 0)]
+    pub discardable_skipped: u64,
 }
 
 /// A client stream's lifecycle.
@@ -1155,6 +1160,10 @@ struct ClientState {
     in_flight: VecDeque<InFlight>,
     /// Samples waiting, in order, while the decoder is busy.
     held: VecDeque<Sample>,
+    /// The sequence of a keyframe the decoder accepted and has not output yet,
+    /// or whose backlog has not drained below the bound yet: the queue bound
+    /// doubles meanwhile (see [`Self::effective_bound`]).
+    keyframe_leeway: Option<u64>,
     /// `decode` returned `Busy` and no `input_ready` followed yet.
     busy: bool,
     /// Decoded frames waiting for `presented` (wire generation, sequence).
@@ -1233,6 +1242,7 @@ impl ClientState {
             learned_depth: None,
             in_flight: VecDeque::new(),
             held: VecDeque::new(),
+            keyframe_leeway: None,
             busy: false,
             decoded: VecDeque::new(),
             last_progress_ns: 0,
@@ -1562,6 +1572,7 @@ impl ClientState {
         self.busy = false;
         self.counters = Arc::new(SessionCounters::new());
         self.learned_depth = None;
+        self.keyframe_leeway = None;
         self.stats.learned_depth = 0;
         let port: Arc<dyn DecoderEvents> = Arc::new(DecoderPort {
             executor: self.me.clone(),
@@ -1630,6 +1641,34 @@ impl ClientState {
         usize::from(bound)
     }
 
+    /// The bound a new sample is checked against. A keyframe decodes slower
+    /// than the frames around it, and the frames that queue behind it while it
+    /// decodes used to fill the bound, flush, and wait for the next keyframe,
+    /// which did the same: a loop of flushes at the keyframe interval. So while
+    /// a keyframe is in the decoder, and until what queued behind it drains
+    /// below the bound, the bound is doubled; the stall rule still catches a
+    /// decoder that stops.
+    fn effective_bound(&mut self) -> usize {
+        let bound = self.queue_bound();
+        let Some(seq) = self.keyframe_leeway else {
+            return bound;
+        };
+        let output = self.counters.output.load(Ordering::Acquire);
+        if output >= seq && self.waiting() < bound {
+            self.keyframe_leeway = None;
+            return bound;
+        }
+        bound.saturating_mul(2)
+    }
+
+    /// A discardable frame left out instead of a flush: nothing references it,
+    /// so the chain stays intact and no keyframe is needed.
+    fn skip_discardable(&mut self, sample: &Sample) {
+        self.stats.discardable_skipped += 1;
+        self.finish(sample.meta.generation, sample.meta.seq);
+        self.dirty = true;
+    }
+
     /// The session output a frame: once the window after the cold start is
     /// full, its depth is the smallest occupancy seen at an output there
     /// (see [`SessionCounters::min_occupancy`]). Until then the bound stays
@@ -1671,7 +1710,30 @@ impl ClientState {
             self.on_break(cx, KeyframeReason::NewSession);
             return;
         }
-        if self.waiting() >= self.queue_bound() {
+        let bound = self.effective_bound();
+        if self.waiting() >= bound {
+            // Over the bound: first leave out frames nothing references (this
+            // one, or held ones), one frame each instead of a keyframe interval.
+            if sample.meta.discardable && !sample.meta.keyframe {
+                self.skip_discardable(&sample);
+                return;
+            }
+            if self
+                .held
+                .iter()
+                .any(|h| h.meta.discardable && !h.meta.keyframe)
+            {
+                let held = std::mem::take(&mut self.held);
+                for h in held {
+                    if h.meta.discardable && !h.meta.keyframe {
+                        self.skip_discardable(&h);
+                    } else {
+                        self.held.push_back(h);
+                    }
+                }
+            }
+        }
+        if self.waiting() >= bound {
             // 6.2: flush what waits and start again at a keyframe.
             self.stats.queue_flushes += 1;
             if !self.flush_decoder(cx) {
@@ -1736,6 +1798,9 @@ impl ClientState {
             DecodeResult::Accepted => {
                 self.note_waiting(cx);
                 self.stats.submitted += 1;
+                if meta.keyframe {
+                    self.keyframe_leeway = Some(meta.seq);
+                }
                 self.in_flight.push_back(InFlight {
                     seq: meta.seq,
                     generation: meta.generation,
@@ -1808,6 +1873,7 @@ impl ClientState {
     /// hung).
     fn flush_decoder(&mut self, cx: &Arc<ClientShared>) -> bool {
         let dropped = self.waiting() as u64;
+        self.keyframe_leeway = None;
         // A flushed decoder fills again: learning restarts at the next keyframe.
         if self.learned_depth.is_none() {
             self.counters.restart();

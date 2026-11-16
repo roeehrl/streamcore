@@ -426,6 +426,17 @@ session hung: its frames are dropped and it is re-created.
   every frame (R2 wants zero reorder), counted in `ClientStats::deep_decoder_sessions`, and
   adapters should prefer decoders with a depth of 2 or less. A keyframe
   is then decoded; any other frame is dropped too, and a keyframe is requested (`QueueBound`).
+  Two things come before that flush. **Discardable frames first:** over the bound, a frame
+  marked `discardable` (no later frame references it) is left out on its own, and so are
+  discardable frames held while the decoder is busy; the chain stays intact, so no flush and no
+  keyframe request follow (`ClientStats::discardable_skipped`), and the flush happens only if the
+  queue is still full without them. **Leeway for a keyframe:** a keyframe decodes slower than
+  the frames around it, and the frames that queued behind a recovery keyframe used to fill the
+  bound, flush, and wait for the next keyframe, which did the same: on a tablet decoder at
+  60 fps that loop ran at the keyframe interval until the end of the stream. So from the moment
+  the decoder accepts a keyframe until it has output it and the queue has drained below the
+  bound, the bound doubles. A decoder that stops behind it still flushes at twice the bound, and
+  the stall rule still re-creates one that outputs nothing for 500 ms.
 - **Busy.** After `DecodeResult::Busy` the executor holds the sample (Rust keeps a copy of every
   sample until the decoder accepts it) and submits nothing more until `input_ready`. Later samples
   wait behind it in order, as many as the queue bound leaves room for (held samples count as
