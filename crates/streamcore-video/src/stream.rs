@@ -2650,7 +2650,12 @@ impl StreamState {
             bulk_active,
             capacity_bps: (!sink.capacity_estimated && sink.capacity_bps != 0)
                 .then_some(sink.capacity_bps),
-            encoded_frames: self.stats.encoded,
+            // Keep-warm repeats are not frames the link carried for the screen,
+            // so they stay out of the sink-gate share.
+            encoded_frames: self
+                .stats
+                .encoded
+                .saturating_sub(self.stats.keep_warm_repeats),
             sink_held: self.stats.sink_held,
         };
         let changed = self.abr.as_mut().and_then(|abr| abr.tick(&sample));
