@@ -762,6 +762,16 @@ pub struct PacingPolicy {
     /// whose caps confirm it (0: none).
     #[uniffi(default = 0)]
     pub max_frame_qp: u8,
+    /// Keep the encoder warm (6.3.1): for this many ms after
+    /// [`crate::StreamController::note_input`], the latest image is encoded
+    /// again whenever a refresh interval passes with nothing submitted, so a
+    /// GPU that lowers its clocks between sparse frames is still fast for the
+    /// next change. Needs an encoder whose repeat of a still image is small
+    /// (not padded CBR), and works only with `rate_adaptation` on (the
+    /// budget repeats leave is spent on new images, so the target must follow
+    /// the link). 0: off.
+    #[uniffi(default = 0)]
+    pub keep_warm_ms: u32,
 }
 
 impl Default for PacingPolicy {
@@ -773,6 +783,7 @@ impl Default for PacingPolicy {
             rate_adaptation: false,
             rate_window_ms: 150,
             max_frame_qp: 0,
+            keep_warm_ms: 0,
         }
     }
 }
@@ -795,6 +806,7 @@ impl PacingPolicy {
             rate_adaptation: false,
             rate_window_ms: 0,
             max_frame_qp: 0,
+            keep_warm_ms: 0,
         }
     }
 }
@@ -840,6 +852,9 @@ pub struct StatsSnapshot {
     /// Skip cause (b): the latest slot replaced before it was submitted.
     pub frames_replaced: u64,
     pub submitted: u64,
+    /// Keep-warm re-encodes of the latest image (6.3.1), counted in `submitted`.
+    #[uniffi(default = 0)]
+    pub keep_warm_repeats: u64,
     pub encoded: u64,
     /// Skip cause (c).
     pub encoder_drops: u64,

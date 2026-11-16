@@ -108,6 +108,9 @@ pub struct MfEncoderFactory {
     stats: Arc<Mutex<SessionStats>>,
     /// The `mft-shutdown` threads of dropped sessions.
     closers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// The bench's `--rate-control`: the mode and, for peak-constrained VBR, the peak as a
+    /// multiple of the mean. Streams use unconstrained VBR.
+    rate_control: Mutex<(u32, Option<f64>)>,
 }
 
 impl MfEncoderFactory {
@@ -126,7 +129,13 @@ impl MfEncoderFactory {
             min_inputs_before_output,
             stats: Arc::default(),
             closers: Arc::default(),
+            rate_control: Mutex::new((mf::RATE_CONTROL_VBR, None)),
         })
+    }
+
+    /// The rate control later sessions are created with (the bench's `--rate-control`).
+    pub fn set_rate_control(&self, mode: u32, peak: Option<f64>) {
+        *lock(&self.rate_control) = (mode, peak);
     }
 
     pub fn stats(&self) -> SessionStats {
@@ -208,11 +217,15 @@ impl EncoderFactory for MfEncoderFactory {
         let candidates =
             mf::enumerate_h264(true, Some(self.gpu.luid)).map_err(|_| MediaError::Unsupported)?;
         let candidate = candidates.first().ok_or(MediaError::Unsupported)?;
+        let (rate_control, peak) = *lock(&self.rate_control);
+        let bitrate = u32::try_from(spec.bitrate_bps).unwrap_or(u32::MAX);
         let params = Params {
             width: spec.width,
             height: spec.height,
             fps: spec.fps.max(1),
-            bitrate: u32::try_from(spec.bitrate_bps).unwrap_or(u32::MAX),
+            bitrate,
+            rate_control,
+            max_bitrate: peak.map(|k| (f64::from(bitrate) * k).min(f64::from(u32::MAX)) as u32),
         };
         let encoder = Encoder::create(candidate, &self.gpu, &params).map_err(|e| {
             lock(&self.stats)

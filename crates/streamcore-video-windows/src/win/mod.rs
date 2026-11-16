@@ -93,6 +93,8 @@ pub fn run(options: &Options) -> Result<(), Error> {
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = sys::com::MediaFoundation::start().map_err(err("MFStartup"))?;
     let adapters = report::build();
+    // Runs measure a lit screen: the display going to sleep mid-run changes what they measure.
+    let _awake = sys::com::DisplayAwake::acquire();
     match options.command {
         Command::Report => {
             report::print(&adapters);
@@ -104,7 +106,29 @@ pub fn run(options: &Options) -> Result<(), Error> {
             let bitrate = options.bitrate_for(encode.0, encode.1);
             // The probe has no capture: it holds the period itself, as a stream would.
             let _timer = options.timer_period.then(sys::com::TimerPeriod::acquire);
-            let mut p = probe::run(luid, encode.0, encode.1, options.fps, bitrate)?;
+            let gap = options.gap.map(|ms| probe::Gap {
+                every: std::time::Duration::from_millis(u64::from(ms)),
+                keep_warm: options.keep_warm.map(|ms| match ms {
+                    0 => std::time::Duration::from_nanos(
+                        capture::refresh_interval_ns(&output).unwrap_or(16_666_667),
+                    ),
+                    ms => std::time::Duration::from_millis(u64::from(ms)),
+                }),
+                warm_session: options.warm_session.map(|size| match size {
+                    Size::Native => encode,
+                    Size::Fixed(w, h) => (w, h),
+                }),
+            });
+            let mut p = probe::run(
+                luid,
+                encode.0,
+                encode.1,
+                options.fps,
+                bitrate,
+                options.rate_control,
+                options.peak(),
+                gap,
+            )?;
             p.timer = timer_report(options.timer_period);
             probe::print(&p);
             write_json(options.json.as_deref(), &p)

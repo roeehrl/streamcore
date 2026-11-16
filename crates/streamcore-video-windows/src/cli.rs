@@ -26,6 +26,19 @@ options:
   --cursor                   capture the cursor
   --timer-period on|off      hold a 1 ms timer period while capturing (bench) or encoding (probe),
                              with the power-throttling opt-out (default on)
+  --gap MS                   probe: then time frames fed MS ms apart (a sparse, idle-like source)
+  --keep-warm off|on|MS      probe with --gap: re-encode the last frame every refresh (on) or every
+                             MS ms between the spaced frames (default off)
+  --keep-warm-hold MS        bench: the stream's keep-warm (PacingPolicy::keep_warm_ms, with rate
+                             adaptation on) with this hold, input simulated every 50 ms through
+                             the run (default off)
+  --warm-session native|WxH  probe with --keep-warm: encode the fill frames on a second encoder
+                             session of that size, its output discarded
+  --rate-control MODE        encoder rate control: vbr (default, as streams use), cbr, pcvbr
+                             (peak-constrained VBR, peak --peak x the mean), quality or lowdelayvbr
+  --peak X                   pcvbr: the peak bitrate as a multiple of the mean (default 2)
+  --content flat|text        synthetic: flat colour (default) or a detailed text-like page, which
+                             with --pace MS scrolls a screen's worth of new detail every MS ms
   --json PATH                also write the report as JSON
 ";
 
@@ -78,6 +91,20 @@ pub struct Options {
     pub min_update_interval: bool,
     pub cursor: bool,
     pub timer_period: bool,
+    /// `--keep-warm`: None off, Some(0) every refresh, Some(ms).
+    pub keep_warm: Option<u32>,
+    /// `--gap`: the probe's spaced frames, MS apart.
+    pub gap: Option<u32>,
+    /// `--keep-warm-hold`: the bench stream's keep-warm hold.
+    pub keep_warm_hold: Option<u32>,
+    /// `--rate-control`: an `eAVEncCommonRateControlMode` value (2 unconstrained VBR).
+    pub rate_control: u32,
+    /// `--peak`: pcvbr's peak as a multiple of the mean.
+    pub peak_ratio: f64,
+    /// `--content text`: the synthetic window draws a detailed page.
+    pub text_content: bool,
+    /// `--warm-session`: the probe's second session size.
+    pub warm_session: Option<Size>,
     pub json: Option<String>,
 }
 
@@ -99,8 +126,20 @@ impl Options {
             min_update_interval: true,
             cursor: false,
             timer_period: true,
+            keep_warm: None,
+            gap: None,
+            keep_warm_hold: None,
+            rate_control: 2,
+            peak_ratio: 2.0,
+            text_content: false,
+            warm_session: None,
             json: None,
         }
+    }
+
+    /// The peak bitrate multiple the rate control takes (pcvbr only).
+    pub fn peak(&self) -> Option<f64> {
+        (self.rate_control == 1).then_some(self.peak_ratio)
     }
 
     /// The bitrate for `width` x `height`: the option, else 0.1 bit per pixel per frame.
@@ -206,6 +245,71 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
                     other => return Err(format!("--timer-period: bad value {other:?}")),
                 }
             }
+            "--keep-warm" => {
+                o.keep_warm = match it.next().as_deref() {
+                    Some("off") => None,
+                    Some("on") => Some(0),
+                    Some(v) => Some(
+                        v.parse()
+                            .ok()
+                            .filter(|&ms| ms > 0)
+                            .ok_or(format!("--keep-warm: bad value {v}"))?,
+                    ),
+                    None => return Err("--keep-warm needs a value".into()),
+                }
+            }
+            "--keep-warm-hold" => {
+                let ms: u32 = num("--keep-warm-hold", it.next())?;
+                if ms == 0 {
+                    return Err("--keep-warm-hold must be > 0".into());
+                }
+                o.keep_warm_hold = Some(ms);
+            }
+            "--gap" => {
+                let ms: u32 = num("--gap", it.next())?;
+                if ms == 0 {
+                    return Err("--gap must be > 0".into());
+                }
+                o.gap = Some(ms);
+            }
+            "--warm-session" => {
+                o.warm_session = Some(match it.next().as_deref() {
+                    Some("native") => Size::Native,
+                    Some(v) => {
+                        let (w, h) = v
+                            .split_once('x')
+                            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                            .filter(|&(w, h): &(u32, u32)| w >= 2 && h >= 2)
+                            .ok_or(format!("--warm-session: bad value {v}"))?;
+                        Size::Fixed(w & !1, h & !1)
+                    }
+                    None => return Err("--warm-session needs a value".into()),
+                })
+            }
+            "--rate-control" => {
+                o.rate_control = match it.next().as_deref() {
+                    Some("cbr") => 0,
+                    Some("pcvbr") => 1,
+                    Some("vbr") => 2,
+                    Some("quality") => 3,
+                    Some("lowdelayvbr") => 4,
+                    other => return Err(format!("--rate-control: bad value {other:?}")),
+                }
+            }
+            "--peak" => {
+                let k: f64 = num("--peak", it.next())?;
+                if k.is_nan() || k < 1.0 {
+                    return Err("--peak must be >= 1".into());
+                }
+                o.peak_ratio = k;
+            }
+            "--content" => {
+                o.text_content = match it.next().as_deref() {
+                    Some("flat") => false,
+                    Some("text") => true,
+                    other => return Err(format!("--content: bad value {other:?}")),
+                }
+            }
             "--json" => o.json = Some(it.next().ok_or("--json needs a path")?),
             other => return Err(format!("unknown option {other}")),
         }
@@ -276,5 +380,54 @@ mod tests {
         ] {
             assert!(parse(args(bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn keep_warm() {
+        assert_eq!(parse(args("bench")).unwrap().keep_warm, None);
+        assert_eq!(
+            parse(args("bench --keep-warm on")).unwrap().keep_warm,
+            Some(0)
+        );
+        assert_eq!(
+            parse(args("bench --keep-warm 8")).unwrap().keep_warm,
+            Some(8)
+        );
+        assert_eq!(
+            parse(args("bench --keep-warm off")).unwrap().keep_warm,
+            None
+        );
+        assert!(parse(args("bench --keep-warm 0")).is_err());
+        assert!(parse(args("bench --keep-warm")).is_err());
+        assert_eq!(parse(args("probe --gap 500")).unwrap().gap, Some(500));
+        assert_eq!(
+            parse(args("bench --keep-warm-hold 1000"))
+                .unwrap()
+                .keep_warm_hold,
+            Some(1000)
+        );
+        assert_eq!(parse(args("bench")).unwrap().rate_control, 2);
+        assert!(parse(args("probe --gap 0")).is_err());
+        assert_eq!(
+            parse(args("probe --warm-session 1920x1080"))
+                .unwrap()
+                .warm_session,
+            Some(Size::Fixed(1920, 1080))
+        );
+        assert!(parse(args("probe --warm-session 0x0")).is_err());
+        assert_eq!(
+            parse(args("probe --rate-control quality"))
+                .unwrap()
+                .rate_control,
+            3
+        );
+        assert!(parse(args("probe --rate-control fast")).is_err());
+        let o = parse(args("bench --rate-control pcvbr --peak 3 --content text")).unwrap();
+        assert_eq!((o.peak(), o.text_content), (Some(3.0), true));
+        assert_eq!(
+            parse(args("bench --rate-control vbr")).unwrap().peak(),
+            None
+        );
+        assert!(parse(args("bench --peak 0.5")).is_err());
     }
 }

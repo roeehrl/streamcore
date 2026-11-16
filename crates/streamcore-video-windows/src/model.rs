@@ -105,6 +105,26 @@ pub struct ProbeReport {
     pub first_output_ms: Option<f64>,
     /// `ProcessInput` -> `ProcessOutput`, one frame in flight.
     pub encode_ms: Option<Summary>,
+    /// `--gap`: frames fed this many ms apart, each a new picture.
+    #[serde(default)]
+    pub gap_ms: Option<u32>,
+    /// `--keep-warm` with `--gap`: the last frame re-encoded every this many ms between them.
+    #[serde(default)]
+    pub keep_warm_ms: Option<f64>,
+    /// `ProcessInput` -> `ProcessOutput` of the spaced frames.
+    #[serde(default)]
+    pub gap_encode_ms: Option<Summary>,
+    /// The same for the re-encoded fill frames.
+    #[serde(default)]
+    pub fill_encode_ms: Option<Summary>,
+    /// Average access-unit size of the spaced and the fill frames.
+    #[serde(default)]
+    pub gap_bytes_avg: Option<usize>,
+    #[serde(default)]
+    pub fill_bytes_avg: Option<usize>,
+    /// The keep-warm fill ran on a second encoder session of this size.
+    #[serde(default)]
+    pub warm_session: Option<(u32, u32)>,
     pub sps: Option<Sps>,
     pub errors: Vec<String>,
     /// The 1 ms timer period was requested, and what was applied.
@@ -161,6 +181,17 @@ pub struct BenchReport {
     pub r1_late_sends: Option<u64>,
     pub synthetic: Option<SyntheticResult>,
     pub encoded_mbps: f64,
+    /// `--rate-control` (an `eAVEncCommonRateControlMode`) and pcvbr's peak multiple.
+    #[serde(default)]
+    pub rate_control: u32,
+    #[serde(default)]
+    pub peak_ratio: Option<f64>,
+    /// Access-unit sizes in the measured window: p50, p95, p99, max (KB).
+    #[serde(default)]
+    pub frame_kb: Option<[f64; 4]>,
+    /// The per-frame share of the bitrate (KB).
+    #[serde(default)]
+    pub frame_budget_kb: f64,
     pub keyframes: u64,
     pub sps: Option<Sps>,
     pub vui_normalized: bool,

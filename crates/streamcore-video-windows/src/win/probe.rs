@@ -20,6 +20,17 @@ use windows::Win32::Graphics::Direct3D11::{D3D11_BIND_RENDER_TARGET, ID3D11Textu
 
 const MAX_INPUTS: u64 = 8;
 const TIMED_FRAMES: usize = 120;
+const GAP_FRAMES: usize = 40;
+
+/// `--gap`: spaced frames, optionally with the last one re-encoded in between.
+#[derive(Clone, Copy, Debug)]
+pub struct Gap {
+    pub every: Duration,
+    pub keep_warm: Option<Duration>,
+    /// Re-encode on a second encoder session of this size (its output discarded) instead of
+    /// the timed one, as a stream would to keep the GPU busy without sending anything.
+    pub warm_session: Option<(u32, u32)>,
+}
 
 fn test_frame(gpu: &Gpu, w: u32, h: u32, shade: u32) -> Result<ID3D11Texture2D, Error> {
     let mut data = vec![128u8; (w * h * 3 / 2) as usize];
@@ -42,12 +53,24 @@ struct Feeder<'a> {
     frames: &'a [ID3D11Texture2D],
     credits: u32,
     fed: u64,
+    /// The picture last fed.
+    picture: u64,
     duration: i64,
 }
 
 impl Feeder<'_> {
     /// Waits for a credit and feeds the next frame; returns `ProcessInput`'s return time.
     fn feed(&mut self, rx: &Receiver<MfEvent>, report: &mut ProbeReport) -> Option<u64> {
+        self.feed_frame(rx, report, false)
+    }
+
+    /// As `feed`; `repeat` feeds the previous frame's picture again (a still screen).
+    fn feed_frame(
+        &mut self,
+        rx: &Receiver<MfEvent>,
+        report: &mut ProbeReport,
+        repeat: bool,
+    ) -> Option<u64> {
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.credits == 0 {
             match next(rx, deadline.saturating_duration_since(Instant::now()))? {
@@ -56,7 +79,14 @@ impl Feeder<'_> {
                 _ => {}
             }
         }
-        let frame = &self.frames[(self.fed % self.frames.len() as u64) as usize];
+        let len = self.frames.len() as u64;
+        let index = if repeat {
+            self.picture
+        } else {
+            self.picture = (self.picture + 1) % len;
+            self.picture
+        };
+        let frame = &self.frames[index as usize];
         let sample = Encoder::sample(frame, self.fed as i64 * self.duration, self.duration).ok()?;
         if self.fed == 0 {
             let _ = self.encoder.force_keyframe();
@@ -89,32 +119,10 @@ impl Feeder<'_> {
     }
 }
 
-pub fn run(
-    luid: u64,
-    width: u32,
-    height: u32,
-    fps: u32,
-    bitrate: u64,
-) -> Result<ProbeReport, Error> {
-    let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
-    let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
-    let candidates = enumerate_h264(true, Some(luid)).map_err(err("MFTEnum2"))?;
-    let candidate = candidates
-        .first()
-        .ok_or("no hardware H.264 encoder MFT on this adapter")?;
-    let params = Params {
-        width,
-        height,
-        fps,
-        bitrate: u32::try_from(bitrate).unwrap_or(u32::MAX),
-    };
-    let encoder = Encoder::create(candidate, &gpu, &params).map_err(err("create encoder"))?;
-    let mut report = ProbeReport {
-        os_build: os_build(),
-        adapter: gpu.name.clone(),
-        encoder: encoder.setup.clone(),
-        ..ProbeReport::default()
-    };
+/// The encoder's events on a channel, pumped by their own thread.
+fn spawn_events(
+    encoder: &Encoder,
+) -> Result<(Receiver<MfEvent>, std::thread::JoinHandle<()>), Error> {
     let pump = encoder.event_pump();
     let (tx, rx) = channel();
     let events = std::thread::Builder::new()
@@ -130,6 +138,41 @@ pub fn run(
             }
         })
         .map_err(err("spawn event thread"))?;
+    Ok((rx, events))
+}
+
+pub fn run(
+    luid: u64,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u64,
+    rate_control: u32,
+    peak: Option<f64>,
+    gap: Option<Gap>,
+) -> Result<ProbeReport, Error> {
+    let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
+    let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
+    let candidates = enumerate_h264(true, Some(luid)).map_err(err("MFTEnum2"))?;
+    let candidate = candidates
+        .first()
+        .ok_or("no hardware H.264 encoder MFT on this adapter")?;
+    let params = Params {
+        width,
+        height,
+        fps,
+        bitrate: u32::try_from(bitrate).unwrap_or(u32::MAX),
+        rate_control,
+        max_bitrate: peak.map(|k| (bitrate as f64 * k).min(f64::from(u32::MAX)) as u32),
+    };
+    let encoder = Encoder::create(candidate, &gpu, &params).map_err(err("create encoder"))?;
+    let mut report = ProbeReport {
+        os_build: os_build(),
+        adapter: gpu.name.clone(),
+        encoder: encoder.setup.clone(),
+        ..ProbeReport::default()
+    };
+    let (rx, events) = spawn_events(&encoder)?;
     let frames = (0..3)
         .map(|i| test_frame(&gpu, width, height, i))
         .collect::<Result<Vec<_>, _>>()?;
@@ -138,6 +181,7 @@ pub fn run(
         frames: &frames,
         credits: 0,
         fed: 0,
+        picture: 2, // so the first frame fed is picture 0
         duration: ns_to_hundred_ns(1_000_000_000 / u64::from(fps.max(1))),
     };
     // Patient: one input, then wait for output before the next.
@@ -167,6 +211,93 @@ pub fn run(
         }
     }
     report.encode_ms = (!encode.is_empty()).then(|| summarize_ns(&encode));
+    // Spaced frames: each a new picture `gap.every` after the last, the encoder otherwise idle
+    // or (keep-warm) re-encoding the last picture every period in between.
+    if let (Some(gap), Some(_)) = (gap, report.encode_ms.as_ref()) {
+        // The second session, when asked for: its own encoder, events and one still picture.
+        let warm = match gap.warm_session.filter(|_| gap.keep_warm.is_some()) {
+            Some((w, h)) => {
+                let warm_params = Params {
+                    width: w,
+                    height: h,
+                    ..params
+                };
+                // Its own device: a second session on the timed one's device stalled in testing.
+                let warm_gpu = Gpu::create(Some(luid)).map_err(err("keep-warm D3D11 device"))?;
+                // A fresh activation object: activating the timed one's again returns its MFT.
+                let fresh = enumerate_h264(true, Some(luid)).map_err(err("MFTEnum2"))?;
+                let warm_candidate = fresh.first().ok_or("no second hardware H.264 MFT")?;
+                let encoder = Encoder::create(warm_candidate, &warm_gpu, &warm_params)
+                    .map_err(err("create keep-warm encoder"))?;
+                let (rx, events) = spawn_events(&encoder)?;
+                let frames = vec![test_frame(&warm_gpu, w, h, 0)?];
+                Some((encoder, rx, events, frames, warm_gpu))
+            }
+            None => None,
+        };
+        let mut warm_feeder = warm.as_ref().map(|(encoder, rx, _, frames, _)| {
+            (
+                Feeder {
+                    encoder,
+                    frames,
+                    credits: 0,
+                    fed: 0,
+                    picture: 0,
+                    duration: feeder.duration,
+                },
+                rx,
+            )
+        });
+        let (mut spaced, mut fill) = (Vec::new(), Vec::new());
+        let (mut spaced_bytes, mut fill_bytes) = (0usize, 0usize);
+        'frames: for _ in 0..GAP_FRAMES {
+            let due = Instant::now() + gap.every;
+            if let Some(period) = gap.keep_warm {
+                let mut next = Instant::now() + period;
+                while next + period / 2 < due {
+                    std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                    let (f, r) = match warm_feeder.as_mut() {
+                        Some((f, r)) => (f, *r),
+                        None => (&mut feeder, &rx),
+                    };
+                    let Some(h3) = f.feed_frame(r, &mut report, true) else {
+                        break 'frames;
+                    };
+                    match f.output(r, Duration::from_millis(500), &mut report) {
+                        Some((h4, bytes)) => {
+                            fill.push(h4.saturating_sub(h3));
+                            fill_bytes += bytes.len();
+                        }
+                        None => break 'frames,
+                    }
+                    next += period;
+                }
+            }
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            let Some(h3) = feeder.feed(&rx, &mut report) else {
+                break;
+            };
+            match feeder.output(&rx, Duration::from_millis(500), &mut report) {
+                Some((h4, bytes)) => {
+                    spaced.push(h4.saturating_sub(h3));
+                    spaced_bytes += bytes.len();
+                }
+                None => break,
+            }
+        }
+        drop(warm_feeder);
+        if let Some((encoder, _, events, _, _gpu)) = warm {
+            report.warm_session = gap.warm_session;
+            encoder.shutdown();
+            let _ = events.join();
+        }
+        report.gap_bytes_avg = (!spaced.is_empty()).then(|| spaced_bytes / spaced.len());
+        report.fill_bytes_avg = (!fill.is_empty()).then(|| fill_bytes / fill.len());
+        report.gap_ms = Some(gap.every.as_millis() as u32);
+        report.keep_warm_ms = gap.keep_warm.map(|p| p.as_secs_f64() * 1e3);
+        report.gap_encode_ms = (!spaced.is_empty()).then(|| summarize_ns(&spaced));
+        report.fill_encode_ms = (!fill.is_empty()).then(|| summarize_ns(&fill));
+    }
     report.permit_target = permit_target(report.min_inputs_before_output);
     encoder.shutdown();
     let _ = events.join();
@@ -203,6 +334,35 @@ pub fn print(r: &ProbeReport) {
         println!(
             "encode (one in flight) n {}  p50 {:.3}  p95 {:.3}  p99 {:.3}  max {:.3} ms",
             s.n, s.p50_ms, s.p95_ms, s.p99_ms, s.max_ms
+        );
+    }
+    if let Some(s) = &r.gap_encode_ms {
+        println!(
+            "encode, frames {} ms apart{}: n {}  p50 {:.3}  p95 {:.3}  p99 {:.3}  max {:.3} ms",
+            r.gap_ms.unwrap_or(0),
+            r.keep_warm_ms
+                .map(|ms| match r.warm_session {
+                    Some((w, h)) => format!(", a {w}x{h} second session encoding every {ms:.1} ms"),
+                    None => format!(", last frame re-encoded every {ms:.1} ms"),
+                })
+                .unwrap_or_default(),
+            s.n,
+            s.p50_ms,
+            s.p95_ms,
+            s.p99_ms,
+            s.max_ms
+        );
+    }
+    if let Some(s) = &r.fill_encode_ms {
+        println!(
+            "encode, re-encoded fill frames: n {}  p50 {:.3}  p95 {:.3}  p99 {:.3}  max {:.3} ms",
+            s.n, s.p50_ms, s.p95_ms, s.p99_ms, s.max_ms
+        );
+    }
+    if let (Some(g), f) = (r.gap_bytes_avg, r.fill_bytes_avg) {
+        println!(
+            "bytes per frame: spaced {g}{}",
+            f.map(|f| format!(", fill {f}")).unwrap_or_default()
         );
     }
     if let Some(s) = &r.sps {

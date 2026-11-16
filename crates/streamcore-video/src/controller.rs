@@ -104,6 +104,13 @@ impl StreamController {
         self.shared.post(Event::Command(Command::RequestKeyframe));
     }
 
+    /// The user gave input (a pen, touch, key or pointer event reached the
+    /// host): with `PacingPolicy::keep_warm_ms`, the stream keeps the encoder
+    /// warm for that long (6.3.1). Cheap; call it for every input event.
+    pub fn note_input(&self) {
+        self.shared.post(Event::Command(Command::Input));
+    }
+
     /// The source display's refresh interval changed (a display mode change);
     /// `None` when unknown, which aligns admission to the target interval
     /// instead (6.3). The initial value is `StreamPlan::refresh_interval_ns`.
