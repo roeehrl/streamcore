@@ -8,6 +8,9 @@ commands:
   probe                 create the hardware H.264 MFT on the chosen adapter and measure
                         min_inputs_before_output and one-in-flight encode time
   bench                 capture -> convert -> encode through a StreamController for --seconds
+  encoders              diagnostics: the registered video encoders, what each Media Foundation
+                        enumeration returns (with and without the hardware, adapter and
+                        sort-and-filter options), activation results, and MF registry settings
 
 options:
   --mode synthetic|desktop   bench source: a synthetic window over the whole monitor that draws a
@@ -47,6 +50,7 @@ pub enum Command {
     Report,
     Probe,
     Bench,
+    Encoders,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +165,7 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
         Some("report") => Command::Report,
         Some("probe") => Command::Probe,
         Some("bench") => Command::Bench,
+        Some("encoders") => Command::Encoders,
         Some(other) => return Err(format!("unknown command {other}")),
         None => return Err("missing command".into()),
     };

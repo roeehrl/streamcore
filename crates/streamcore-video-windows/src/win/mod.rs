@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod capture;
 pub mod convert;
+pub mod diag;
 pub mod encoder;
 pub mod probe;
 pub mod queue;
@@ -132,6 +133,11 @@ pub fn run(options: &Options) -> Result<(), Error> {
             p.timer = timer_report(options.timer_period);
             probe::print(&p);
             write_json(options.json.as_deref(), &p)
+        }
+        Command::Encoders => {
+            let d = diag::run();
+            diag::print(&d);
+            write_json(options.json.as_deref(), &d)
         }
         Command::Bench => {
             let (luid, output) = select(options, &adapters)?;
