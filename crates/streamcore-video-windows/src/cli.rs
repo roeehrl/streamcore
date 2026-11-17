@@ -8,6 +8,9 @@ commands:
   probe                 create the hardware H.264 MFT on the chosen adapter and measure
                         min_inputs_before_output and one-in-flight encode time
   bench                 capture -> convert -> encode through a StreamController for --seconds
+  encoders              diagnostics: the registered video encoders, what each Media Foundation
+                        enumeration returns (with and without the hardware, adapter and
+                        sort-and-filter options), activation results, and MF registry settings
 
 options:
   --mode synthetic|desktop   bench source: a synthetic window over the whole monitor that draws a
@@ -39,6 +42,8 @@ options:
   --peak X                   pcvbr: the peak bitrate as a multiple of the mean (default 2)
   --content flat|text        synthetic: flat colour (default) or a detailed text-like page, which
                              with --pace MS scrolls a screen's worth of new detail every MS ms
+  --direct-mft               create the hardware encoder from its registration, as when Media
+                             Foundation lists none (tests that fallback on any PC)
   --json PATH                also write the report as JSON
 ";
 
@@ -47,6 +52,7 @@ pub enum Command {
     Report,
     Probe,
     Bench,
+    Encoders,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +111,8 @@ pub struct Options {
     pub text_content: bool,
     /// `--warm-session`: the probe's second session size.
     pub warm_session: Option<Size>,
+    /// `--direct-mft`: skip enumeration and create the registered hardware encoder directly.
+    pub direct_mft: bool,
     pub json: Option<String>,
 }
 
@@ -133,6 +141,7 @@ impl Options {
             peak_ratio: 2.0,
             text_content: false,
             warm_session: None,
+            direct_mft: false,
             json: None,
         }
     }
@@ -161,6 +170,7 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
         Some("report") => Command::Report,
         Some("probe") => Command::Probe,
         Some("bench") => Command::Bench,
+        Some("encoders") => Command::Encoders,
         Some(other) => return Err(format!("unknown command {other}")),
         None => return Err("missing command".into()),
     };
@@ -310,6 +320,7 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
                     other => return Err(format!("--content: bad value {other:?}")),
                 }
             }
+            "--direct-mft" => o.direct_mft = true,
             "--json" => o.json = Some(it.next().ok_or("--json needs a path")?),
             other => return Err(format!("unknown option {other}")),
         }

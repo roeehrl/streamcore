@@ -30,6 +30,10 @@ pub struct EncoderInfo {
     pub codec: String,
     pub hardware: bool,
     pub vendor_id: Option<String>,
+    /// Created from its registration (`CoCreateInstance`) because Media Foundation's
+    /// enumeration listed no hardware encoder for the adapter.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -214,4 +218,64 @@ pub struct SyntheticResult {
     pub repeated: u64,
     /// Submitted frames whose barcode could not be read.
     pub undecoded: u64,
+}
+
+/// One encoder an enumeration call returned.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MftEntry {
+    pub name: String,
+    pub clsid: Option<String>,
+    pub hardware_url: Option<String>,
+    pub vendor_id: Option<String>,
+    /// `MF_TRANSFORM_FLAGS_Attribute` (the `MFT_ENUM_FLAG` it was registered with).
+    pub flags: Option<u32>,
+    pub merit: Option<u32>,
+    pub adapter_luid: Option<String>,
+    /// `ActivateObject` then `ShutdownObject`: "ok" or the error (hardware calls only).
+    pub activation: Option<String>,
+}
+
+/// One `MFTEnum2` / `MFTEnumEx` call over the video encoder category.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumCall {
+    pub label: String,
+    pub api: String,
+    pub flags: u32,
+    pub input: Option<String>,
+    pub output: Option<String>,
+    pub adapter_luid: Option<String>,
+    pub error: Option<String>,
+    pub found: Vec<MftEntry>,
+}
+
+/// A video encoder registered under the encoder category.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredMft {
+    pub clsid: String,
+    pub name: String,
+    pub mft_flags: Option<String>,
+    pub attributes: Option<String>,
+    pub dll: Option<String>,
+    pub threading: Option<String>,
+    /// `CoCreateInstance` as `IMFTransform`: "ok" or the error.
+    pub create: Option<String>,
+    pub hardware_url: Option<String>,
+    pub d3d11_aware: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryValue {
+    pub name: String,
+    pub value: String,
+}
+
+/// The `encoders` command's report.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncoderDiag {
+    pub os_build: String,
+    /// index, name, LUID, vendor id.
+    pub adapters: Vec<(u32, String, String, String)>,
+    pub calls: Vec<EnumCall>,
+    pub registered: Vec<RegisteredMft>,
+    pub mf_settings: Vec<RegistryValue>,
 }

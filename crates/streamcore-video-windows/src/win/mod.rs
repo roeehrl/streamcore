@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod capture;
 pub mod convert;
+pub mod diag;
 pub mod encoder;
 pub mod probe;
 pub mod queue;
@@ -92,6 +93,7 @@ pub fn run(options: &Options) -> Result<(), Error> {
     // The process MTA: helper threads (encoder create, bounded invalidate) join it.
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = sys::com::MediaFoundation::start().map_err(err("MFStartup"))?;
+    sys::mf::force_direct(options.direct_mft);
     let adapters = report::build();
     // Runs measure a lit screen: the display going to sleep mid-run changes what they measure.
     let _awake = sys::com::DisplayAwake::acquire();
@@ -132,6 +134,11 @@ pub fn run(options: &Options) -> Result<(), Error> {
             p.timer = timer_report(options.timer_period);
             probe::print(&p);
             write_json(options.json.as_deref(), &p)
+        }
+        Command::Encoders => {
+            let d = diag::run();
+            diag::print(&d);
+            write_json(options.json.as_deref(), &d)
         }
         Command::Bench => {
             let (luid, output) = select(options, &adapters)?;

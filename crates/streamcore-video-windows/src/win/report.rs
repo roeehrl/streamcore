@@ -4,7 +4,7 @@
 
 use super::os_build;
 use super::sys::d3d::{Gpu, enumerate_adapters};
-use super::sys::mf::enumerate_h264;
+use super::sys::mf::{enumerate_h264, hardware_h264};
 use super::sys::vp::VideoProcessor;
 use crate::model::{AdapterInfo, AdapterReport, OutputInfo};
 use windows::Foundation::Metadata::ApiInformation;
@@ -74,7 +74,7 @@ pub fn build() -> AdapterReport {
             });
             monitor_index += 1;
         }
-        match enumerate_h264(true, Some(a.luid)) {
+        match hardware_h264(a.luid, a.vendor_id) {
             Ok(list) => info.encoders.extend(list.into_iter().map(|c| c.info)),
             Err(e) => info.encoder_enum_error = Some(e.to_string()),
         }
@@ -127,10 +127,15 @@ pub fn print(r: &AdapterReport) {
         }
         for e in &a.encoders {
             println!(
-                "  hardware encoder {} {}  vendor {}",
+                "  hardware encoder {} {}  vendor {}{}",
                 e.codec,
                 e.name,
-                e.vendor_id.as_deref().unwrap_or("-")
+                e.vendor_id.as_deref().unwrap_or("-"),
+                if e.direct {
+                    "  (created directly: Media Foundation listed none)"
+                } else {
+                    ""
+                }
             );
         }
         if a.encoders.is_empty() {

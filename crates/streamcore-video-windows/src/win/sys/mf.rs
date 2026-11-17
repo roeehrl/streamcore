@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
 };
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0_0, VT_BOOL, VT_UI4, VariantClear};
 use windows::core::{Error, GUID, HRESULT, Interface, PWSTR, Result};
 
@@ -52,10 +52,28 @@ pub fn is_not_accepting(e: &Error) -> bool {
     e.code() == MF_E_NOTACCEPTING
 }
 
-/// Shuts an activated MFT down when dropped, unless disarmed: every early return between
-/// `ActivateObject` and a configured encoder would otherwise leak the session, and hardware
-/// encoders limit sessions per process.
-struct ActivationGuard(Option<IMFActivate>);
+/// Releases an MFT's session: `IMFShutdown` for one created directly, `ShutdownObject` for an
+/// activated one.
+fn shut_down(activate: Option<&IMFActivate>, transform: &IMFTransform) {
+    match activate {
+        Some(activate) => {
+            // SAFETY: valid activation object whose MFT was created; releases the MFT and its
+            // hardware session.
+            let _ = unsafe { activate.ShutdownObject() };
+        }
+        None => {
+            if let Ok(s) = transform.cast::<IMFShutdown>() {
+                // SAFETY: valid interface.
+                let _ = unsafe { s.Shutdown() };
+            }
+        }
+    }
+}
+
+/// Shuts a created MFT down when dropped, unless disarmed: every early return between creating
+/// it and a configured encoder would otherwise leak the session, and hardware encoders limit
+/// sessions per process.
+struct ActivationGuard(Option<(Option<IMFActivate>, IMFTransform)>);
 
 impl ActivationGuard {
     fn disarm(mut self) {
@@ -65,18 +83,152 @@ impl ActivationGuard {
 
 impl Drop for ActivationGuard {
     fn drop(&mut self) {
-        if let Some(activate) = self.0.take() {
-            // SAFETY: valid activation object whose MFT was created; releases the MFT and its
-            // hardware session.
-            let _ = unsafe { activate.ShutdownObject() };
+        if let Some((activate, transform)) = self.0.take() {
+            shut_down(activate.as_ref(), &transform);
         }
     }
 }
 
-/// An encoder MFT `MFTEnum2` returned, not yet activated.
+/// How a candidate's MFT is created.
+enum Source {
+    /// An activation object `MFTEnum2` returned.
+    Activate(IMFActivate),
+    /// A registered hardware encoder's CLSID, created with `CoCreateInstance` (`direct`).
+    Direct(GUID),
+}
+
+/// An encoder MFT, not yet created.
 pub struct Candidate {
     pub info: EncoderInfo,
-    activate: IMFActivate,
+    source: Source,
+}
+
+/// The hardware H.264 encoders for the adapter `luid`: what `MFTEnum2` returns, or, when it
+/// returns none, the registered hardware H.264 encoders of the adapter's vendor, created directly.
+/// Some Windows installations enumerate no hardware MFT at all although the driver's MFTs are
+/// registered and load (`encoders` diagnostics); the MFT then runs on the device it is given.
+pub fn hardware_h264(luid: u64, vendor_id: u32) -> Result<Vec<Candidate>> {
+    if !FORCE_DIRECT.load(Ordering::Relaxed) {
+        let listed = enumerate_h264(true, Some(luid))?;
+        if !listed.is_empty() {
+            return Ok(listed);
+        }
+    }
+    Ok(registered_hardware_h264(vendor_id))
+}
+
+static FORCE_DIRECT: AtomicBool = AtomicBool::new(false);
+
+/// Test hook (the bench's `--direct-mft`): `hardware_h264` skips enumeration and always creates
+/// the registered encoder directly, so the fallback can be exercised where enumeration works.
+pub fn force_direct(on: bool) {
+    FORCE_DIRECT.store(on, Ordering::Relaxed);
+}
+
+/// The PCI vendor a hardware MFT belongs to: its `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`
+/// (`VEN_10DE`), else the vendor its name starts with. `None`: unknown (not used).
+fn mft_vendor(name: &str, attrs: Option<&IMFAttributes>) -> Option<u32> {
+    if let Some(v) = attrs.and_then(|a| attr_string(a, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute)) {
+        let hex = v.trim_start_matches("VEN_").trim_start_matches("ven_");
+        if let Ok(id) = u32::from_str_radix(hex, 16) {
+            return Some(id);
+        }
+    }
+    let name = name.to_ascii_lowercase();
+    [
+        ("nvidia", 0x10de),
+        ("amd", 0x1002),
+        ("intel", 0x8086),
+        ("qualcomm", 0x5143),
+    ]
+    .iter()
+    .find(|(brand, _)| name.starts_with(brand))
+    .map(|&(_, id)| id)
+}
+
+/// Whether `types` (as `MFTGetInfo` returned them) lists `subtype`; an MFT that registered no
+/// types is not ruled out.
+fn lists(types: *mut MFT_REGISTER_TYPE_INFO, count: u32, subtype: &GUID) -> bool {
+    if types.is_null() || count == 0 {
+        return true;
+    }
+    // SAFETY: MFTGetInfo returned `count` entries in this array.
+    unsafe { std::slice::from_raw_parts(types, count as usize) }
+        .iter()
+        .any(|t| t.guidSubtype == *subtype)
+}
+
+/// The registered hardware video encoders (`MFTFlags` with `MFT_ENUM_FLAG_HARDWARE`) that take
+/// NV12 and give H.264, of `vendor_id`.
+fn registered_hardware_h264(vendor_id: u32) -> Vec<Candidate> {
+    use super::reg::{ENCODER_CATEGORY, Key, parse_guid};
+    use windows::Win32::System::Registry::HKEY_CLASSES_ROOT;
+    let Some(category) = Key::open(HKEY_CLASSES_ROOT, ENCODER_CATEGORY) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for clsid in category.subkeys() {
+        let Some(guid) = parse_guid(&clsid) else {
+            continue;
+        };
+        let flags = Key::open(
+            HKEY_CLASSES_ROOT,
+            &format!(r"MediaFoundation\Transforms\{clsid}"),
+        )
+        .and_then(|k| k.dword("MFTFlags"))
+        .unwrap_or(0);
+        if flags & MFT_ENUM_FLAG_HARDWARE.0 as u32 == 0 {
+            continue;
+        }
+        let mut name = PWSTR::null();
+        let (mut ins, mut in_count) = (std::ptr::null_mut(), 0u32);
+        let (mut outs, mut out_count) = (std::ptr::null_mut(), 0u32);
+        let mut attrs: Option<IMFAttributes> = None;
+        // SAFETY: every out pointer is a valid local; MF allocates the name and type arrays,
+        // freed below.
+        let got = unsafe {
+            MFTGetInfo(
+                guid,
+                Some(&mut name),
+                Some(&mut ins),
+                Some(&mut in_count),
+                Some(&mut outs),
+                Some(&mut out_count),
+                Some(&mut attrs),
+            )
+        };
+        // SAFETY: on success the name is MF-allocated (or null); copied, then freed.
+        let friendly = unsafe {
+            let s = name.to_string().unwrap_or_default();
+            if !name.is_null() {
+                CoTaskMemFree(Some(name.0 as *const _));
+            }
+            s
+        };
+        let fits = got.is_ok()
+            && lists(ins, in_count, &MFVideoFormat_NV12)
+            && lists(outs, out_count, &MFVideoFormat_H264);
+        // SAFETY: the arrays MF allocated (null when none).
+        unsafe {
+            CoTaskMemFree(Some(ins as *const _));
+            CoTaskMemFree(Some(outs as *const _));
+        }
+        let vendor = mft_vendor(&friendly, attrs.as_ref());
+        if !fits || vendor != Some(vendor_id) {
+            continue;
+        }
+        out.push(Candidate {
+            info: EncoderInfo {
+                name: friendly,
+                codec: "h264".into(),
+                hardware: true,
+                vendor_id: Some(format!("VEN_{vendor_id:04X}")),
+                direct: true,
+            },
+            source: Source::Direct(guid),
+        });
+    }
+    out
 }
 
 /// H.264 encoder MFTs for NV12 input: the hardware ones scoped to the adapter `luid`, or the
@@ -137,10 +289,14 @@ pub fn enumerate_h264(hardware: bool, luid: Option<u64>) -> Result<Vec<Candidate
                         codec: "h264".into(),
                         hardware,
                         vendor_id: attr_string(&attrs, &MFT_ENUM_HARDWARE_VENDOR_ID_Attribute),
+                        direct: false,
                     },
                     Err(_) => EncoderInfo::default(),
                 };
-                out.push(Candidate { info, activate });
+                out.push(Candidate {
+                    info,
+                    source: Source::Activate(activate),
+                });
             }
         }
         CoTaskMemFree(Some(array as *const _));
@@ -219,7 +375,8 @@ unsafe impl Send for Sample {}
 
 /// An activated, configured, streaming asynchronous encoder MFT.
 pub struct Encoder {
-    activate: IMFActivate,
+    /// `None` for an MFT created directly.
+    activate: Option<IMFActivate>,
     transform: IMFTransform,
     codec_api: Option<ICodecAPI>,
     events: IMFMediaEventGenerator,
@@ -256,10 +413,21 @@ impl Encoder {
             bitrate: u64::from(p.bitrate),
             ..EncoderSetup::default()
         };
-        let activate = candidate.activate.clone();
-        // SAFETY: valid activation object; creates the MFT.
-        let transform: IMFTransform = unsafe { activate.ActivateObject()? };
-        let guard = ActivationGuard(Some(activate.clone()));
+        let (activate, transform): (Option<IMFActivate>, IMFTransform) = match &candidate.source {
+            // SAFETY: valid activation object; creates the MFT.
+            Source::Activate(a) => (Some(a.clone()), unsafe { a.ActivateObject()? }),
+            // SAFETY: a registered hardware encoder's CLSID; the MFT gets this stream's device
+            // through MFT_MESSAGE_SET_D3D_MANAGER below, like an activated one.
+            Source::Direct(clsid) => (None, unsafe {
+                CoCreateInstance(clsid, None, CLSCTX_INPROC_SERVER)?
+            }),
+        };
+        if candidate.info.direct {
+            setup.notes.push(
+                "created from its registration: Media Foundation listed no hardware encoder".into(),
+            );
+        }
+        let guard = ActivationGuard(Some((activate.clone(), transform.clone())));
         // SAFETY: valid MFT; attribute calls take valid GUID pointers.
         let attrs = unsafe { transform.GetAttributes()? };
         // SAFETY: as above.
@@ -562,12 +730,16 @@ impl Encoder {
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
-        if let Ok(s) = self.transform.cast::<IMFShutdown>() {
-            // SAFETY: valid interface.
-            let _ = unsafe { s.Shutdown() };
+        if let Some(activate) = &self.activate {
+            if let Ok(s) = self.transform.cast::<IMFShutdown>() {
+                // SAFETY: valid interface.
+                let _ = unsafe { s.Shutdown() };
+            }
+            // SAFETY: valid activation object; releases the MFT's resources.
+            let _ = unsafe { activate.ShutdownObject() };
+        } else {
+            shut_down(None, &self.transform);
         }
-        // SAFETY: valid activation object; releases the MFT's resources.
-        let _ = unsafe { self.activate.ShutdownObject() };
     }
 }
 
