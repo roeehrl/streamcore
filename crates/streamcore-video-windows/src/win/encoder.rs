@@ -216,7 +216,9 @@ impl EncoderFactory for MfEncoderFactory {
         let _apartment = Apartment::mta().map_err(|_| MediaError::Internal)?;
         let candidates = mf::hardware_h264(self.gpu.luid, self.gpu.vendor_id())
             .map_err(|_| MediaError::Unsupported)?;
-        let candidate = candidates.first().ok_or(MediaError::Unsupported)?;
+        if candidates.is_empty() {
+            return Err(MediaError::Unsupported);
+        }
         let (rate_control, peak) = *lock(&self.rate_control);
         let bitrate = u32::try_from(spec.bitrate_bps).unwrap_or(u32::MAX);
         let params = Params {
@@ -227,12 +229,21 @@ impl EncoderFactory for MfEncoderFactory {
             rate_control,
             max_bitrate: peak.map(|k| (f64::from(bitrate) * k).min(f64::from(u32::MAX)) as u32),
         };
-        let encoder = Encoder::create(candidate, &self.gpu, &params).map_err(|e| {
-            lock(&self.stats)
-                .errors
-                .push(format!("create {}: {e}", candidate.info.name));
-            MediaError::EncoderFailed { recoverable: false }
-        })?;
+        // The first that configures: a directly created candidate may not take NV12 -> H.264.
+        let encoder = candidates
+            .iter()
+            .find_map(
+                |candidate| match Encoder::create(candidate, &self.gpu, &params) {
+                    Ok(encoder) => Some(encoder),
+                    Err(e) => {
+                        lock(&self.stats)
+                            .errors
+                            .push(format!("create {}: {e}", candidate.info.name));
+                        None
+                    }
+                },
+            )
+            .ok_or(MediaError::EncoderFailed { recoverable: false })?;
         let info = EncoderInfo {
             codec: Codec::H264,
             name: encoder.setup.name.clone(),

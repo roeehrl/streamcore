@@ -107,6 +107,9 @@ pub struct Candidate {
 /// returns none, the registered hardware H.264 encoders of the adapter's vendor, created directly.
 /// Some Windows installations enumerate no hardware MFT at all although the driver's MFTs are
 /// registered and load (`encoders` diagnostics); the MFT then runs on the device it is given.
+/// Enumeration also leaves out MFTs on purpose (field-of-use locked, blocked by the OS or the
+/// driver, no hardware encode in this session): creating one directly overrides that, so a bad
+/// stream from a `direct` encoder may be one Windows meant to exclude.
 pub fn hardware_h264(luid: u64, vendor_id: u32) -> Result<Vec<Candidate>> {
     if !FORCE_DIRECT.load(Ordering::Relaxed) {
         let listed = enumerate_h264(true, Some(luid))?;
@@ -167,6 +170,7 @@ fn registered_hardware_h264(vendor_id: u32) -> Vec<Candidate> {
         return Vec::new();
     };
     let mut out = Vec::new();
+    let mut typed_flags = Vec::new();
     for clsid in category.subkeys() {
         let Some(guid) = parse_guid(&clsid) else {
             continue;
@@ -205,6 +209,8 @@ fn registered_hardware_h264(vendor_id: u32) -> Vec<Candidate> {
             }
             s
         };
+        // Registered NV12 and H.264 types explicitly: tried before an MFT that registered none.
+        let typed = !ins.is_null() && in_count > 0 && !outs.is_null() && out_count > 0;
         let fits = got.is_ok()
             && lists(ins, in_count, &MFVideoFormat_NV12)
             && lists(outs, out_count, &MFVideoFormat_H264);
@@ -227,8 +233,11 @@ fn registered_hardware_h264(vendor_id: u32) -> Vec<Candidate> {
             },
             source: Source::Direct(guid),
         });
+        typed_flags.push(typed);
     }
-    out
+    let mut order: Vec<(bool, Candidate)> = typed_flags.into_iter().zip(out).collect();
+    order.sort_by_key(|(typed, _)| !*typed);
+    order.into_iter().map(|(_, c)| c).collect()
 }
 
 /// H.264 encoder MFTs for NV12 input: the hardware ones scoped to the adapter `luid`, or the
@@ -424,7 +433,9 @@ impl Encoder {
         };
         if candidate.info.direct {
             setup.notes.push(
-                "created from its registration: Media Foundation listed no hardware encoder".into(),
+                "created from its registration: Media Foundation listed no hardware encoder \
+                 (this can override an exclusion Windows or the driver meant)"
+                    .into(),
             );
         }
         let guard = ActivationGuard(Some((activate.clone(), transform.clone())));

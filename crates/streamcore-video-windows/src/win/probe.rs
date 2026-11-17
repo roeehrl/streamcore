@@ -155,9 +155,9 @@ pub fn run(
     let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
     let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
     let candidates = hardware_h264(luid, gpu.vendor_id()).map_err(err("MFTEnum2"))?;
-    let candidate = candidates
-        .first()
-        .ok_or("no hardware H.264 encoder MFT on this adapter")?;
+    if candidates.is_empty() {
+        return Err("no hardware H.264 encoder MFT on this adapter".into());
+    }
     let params = Params {
         width,
         height,
@@ -166,7 +166,16 @@ pub fn run(
         rate_control,
         max_bitrate: peak.map(|k| (bitrate as f64 * k).min(f64::from(u32::MAX)) as u32),
     };
-    let encoder = Encoder::create(candidate, &gpu, &params).map_err(err("create encoder"))?;
+    // The first that configures: a directly created candidate may not take NV12 -> H.264.
+    let mut failures = Vec::new();
+    let encoder = candidates
+        .iter()
+        .find_map(|c| {
+            Encoder::create(c, &gpu, &params)
+                .map_err(|e| failures.push(format!("{}: {e}", c.info.name)))
+                .ok()
+        })
+        .ok_or_else(|| format!("create encoder: {}", failures.join("; ")))?;
     let mut report = ProbeReport {
         os_build: os_build(),
         adapter: gpu.name.clone(),
