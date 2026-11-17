@@ -231,6 +231,18 @@ fn p95(values: &mut [u64]) -> u64 {
     values[(values.len() * 95).div_ceil(100).max(1) - 1]
 }
 
+// Windows: the 1 ms timer period a host holds while it captures (the Windows
+// capture backend's `TimerPeriod`). This test runs no capture, and at the
+// default 15.6 ms timer resolution about half the runs measured frames arriving
+// up to two timer ticks after they were sent (added p95 ~31 ms instead of
+// ~1 ms). Never ended: the process ends with the test binary.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+#[link(name = "winmm")]
+unsafe extern "system" {
+    fn timeBeginPeriod(period_ms: u32) -> u32;
+}
+
 /// The P2 scheduling gate (9.6, 11): with rate adaptation on, a 60 fps stream's
 /// frames are delayed by the transport at most half a frame interval more than
 /// its best case (p95) while a real bulk transfer runs, on TLS/TCP and on
@@ -238,6 +250,12 @@ fn p95(values: &mut [u64]) -> u64 {
 /// jitter (which moves both) is not counted against the transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn video_added_delay_stays_within_half_a_frame_under_a_real_transfer() {
+    #[cfg(windows)]
+    #[allow(unsafe_code)]
+    // SAFETY: a plain winmm call with no pointers.
+    unsafe {
+        timeBeginPeriod(1);
+    }
     set_transport_tuning(TransportTuning {
         bulk_token_bucket: true,
         ..TransportTuning::default()
