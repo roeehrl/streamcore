@@ -389,3 +389,29 @@ impl Drop for TimerPeriod {
         }
     }
 }
+
+/// Keeps the display on (and the system awake) while held, so a bench or probe run measures a
+/// lit screen: with the display off, DWM composes far less often and the GPU idles differently.
+/// Nothing persists: dropping it clears the request.
+pub struct DisplayAwake(());
+
+impl DisplayAwake {
+    pub fn acquire() -> Self {
+        use windows::Win32::System::Power::{
+            ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+        };
+        // SAFETY: plain flags; cleared on drop from the same thread.
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+        };
+        Self(())
+    }
+}
+
+impl Drop for DisplayAwake {
+    fn drop(&mut self) {
+        use windows::Win32::System::Power::{ES_CONTINUOUS, SetThreadExecutionState};
+        // SAFETY: plain flags; clears this thread's request.
+        unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+    }
+}

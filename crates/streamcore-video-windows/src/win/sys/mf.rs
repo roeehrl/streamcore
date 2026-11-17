@@ -148,6 +148,10 @@ pub fn enumerate_h264(hardware: bool, luid: Option<u64>) -> Result<Vec<Candidate
     Ok(out)
 }
 
+/// `eAVEncCommonRateControlMode_UnconstrainedVBR`, the rate control streams use: a repeat of a
+/// still image comes out at a few KB, where CBR pads it to the full per-frame budget (6.3.1).
+pub const RATE_CONTROL_VBR: u32 = eAVEncCommonRateControlMode_UnconstrainedVBR.0 as u32;
+
 /// Encoder parameters.
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -155,6 +159,10 @@ pub struct Params {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// `AVEncCommonRateControlMode` (`eAVEncCommonRateControlMode`).
+    pub rate_control: u32,
+    /// `AVEncCommonMaxBitRate`, set only when given (peak-constrained VBR).
+    pub max_bitrate: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -291,7 +299,7 @@ impl Encoder {
         };
 
         let codec_api: Option<ICodecAPI> = transform.cast().ok();
-        let wanted: Vec<(&str, GUID, Val)> = vec![
+        let mut wanted: Vec<(&str, GUID, Val)> = vec![
             (
                 "AVLowLatencyMode",
                 CODECAPI_AVLowLatencyMode,
@@ -300,7 +308,7 @@ impl Encoder {
             (
                 "AVEncCommonRateControlMode",
                 CODECAPI_AVEncCommonRateControlMode,
-                Val::U32(eAVEncCommonRateControlMode_CBR.0 as u32),
+                Val::U32(p.rate_control),
             ),
             (
                 "AVEncCommonMeanBitRate",
@@ -315,6 +323,13 @@ impl Encoder {
             // 0: no periodic IDR; the stream asks for one when it needs it.
             ("AVEncMPVGOPSize", CODECAPI_AVEncMPVGOPSize, Val::U32(0)),
         ];
+        if let Some(max) = p.max_bitrate {
+            wanted.push((
+                "AVEncCommonMaxBitRate",
+                CODECAPI_AVEncCommonMaxBitRate,
+                Val::U32(max),
+            ));
+        }
         match &codec_api {
             Some(api) => {
                 for (name, key, val) in &wanted {

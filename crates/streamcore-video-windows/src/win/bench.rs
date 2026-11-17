@@ -55,7 +55,16 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     let mut errors = Vec::new();
 
     // The permit target comes from the encoder's min_inputs_before_output (3.3).
-    let probe = probe::run(luid, encode.0, encode.1, options.fps, bitrate);
+    let probe = probe::run(
+        luid,
+        encode.0,
+        encode.1,
+        options.fps,
+        bitrate,
+        options.rate_control,
+        options.peak(),
+        None,
+    );
     let min_inputs = probe.as_ref().ok().and_then(|p| p.min_inputs_before_output);
     if let Err(e) = &probe {
         errors.push(format!("probe: {e}"));
@@ -88,6 +97,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         Some(recorder.clone()),
         min_inputs,
     );
+    factory.set_rate_control(options.rate_control, options.peak());
 
     // Synthetic source over the whole monitor, its barcode read back after convert.
     let synthetic = options.mode == Mode::Synthetic;
@@ -121,6 +131,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
                 Pace::Composition => WindowPace::EveryComposition,
                 Pace::EveryMs(ms) => WindowPace::Every(ms),
             },
+            options.text_content,
         ))
     } else {
         None
@@ -181,7 +192,14 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
             medium_cap_bps: None,
             adapter_luid: Some(luid),
             refresh_interval_ns: super::capture::refresh_interval_ns(output),
-            pacing: streamcore_video::PacingPolicy::default(),
+            // Keep-warm runs only with rate adaptation (6.3.1).
+            pacing: match options.keep_warm_hold {
+                Some(hold) => streamcore_video::PacingPolicy {
+                    keep_warm_ms: hold,
+                    ..streamcore_video::PacingPolicy::with_rate_adaptation()
+                },
+                None => streamcore_video::PacingPolicy::default(),
+            },
         },
         port,
         queue: executor.queue(),
@@ -221,7 +239,19 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     let measure_from = now_ns() + (options.warmup * 1e9) as u64;
     let end_at = measure_from + (options.seconds * 1e9) as u64;
     if started {
-        std::thread::sleep(Duration::from_nanos(end_at.saturating_sub(now_ns())));
+        match options.keep_warm_hold {
+            // Someone drawing all along: input every 50 ms, as a pen reports far more often.
+            Some(hold) => {
+                notes.push(format!(
+                    "keep-warm: hold {hold} ms, input simulated every 50 ms"
+                ));
+                while now_ns() < end_at {
+                    controller.note_input();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            None => std::thread::sleep(Duration::from_nanos(end_at.saturating_sub(now_ns()))),
+        }
     }
     let stats = controller.stats();
     // Read while the capture still holds the timer period (nothing is held after close).
@@ -289,8 +319,29 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         }
         None => None,
     };
+    // A synthetic window redrawn on every composition is captured at about the refresh rate on
+    // a lit screen; far below it the display is asleep (or the session not on the console) and
+    // the run does not measure what it says.
+    let fps_captured = recorder.captured_between(measure_from, end_at) as f64 / seconds;
+    if synthetic && options.pace == Pace::Composition {
+        let expected = output
+            .refresh_hz
+            .unwrap_or(60.0)
+            .min(f64::from(options.fps));
+        if fps_captured < expected / 2.0 {
+            errors.push(format!(
+                "captured {fps_captured:.1} fps of an expected ~{expected:.0}: is the display asleep?"
+            ));
+        }
+    }
     let count = |f: &dyn Fn(&FrameTrace) -> bool| measured.iter().filter(|t| f(t)).count() as u64;
     let encoded_bytes: usize = measured.iter().filter_map(|t| t.bytes).sum();
+    let mut sizes: Vec<usize> = measured.iter().filter_map(|t| t.bytes).collect();
+    sizes.sort_unstable();
+    let frame_kb = (!sizes.is_empty()).then(|| {
+        let at = |q: f64| sizes[((sizes.len() - 1) as f64 * q).round() as usize] as f64 / 1e3;
+        [at(0.5), at(0.95), at(0.99), at(1.0)]
+    });
     let snapshot = stats;
     let stream: BTreeMap<String, u64> = [
         ("frames_received", snapshot.frames_received),
@@ -298,6 +349,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         ("submitted", snapshot.submitted),
         ("encoded", snapshot.encoded),
         ("encoder_drops", snapshot.encoder_drops),
+        ("keep_warm_repeats", snapshot.keep_warm_repeats),
         ("packets_sent", snapshot.packets_sent),
         ("packets_refused", snapshot.packets_refused),
         ("recoveries", snapshot.recoveries),
@@ -329,7 +381,7 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         min_inputs_before_output_probe: min_inputs,
         inputs_before_first_output: session.inputs_before_first_output,
         max_frames_in_encoder: Some(session.max_in_encoder),
-        fps_captured: recorder.captured_between(measure_from, end_at) as f64 / seconds,
+        fps_captured,
         fps_submitted: count(&|t| t.h3.is_some()) as f64 / seconds,
         fps_encoded: count(&|t| t.h4.is_some()) as f64 / seconds,
         // The discard sink stamps no H5: nothing sent is measured.
@@ -340,6 +392,10 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         r1_late_sends: None,
         synthetic: synthetic_result,
         encoded_mbps: encoded_bytes as f64 * 8.0 / 1e6 / seconds,
+        rate_control: options.rate_control,
+        peak_ratio: options.peak(),
+        frame_kb,
+        frame_budget_kb: bitrate as f64 / f64::from(options.fps.max(1)) / 8.0 / 1e3,
         keyframes: count(&|t| t.keyframe),
         sps: session.sps.clone(),
         vui_normalized: session.vui_normalized,
@@ -386,6 +442,9 @@ fn synthetic_analysis(
     SyntheticResult {
         pace: match options.pace {
             Pace::Composition => "a new counter every DWM composition".into(),
+            Pace::EveryMs(ms) if options.text_content => {
+                format!("a new counter and a third of a page scrolled every {ms} ms")
+            }
             Pace::EveryMs(ms) => format!("a new counter and colour every {ms} ms"),
         },
         counters_drawn: drawn.len() as u64,
@@ -454,6 +513,20 @@ pub fn print(r: &BenchReport) {
     println!("R1 (access unit -> sink): {SINK_NOT_MEASURED}");
     if let Some(s) = &r.synthetic {
         println!("synthetic: {s:?}");
+    }
+    println!(
+        "rate control {}{}, frame budget {:.1} KB (bitrate / fps)",
+        r.rate_control,
+        r.peak_ratio
+            .map(|k| format!(", peak {k} x mean"))
+            .unwrap_or_default(),
+        r.frame_budget_kb
+    );
+    if let Some([p50, p95, p99, max]) = r.frame_kb {
+        println!(
+            "frame size KB p50 {p50:.1}  p95 {p95:.1}  p99 {p99:.1}  max {max:.1}  (max {:.1}x budget)",
+            max / r.frame_budget_kb.max(0.001)
+        );
     }
     println!(
         "encoded {:.2} Mbit/s, {} keyframes",

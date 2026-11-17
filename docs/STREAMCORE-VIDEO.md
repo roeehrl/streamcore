@@ -721,6 +721,37 @@ one target interval plus one refresh after it arrived) if nothing newer is admit
 deadline is absolute on the host clock and armed as `deadline − now`: H0 may come after the frame's
 arrival (9.2), so a delay measured from H0 would fire one H1 → H0 early.
 
+#### 6.3.1 Keep-warm
+
+A GPU lowers its clocks between sparse frames, so the first change after a pause encodes slowly.
+Measured at 4K on an integrated GPU's hardware encoder: 13 ms per frame under constant redraw,
+about 25 ms for frames 500 ms apart and 33 ms on an idle desktop. When someone is drawing, that
+first change is exactly the frame they wait for.
+
+With `PacingPolicy::keep_warm_ms`, every `StreamController::note_input` opens (or extends) a hold
+of that many ms. During the hold, once one and a half refresh intervals (or one and a half of the
+screen's recent interval between new images, if longer, at most 100 ms) pass with no new image
+and a refresh interval with nothing submitted, the executor encodes the latest image again as a
+plain delta, then once per refresh while the screen stays still. A repeat is never submitted while a
+frame is in the encoder or the sink holds, and a screen changing on every refresh is never
+repeated, nor one changing at a steady lower rate (30 fps on a 60 Hz display), so a repeat does
+not delay a new frame. `StatsSnapshot::keep_warm_repeats` counts them
+(they are also in `submitted`). Measured the same way with simulated input throughout, draw to
+encoded for a change every 500 ms went from 64 to 47 ms (p50) and 83 to 62 ms (p95) on a flat
+page, and from 67-76 to 62-69 ms (p50) and 94-116 to 88 ms (p95) on a scrolling text page.
+Repeats every 33 ms, a GPU copy every refresh, or a smaller second encoder session gain nothing.
+
+A repeat of a still image must be small. CBR pads every frame to the per-frame budget (about
+100 KB at 4K, 50 Mbit/s), so the Windows encoder uses unconstrained VBR: a repeat is a few KB
+(under 1 KB on a still desktop). On a scrolled page of text, VBR's largest frames were within
+about 1.35x of CBR's, which already reaches 3-10x the per-frame budget; quality-based rate control
+produced 2.5-2.9 MB frames and is not used. VBR holds the mean over a window, so with repeats the
+budget they leave is spent on the new images: the scrolling text page went from about 21 to
+47 Mbit/s against a 50 Mbit/s target, with twice as many frames above 700 KB. So keep-warm runs
+only with rate adaptation (6.6), which sets that target from the link; with it off,
+`note_input` does nothing. A coarse per-frame QP or minimum QP on repeats does not change the
+rate (the repeats are already tiny).
+
 ### 6.4 Post-encoder shedding in `VideoSink`
 
 Per stream, before fragmentation:

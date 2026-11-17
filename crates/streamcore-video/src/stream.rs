@@ -48,6 +48,8 @@ pub(crate) enum Command {
     Update(OpToken, StreamUpdate),
     Stop(OpToken),
     RequestKeyframe,
+    /// User input reached the host: keep the encoder warm (6.3.1).
+    Input,
     /// The display's refresh interval changed (`None`: unknown).
     Refresh(Option<u64>),
     /// The client flushed this many frames (skip cause e).
@@ -111,6 +113,9 @@ enum TimerKind {
     Compose,
     /// Rate adaptation's tick (6.6).
     Abr,
+    /// Keep-warm (6.3.1): re-encode the latest image if nothing was submitted
+    /// for a refresh interval.
+    KeepWarm,
 }
 
 struct EncoderSlot {
@@ -236,6 +241,18 @@ pub(crate) struct StreamState {
     /// sink's next report that finds it ready.
     recovery_wait_ready: bool,
 
+    /// Keep-warm (6.3.1): until this executor time, and its timer.
+    keep_warm_until: u64,
+    keep_warm_timer: Option<TimerToken>,
+    /// Executor times of the last submit and the last new image.
+    last_submit_at: u64,
+    last_image_at: u64,
+    /// The recent interval between new images (an average of those under
+    /// `KEEP_WARM_MAX_GAP_NS`), 0 until two arrived: keep-warm waits longer
+    /// than it, so a screen changing at a steady rate below the refresh rate
+    /// (30 fps on 60 Hz) gets no repeats between its frames.
+    image_interval_ns: u64,
+
     timers: BTreeMap<TimerToken, (u64, TimerKind)>,
     next_timer: TimerToken,
     armed: Option<(u64, TimerToken)>,
@@ -255,6 +272,9 @@ pub(crate) struct StreamState {
     inline: bool,
 }
 
+/// Keep-warm (6.3.1): image gaps from this long count as a pause, not as the
+/// screen's rate, and a repeat never waits longer than this after a new image.
+const KEEP_WARM_MAX_GAP_NS: u64 = 100_000_000;
 /// Rate adaptation's tick (6.6).
 const ABR_TICK_NS: u64 = 100_000_000;
 /// Bulk counts as competing this long after its last byte.
@@ -472,6 +492,11 @@ impl StreamState {
             bulk_seen: (0, 0),
             client_loss_seen: (0, 0),
             recovery_wait_ready: false,
+            keep_warm_until: 0,
+            keep_warm_timer: None,
+            last_submit_at: 0,
+            last_image_at: 0,
+            image_interval_ns: 0,
             timers: BTreeMap::new(),
             next_timer: 0,
             armed: None,
@@ -732,6 +757,7 @@ impl StreamState {
             Command::Update(op, update) => self.on_update(cx, op, update),
             Command::Stop(op) => self.on_stop(cx, op),
             Command::RequestKeyframe => self.request_recovery(cx),
+            Command::Input => self.on_input(cx),
             Command::Refresh(refresh) => {
                 self.plan.refresh_interval_ns = refresh;
                 self.pacer.set_refresh(refresh.unwrap_or(0));
@@ -752,6 +778,7 @@ impl StreamState {
             }
             Command::Revoked => {
                 self.cancel_pace();
+                self.stop_keep_warm();
                 self.clear_canvas(cx);
                 self.latest = None;
                 self.recovery_needed = false;
@@ -1234,6 +1261,12 @@ impl StreamState {
                     self.abr_tick(cx);
                 }
             }
+            TimerKind::KeepWarm => {
+                if self.keep_warm_timer == Some(token) {
+                    self.keep_warm_timer = None;
+                    self.keep_warm_tick(cx);
+                }
+            }
         }
     }
 
@@ -1243,6 +1276,7 @@ impl StreamState {
     fn reset_stream_state(&mut self) {
         self.stop_abr();
         self.cancel_pace();
+        self.stop_keep_warm();
         self.canvas_reset();
         self.pacer.reset();
         self.permits.reset();
@@ -1607,6 +1641,16 @@ impl StreamState {
         };
         let mapped = self.plan.color_mapping.map(info.color, info.format, output);
         self.time_anchor = Some((info.capture_ns, cx.clock.now_ns()));
+        let now = cx.clock.now_ns();
+        let gap = now.saturating_sub(self.last_image_at);
+        if self.last_image_at != 0 && gap < KEEP_WARM_MAX_GAP_NS {
+            self.image_interval_ns = if self.image_interval_ns == 0 {
+                gap
+            } else {
+                (self.image_interval_ns * 7 + gap) / 8
+            };
+        }
+        self.last_image_at = now;
         let format = info.format;
         let admitted = if paced {
             self.admit(cx, &info)
@@ -1763,6 +1807,7 @@ impl StreamState {
                 }
                 self.ltr.pending_ack = None;
                 self.last_pts_ns = pts_ns;
+                self.last_submit_at = cx.clock.now_ns();
                 self.force_keyframe = false;
                 self.ltr.force_refresh = false;
                 self.stats.submitted += 1;
@@ -1847,6 +1892,94 @@ impl StreamState {
             self.post_internal(cx, Internal::Arm);
         }
         false
+    }
+
+    // -----------------------------------------------------------------------
+    // Keep-warm (6.3.1).
+
+    /// Input reached the host: keep the encoder warm for `keep_warm_ms`.
+    fn on_input(&mut self, cx: &Arc<Shared>) {
+        let hold_ms = self.plan.pacing.keep_warm_ms;
+        // Only with rate adaptation: VBR spends the budget repeats leave on new images, so the
+        // target must follow the link (6.3.1).
+        if hold_ms == 0
+            || !self.plan.pacing.rate_adaptation
+            || self.canvas.is_some()
+            || self.closing
+        {
+            return;
+        }
+        let now = cx.clock.now_ns();
+        self.keep_warm_until = now.saturating_add(u64::from(hold_ms) * 1_000_000);
+        if self.keep_warm_timer.is_none() {
+            let delay = self.keep_warm_delay(now);
+            self.keep_warm_timer = Some(self.set_timer(cx, delay, TimerKind::KeepWarm));
+        }
+    }
+
+    /// The next keep-warm check: a refresh interval after the last submit, and
+    /// one and a half refresh intervals, or of the screen's recent image
+    /// interval if longer (at most 100 ms), after the last new image. A screen
+    /// changing at a steady rate is never repeated, so a repeat does not land
+    /// just ahead of a new frame and delay it.
+    fn keep_warm_due(&self) -> u64 {
+        let interval = self.pacer.refresh_ns();
+        let quiet = interval.max(self.image_interval_ns) * 3 / 2;
+        self.last_submit_at.saturating_add(interval).max(
+            self.last_image_at
+                .saturating_add(quiet.min(KEEP_WARM_MAX_GAP_NS)),
+        )
+    }
+
+    fn keep_warm_delay(&self, now: u64) -> u64 {
+        let interval = self.pacer.refresh_ns();
+        self.keep_warm_due()
+            .saturating_sub(now)
+            .clamp(interval / 8, interval * 2)
+    }
+
+    /// Re-encode the latest image if nothing was submitted for a refresh
+    /// interval and nothing is in the encoder; re-arm while input is recent.
+    fn keep_warm_tick(&mut self, cx: &Arc<Shared>) {
+        let now = cx.clock.now_ns();
+        if now >= self.keep_warm_until
+            || self.closing
+            || cx.revoked()
+            || !self.accepts_frames()
+            || self.encoder.is_none()
+        {
+            return;
+        }
+        // A 1/8-interval tolerance for timer lateness.
+        let quiet = now + self.pacer.refresh_ns() / 8 >= self.keep_warm_due();
+        if quiet && cx.work.in_flight() == 0 {
+            let restamp = self.host_now(cx);
+            if let Some(latest) = self.latest.as_mut().filter(|latest| !latest.pending) {
+                latest.pending = true;
+                latest.admitted = true;
+                latest.restamp = restamp;
+                let before = self.stats.submitted;
+                self.submit_due(cx);
+                if self.stats.submitted > before {
+                    self.stats.keep_warm_repeats += 1;
+                } else if let Some(latest) = self.latest.as_mut().filter(|l| l.restamp == restamp) {
+                    // Not submitted (the sink holds, the encoder is busy): no
+                    // repeat waits for later; the next tick tries again.
+                    latest.pending = false;
+                    latest.admitted = false;
+                    latest.restamp = None;
+                }
+            }
+        }
+        let delay = self.keep_warm_delay(cx.clock.now_ns());
+        self.keep_warm_timer = Some(self.set_timer(cx, delay, TimerKind::KeepWarm));
+    }
+
+    fn stop_keep_warm(&mut self) {
+        self.keep_warm_until = 0;
+        if self.keep_warm_timer.take().is_some() {
+            self.cancel_timers(|kind| *kind == TimerKind::KeepWarm);
+        }
     }
 
     /// The host clock now: the latest image's H1 plus the executor time since
@@ -2517,7 +2650,12 @@ impl StreamState {
             bulk_active,
             capacity_bps: (!sink.capacity_estimated && sink.capacity_bps != 0)
                 .then_some(sink.capacity_bps),
-            encoded_frames: self.stats.encoded,
+            // Keep-warm repeats are not frames the link carried for the screen,
+            // so they stay out of the sink-gate share.
+            encoded_frames: self
+                .stats
+                .encoded
+                .saturating_sub(self.stats.keep_warm_repeats),
             sink_held: self.stats.sink_held,
         };
         let changed = self.abr.as_mut().and_then(|abr| abr.tick(&sample));
