@@ -6,7 +6,7 @@
 
 use super::sys::com::{Apartment, now_ns};
 use super::sys::d3d::Gpu;
-use super::sys::mf::{Encoder, MfEvent, Params, enumerate_h264};
+use super::sys::mf::{Encoder, MfEvent, Params, hardware_h264};
 use super::{Error, err, os_build};
 use crate::clock::ns_to_hundred_ns;
 use crate::h264::annexb::{NAL_SPS, find};
@@ -141,6 +141,7 @@ fn spawn_events(
     Ok((rx, events))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     luid: u64,
     width: u32,
@@ -153,7 +154,7 @@ pub fn run(
 ) -> Result<ProbeReport, Error> {
     let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
     let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
-    let candidates = enumerate_h264(true, Some(luid)).map_err(err("MFTEnum2"))?;
+    let candidates = hardware_h264(luid, gpu.vendor_id()).map_err(err("MFTEnum2"))?;
     let candidate = candidates
         .first()
         .ok_or("no hardware H.264 encoder MFT on this adapter")?;
@@ -225,7 +226,7 @@ pub fn run(
                 // Its own device: a second session on the timed one's device stalled in testing.
                 let warm_gpu = Gpu::create(Some(luid)).map_err(err("keep-warm D3D11 device"))?;
                 // A fresh activation object: activating the timed one's again returns its MFT.
-                let fresh = enumerate_h264(true, Some(luid)).map_err(err("MFTEnum2"))?;
+                let fresh = hardware_h264(luid, warm_gpu.vendor_id()).map_err(err("MFTEnum2"))?;
                 let warm_candidate = fresh.first().ok_or("no second hardware H.264 MFT")?;
                 let encoder = Encoder::create(warm_candidate, &warm_gpu, &warm_params)
                     .map_err(err("create keep-warm encoder"))?;
@@ -285,7 +286,6 @@ pub fn run(
                 None => break,
             }
         }
-        drop(warm_feeder);
         if let Some((encoder, _, events, _, _gpu)) = warm {
             report.warm_session = gap.warm_session;
             encoder.shutdown();

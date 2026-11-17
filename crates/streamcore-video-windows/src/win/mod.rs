@@ -93,6 +93,7 @@ pub fn run(options: &Options) -> Result<(), Error> {
     // The process MTA: helper threads (encoder create, bounded invalidate) join it.
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = sys::com::MediaFoundation::start().map_err(err("MFStartup"))?;
+    sys::mf::force_direct(options.direct_mft);
     let adapters = report::build();
     // Runs measure a lit screen: the display going to sleep mid-run changes what they measure.
     let _awake = sys::com::DisplayAwake::acquire();

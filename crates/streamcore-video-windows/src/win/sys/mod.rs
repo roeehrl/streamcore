@@ -9,5 +9,6 @@ pub mod com;
 pub mod d3d;
 pub mod mf;
 pub mod mfdiag;
+pub mod reg;
 pub mod vp;
 pub mod window;

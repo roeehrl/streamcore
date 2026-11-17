@@ -5,21 +5,13 @@
 //! and releasing the encoders it tests.
 
 use super::d3d::u64_to_luid;
+use super::reg::{ENCODER_CATEGORY, Key, parse_guid};
 use crate::model::{EnumCall, MftEntry, RegisteredMft, RegistryValue};
 use std::ffi::c_void;
-use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::System::Registry::{
-    HKEY, HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE, KEY_READ, REG_BINARY, REG_DWORD, REG_EXPAND_SZ,
-    REG_QWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW,
-    RegQueryValueExW,
-};
-use windows::core::{GUID, HSTRING, Interface, PWSTR};
-
-/// `MFT_CATEGORY_VIDEO_ENCODER` as the registry spells it (no braces, like its subkeys).
-const ENCODER_CATEGORY: &str =
-    r"MediaFoundation\Transforms\Categories\f79eac7d-e545-4387-bdee-d647d7bde42a";
+use windows::Win32::System::Registry::{HKEY_CLASSES_ROOT, HKEY_LOCAL_MACHINE};
+use windows::core::{GUID, Interface, PWSTR};
 
 fn guid_string(g: &GUID) -> String {
     format!("{{{g:?}}}").to_lowercase()
@@ -200,129 +192,6 @@ pub fn enumerate(
     call
 }
 
-struct Key(HKEY);
-
-impl Key {
-    fn open(root: HKEY, path: &str) -> Option<Self> {
-        let mut key = HKEY::default();
-        // SAFETY: valid root key and path; the out pointer is a valid local, closed in Drop.
-        let r = unsafe { RegOpenKeyExW(root, &HSTRING::from(path), None, KEY_READ, &mut key) };
-        (r == ERROR_SUCCESS).then_some(Self(key))
-    }
-
-    fn subkeys(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for index in 0.. {
-            let mut name = [0u16; 256];
-            let mut len = name.len() as u32;
-            // SAFETY: valid key; the name buffer and its length are valid locals.
-            let r = unsafe {
-                RegEnumKeyExW(
-                    self.0,
-                    index,
-                    Some(PWSTR(name.as_mut_ptr())),
-                    &mut len,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            };
-            if r != ERROR_SUCCESS {
-                break;
-            }
-            out.push(String::from_utf16_lossy(&name[..len as usize]));
-        }
-        out
-    }
-
-    fn values(&self) -> Vec<RegistryValue> {
-        let mut out = Vec::new();
-        for index in 0.. {
-            let mut name = [0u16; 256];
-            let mut name_len = name.len() as u32;
-            let mut kind = 0u32;
-            let mut data = vec![0u8; 4096];
-            let mut data_len = data.len() as u32;
-            // SAFETY: valid key; every buffer and length is a valid local.
-            let r = unsafe {
-                RegEnumValueW(
-                    self.0,
-                    index,
-                    Some(PWSTR(name.as_mut_ptr())),
-                    &mut name_len,
-                    None,
-                    Some(&mut kind),
-                    Some(data.as_mut_ptr()),
-                    Some(&mut data_len),
-                )
-            };
-            if r != ERROR_SUCCESS {
-                break;
-            }
-            data.truncate(data_len as usize);
-            out.push(RegistryValue {
-                name: String::from_utf16_lossy(&name[..name_len as usize]),
-                value: render(REG_VALUE_TYPE(kind), &data),
-            });
-        }
-        out
-    }
-
-    fn value(&self, name: &str) -> Option<String> {
-        let mut kind = REG_VALUE_TYPE(0);
-        let mut data = vec![0u8; 4096];
-        let mut len = data.len() as u32;
-        // SAFETY: valid key; the buffers are valid locals.
-        let r = unsafe {
-            RegQueryValueExW(
-                self.0,
-                &HSTRING::from(name),
-                None,
-                Some(&mut kind),
-                Some(data.as_mut_ptr()),
-                Some(&mut len),
-            )
-        };
-        (r == ERROR_SUCCESS).then(|| {
-            data.truncate(len as usize);
-            render(kind, &data)
-        })
-    }
-}
-
-impl Drop for Key {
-    fn drop(&mut self) {
-        // SAFETY: a key this struct opened.
-        let _ = unsafe { RegCloseKey(self.0) };
-    }
-}
-
-fn render(kind: REG_VALUE_TYPE, data: &[u8]) -> String {
-    match kind {
-        REG_DWORD if data.len() >= 4 => {
-            let v = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            format!("0x{v:x} ({v})")
-        }
-        REG_QWORD if data.len() >= 8 => {
-            format!(
-                "0x{:x}",
-                u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8]))
-            )
-        }
-        REG_SZ | REG_EXPAND_SZ => {
-            let wide: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .take_while(|&c| c != 0)
-                .collect();
-            String::from_utf16_lossy(&wide)
-        }
-        REG_BINARY => format!("{} bytes", data.len()),
-        other => format!("type {} ({} bytes)", other.0, data.len()),
-    }
-}
-
 /// Media Foundation's registry settings that bear on encoder enumeration: every value under
 /// `HKLM\SOFTWARE\Microsoft\Windows Media Foundation` and its direct subkeys (as `subkey\name`).
 pub fn mf_settings() -> Vec<RegistryValue> {
@@ -345,14 +214,6 @@ pub fn mf_settings() -> Vec<RegistryValue> {
         }
     }
     out
-}
-
-fn parse_guid(s: &str) -> Option<GUID> {
-    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex.len() != 32 {
-        return None;
-    }
-    u128::from_str_radix(&hex, 16).ok().map(GUID::from_u128)
 }
 
 /// Every video encoder registered in the encoder category, with its registration and whether

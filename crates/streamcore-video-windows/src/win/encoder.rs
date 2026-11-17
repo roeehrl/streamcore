@@ -177,7 +177,7 @@ impl EncoderFactory for MfEncoderFactory {
         }
         let _apartment = Apartment::mta();
         let min = self.min_inputs_before_output.unwrap_or(1);
-        mf::enumerate_h264(true, Some(self.gpu.luid))
+        mf::hardware_h264(self.gpu.luid, self.gpu.vendor_id())
             .unwrap_or_default()
             .into_iter()
             .map(|c| EncoderCaps {
@@ -214,8 +214,8 @@ impl EncoderFactory for MfEncoderFactory {
         }
         // The executor's helper thread: join the process MTA for the MFT's lifetime calls.
         let _apartment = Apartment::mta().map_err(|_| MediaError::Internal)?;
-        let candidates =
-            mf::enumerate_h264(true, Some(self.gpu.luid)).map_err(|_| MediaError::Unsupported)?;
+        let candidates = mf::hardware_h264(self.gpu.luid, self.gpu.vendor_id())
+            .map_err(|_| MediaError::Unsupported)?;
         let candidate = candidates.first().ok_or(MediaError::Unsupported)?;
         let (rate_control, peak) = *lock(&self.rate_control);
         let bitrate = u32::try_from(spec.bitrate_bps).unwrap_or(u32::MAX);

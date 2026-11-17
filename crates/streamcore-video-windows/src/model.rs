@@ -30,6 +30,10 @@ pub struct EncoderInfo {
     pub codec: String,
     pub hardware: bool,
     pub vendor_id: Option<String>,
+    /// Created from its registration (`CoCreateInstance`) because Media Foundation's
+    /// enumeration listed no hardware encoder for the adapter.
+    #[serde(default)]
+    pub direct: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

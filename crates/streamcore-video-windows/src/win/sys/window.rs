@@ -192,6 +192,7 @@ impl Page {
         // SAFETY: a memory DC compatible with the window's; the bitmap is selected into it and
         // both are released in Drop.
         let dc = unsafe { CreateCompatibleDC(Some(window_dc)) };
+        // SAFETY: as above.
         let old = unsafe { SelectObject(dc, HGDIOBJ(bitmap.0)) };
         Ok(Self {
             dc,

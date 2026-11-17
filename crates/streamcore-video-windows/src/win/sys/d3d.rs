@@ -290,6 +290,12 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// The adapter's PCI vendor ID (0 when unknown).
+    pub fn vendor_id(&self) -> u32 {
+        // SAFETY: valid adapter; a plain struct read.
+        unsafe { self.adapter.GetDesc1() }.map_or(0, |d| d.VendorId)
+    }
+
     /// Creates a device on the adapter with `luid` (or the first adapter), with BGRA and video
     /// support, multithread-protected because the encoder MFT uses it from its own threads.
     pub fn create(luid: Option<u64>) -> Result<Self> {
