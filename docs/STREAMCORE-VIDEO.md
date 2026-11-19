@@ -736,7 +736,10 @@ plain delta, then once per refresh while the screen stays still. A repeat is nev
 frame is in the encoder or the sink holds, and a screen changing on every refresh is never
 repeated, nor one changing at a steady lower rate (30 fps on a 60 Hz display), so a repeat does
 not delay a new frame. `StatsSnapshot::keep_warm_repeats` counts them
-(they are also in `submitted`). Measured the same way with simulated input throughout, draw to
+(they are also in `submitted`), and each one reaches the encoder with
+`SubmitOpts::keep_warm_repeat` set (the native submit function's last argument), so a host's
+trace can tell them from a recovery re-encode or the re-encode of a skipped image, which never
+carry it. While a recovery is pending, keep-warm submits nothing; the recovery goes first. Measured the same way with simulated input throughout, draw to
 encoded for a change every 500 ms went from 64 to 47 ms (p50) and 83 to 62 ms (p95) on a flat
 page, and from 67-76 to 62-69 ms (p50) and 94-116 to 88 ms (p95) on a scrolling text page.
 Repeats every 33 ms, a GPU copy every refresh, or a smaller second encoder session gain nothing.

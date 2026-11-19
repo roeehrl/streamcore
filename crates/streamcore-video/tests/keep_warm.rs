@@ -188,3 +188,46 @@ fn a_screen_changing_at_half_the_refresh_rate_gets_no_repeats_between_frames() {
     s.close();
     s.assert_clean();
 }
+
+#[test]
+fn only_keep_warm_repeats_are_marked_as_repeats() {
+    let s = stream(1_000);
+    present(&s);
+    s.controller.note_input();
+    run_for(&s, 100);
+    // A keyframe asked for in the hold is a recovery, not a repeat.
+    s.controller.request_keyframe();
+    // Keyframes are at least the recovery interval (500 ms) apart; input keeps
+    // the hold going meanwhile.
+    for _ in 0..6 {
+        s.controller.note_input();
+        run_for(&s, 100);
+        // The link sends everything: recovery does not wait for it to drain.
+        for sample in s.out.held() {
+            s.out.finish(sample, true);
+        }
+        s.pump();
+    }
+    let stats = s.controller.stats();
+    let submits = lock(&s.encoder().submits).clone();
+    assert_eq!(submits.len() as u64, stats.submitted);
+    let marked = submits.iter().filter(|o| o.keep_warm_repeat).count() as u64;
+    assert_eq!(marked, stats.keep_warm_repeats);
+    assert!(marked >= 6, "{marked} repeats");
+    // The first image and the keyframe: real submits, unmarked.
+    assert!(!submits[0].keep_warm_repeat);
+    let keyframes: Vec<_> = submits
+        .iter()
+        .skip(1)
+        .filter(|o| o.force_keyframe)
+        .collect();
+    assert_eq!(keyframes.len(), 1);
+    assert!(!keyframes[0].keep_warm_repeat);
+    assert!(
+        submits
+            .iter()
+            .all(|o| !o.keep_warm_repeat || !(o.force_keyframe || o.ltr_refresh))
+    );
+    s.close();
+    s.assert_clean();
+}

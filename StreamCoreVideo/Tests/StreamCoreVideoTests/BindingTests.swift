@@ -95,7 +95,7 @@ final class FakeEncoder: StreamEncoder, @unchecked Sendable {
     init(spec: EncoderSpec, events: EncoderEvents) { self.spec = spec; self.events = events }
 
     /// The C submit: the output goes through the C ABI's single call; the stream keeps the permit.
-    static let nativeSubmit: StreamCoreNative.SubmitFunction = { encoder, _, seq, pts, captureNs, keyframe, _, _ in
+    static let nativeSubmit: StreamCoreNative.SubmitFunction = { encoder, _, seq, pts, captureNs, keyframe, _, _, _ in
         let encoder = Unmanaged<FakeEncoder>.fromOpaque(encoder!).takeUnretainedValue()
         let sink = encoder.spec.sink.nativeKey()
         encoder.output.async {
