@@ -523,6 +523,12 @@ pub struct SubmitOpts {
     /// once, on the first submit after the client's acknowledgement arrived.
     #[uniffi(default = None)]
     pub ltr_acknowledged: Option<u32>,
+    /// A keep-warm repeat (6.3.1): the latest image encoded again, as a plain
+    /// delta, only to keep the encoder's clocks up. Never set on a recovery
+    /// re-encode or on the re-encode of a skipped image. A host's trace can
+    /// leave these frames out of its repeated-frame counts.
+    #[uniffi(default = false)]
+    pub keep_warm_repeat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]

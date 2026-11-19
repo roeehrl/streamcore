@@ -20,7 +20,7 @@ public enum StreamCoreNative {
     public typealias WakeFunction = @convention(c) (UnsafeMutableRawPointer?) -> Void
     public typealias ReleaseFunction = @convention(c) (UnsafeMutableRawPointer?, UInt64) -> Void
     public typealias SubmitFunction = @convention(c) (UnsafeMutableRawPointer?, UInt64, UInt64, UInt64, UInt64, Bool,
-                                                      UInt32, Bool) -> Int32
+                                                      UInt32, Bool, Bool) -> Int32
 
     /// Attaches the per-frame calls of the stream whose port has key `port`
     /// (`StreamPort.nativeKey()`): `queue` and `capture` are the objects given as

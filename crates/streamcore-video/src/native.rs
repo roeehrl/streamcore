@@ -115,7 +115,8 @@ pub type WakeFn = extern "C" fn(queue: *mut c_void);
 pub type ReleaseFn = extern "C" fn(capture: *mut c_void, surface: u64);
 /// `streamcore_video_submit_fn`: `StreamEncoder::submit`, returning one of the
 /// `SUBMIT_*` codes. `ltr_acknowledged` is `SubmitOpts::ltr_acknowledged`
-/// (`0`: none) and `ltr_refresh` is `SubmitOpts::ltr_refresh`.
+/// (`0`: none), `ltr_refresh` is `SubmitOpts::ltr_refresh` and
+/// `keep_warm_repeat` is `SubmitOpts::keep_warm_repeat`.
 pub type SubmitFn = extern "C" fn(
     encoder: *mut c_void,
     surface: u64,
@@ -125,6 +126,7 @@ pub type SubmitFn = extern "C" fn(
     force_keyframe: bool,
     ltr_acknowledged: u32,
     ltr_refresh: bool,
+    keep_warm_repeat: bool,
 ) -> i32;
 
 /// `streamcore_video_stream_callbacks`: the per-frame calls of a stream's
@@ -240,6 +242,7 @@ impl NativeSubmit {
             opts.force_keyframe,
             opts.ltr_acknowledged.unwrap_or(0),
             opts.ltr_refresh,
+            opts.keep_warm_repeat,
         ) {
             SUBMITTED => Submitted::Ok,
             SUBMIT_BUSY => Submitted::Busy,

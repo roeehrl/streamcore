@@ -244,6 +244,9 @@ pub(crate) struct StreamState {
     /// Keep-warm (6.3.1): until this executor time, and its timer.
     keep_warm_until: u64,
     keep_warm_timer: Option<TimerToken>,
+    /// Set while `keep_warm_tick` submits: that submit is a keep-warm repeat
+    /// (`SubmitOpts::keep_warm_repeat`).
+    keep_warm_submitting: bool,
     /// Executor times of the last submit and the last new image.
     last_submit_at: u64,
     last_image_at: u64,
@@ -494,6 +497,7 @@ impl StreamState {
             recovery_wait_ready: false,
             keep_warm_until: 0,
             keep_warm_timer: None,
+            keep_warm_submitting: false,
             last_submit_at: 0,
             last_image_at: 0,
             image_interval_ns: 0,
@@ -1777,6 +1781,7 @@ impl StreamState {
             force_keyframe,
             ltr_refresh,
             ltr_acknowledged: self.ltr.pending_ack,
+            keep_warm_repeat: self.keep_warm_submitting && !force_keyframe && !ltr_refresh,
         };
         debug_assert!(is_current(cx.id));
         let result = match native_submit {
@@ -1952,14 +1957,18 @@ impl StreamState {
         }
         // A 1/8-interval tolerance for timer lateness.
         let quiet = now + self.pacer.refresh_ns() / 8 >= self.keep_warm_due();
-        if quiet && cx.work.in_flight() == 0 {
+        // A pending recovery is submitted by its own path, not as a repeat.
+        let recovering = self.force_keyframe || self.ltr.force_refresh;
+        if quiet && cx.work.in_flight() == 0 && !recovering {
             let restamp = self.host_now(cx);
             if let Some(latest) = self.latest.as_mut().filter(|latest| !latest.pending) {
                 latest.pending = true;
                 latest.admitted = true;
                 latest.restamp = restamp;
                 let before = self.stats.submitted;
+                self.keep_warm_submitting = true;
                 self.submit_due(cx);
+                self.keep_warm_submitting = false;
                 if self.stats.submitted > before {
                     self.stats.keep_warm_repeats += 1;
                 } else if let Some(latest) = self.latest.as_mut().filter(|l| l.restamp == restamp) {

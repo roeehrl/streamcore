@@ -1530,6 +1530,7 @@ pub mod glue {
         force_keyframe: bool,
         ltr_acknowledged: u32,
         ltr_refresh: bool,
+        keep_warm_repeat: bool,
     ) -> i32 {
         // SAFETY: the context is the `FakeEncoder` returned by `create`, which
         // the stream holds while it may submit.
@@ -1541,6 +1542,7 @@ pub mod glue {
             force_keyframe,
             ltr_refresh,
             ltr_acknowledged: (ltr_acknowledged != 0).then_some(ltr_acknowledged),
+            keep_warm_repeat,
         };
         match encoder.accept(opts, None) {
             SubmitResult::Submitted => native::SUBMITTED,
