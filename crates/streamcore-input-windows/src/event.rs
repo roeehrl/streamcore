@@ -130,6 +130,9 @@ pub enum Feedback {
     /// A stroke went into contact (true) or lifted (false); a host may hide the captured cursor
     /// while drawing.
     Drawing(bool),
+    /// Windows refused a pen frame; the pointer still follows as a mouse move. Reported once,
+    /// then not again until a frame has been accepted.
+    PenFailed,
     /// Touch contacts could not be injected (no touch device, or Windows refused them) and were
     /// lifted; the host may deliver the gesture another way.
     TouchFailed,

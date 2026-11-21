@@ -184,6 +184,8 @@ pub(crate) struct Engine<B: Backend> {
     feedback: Box<dyn FeedbackSink>,
     pen: PenSession,
     drawing: bool,
+    /// Windows refused the last pen frame.
+    pen_refused: bool,
     /// The mouse button a mouse-path stroke holds down, if any.
     stroke_button: Option<StrokeButton>,
     /// Buttons a click's down holds until its up.
@@ -209,6 +211,7 @@ impl<B: Backend> Engine<B> {
             feedback,
             pen: PenSession::new(),
             drawing: false,
+            pen_refused: false,
             stroke_button: None,
             clicked: Vec::new(),
             pan: PanDrag::default(),
@@ -430,11 +433,16 @@ impl<B: Backend> Engine<B> {
         let screen = self.backend.virtual_screen();
         let position = screen.pointer(frame.x, frame.y);
         let pressure = geometry::pen_pressure(frame.force, frame.in_contact);
-        if !self.backend.inject_pen(&frame, position, pressure) {
+        let refused = !self.backend.inject_pen(&frame, position, pressure);
+        if refused {
             // The pen path failed mid-stream: at least keep the pointer following for this frame.
             let (x, y) = screen.absolute(frame.x, frame.y);
             self.send(&[SendOp::MoveTo { x, y }]);
+            if !self.pen_refused {
+                self.feedback.feedback(Feedback::PenFailed);
+            }
         }
+        self.pen_refused = refused;
     }
 
     fn move_to(&self, x: i32, y: i32) -> SendOp {
@@ -1354,6 +1362,9 @@ mod tests {
         let calls = rig.calls();
         assert!(matches!(calls[0], Call::Pen { .. }));
         assert_eq!(calls[1], Call::Send(vec![centre()]));
+        // Said once, not for every frame of the stroke.
+        rig.pen(PencilPhase::Hover, PointerKind::Pen, StrokeButton::Left);
+        assert_eq!(rig.feedback(), [Feedback::PenFailed]);
     }
 
     // Mouse.
