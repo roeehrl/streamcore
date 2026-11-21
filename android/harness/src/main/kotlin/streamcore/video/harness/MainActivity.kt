@@ -226,7 +226,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         val channel = connectSecure(
             identity,
             host,
-            listOf(ChannelPath(target.stream, ChannelTransport.TLS_TCP, 0u)),
+            listOf(ChannelPath(target.stream, ChannelTransport.TlsTcp, 0u)),
             SessionOptions(listOf(DEMO_CAPABILITY, FRAMES_V4), listOf(DEMO_CAPABILITY)),
             OperationCancellation(),
         )
