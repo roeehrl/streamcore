@@ -8,6 +8,8 @@
 //! machine: show it locally, never send or log it where it leaves the machine.
 
 pub mod adb;
+mod plist;
+pub mod usbmux;
 
 use streamcore_transport::transport::{Medium, PipeIo};
 
