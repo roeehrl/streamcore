@@ -298,6 +298,12 @@ impl SecureChannel {
     pub fn bulk_bucket_enabled(&self) -> bool {
         self.io.features.bulk_token_bucket
     }
+    /// The channel is closed, by either side or by a transport failure.
+    /// Nothing more can be sent on it. A leaf call.
+    pub fn is_closed(&self) -> bool {
+        *self.io.closed.borrow()
+    }
+
     pub fn close(&self) {
         self.io.close();
     }

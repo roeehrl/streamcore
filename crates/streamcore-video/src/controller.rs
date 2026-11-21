@@ -159,6 +159,31 @@ impl StreamController {
         self.shared.post(Event::Command(Command::TransportChanged));
     }
 
+    /// The stream's transport is going away (8.8): park. Queued and encoding
+    /// frames are dropped without counting as lost, capture and the encoder
+    /// session stay, and nothing is sent until [`Self::attach_transport`]. The
+    /// observer gets `TransportParked`; a stream still parked after
+    /// `StreamTimings::park_ns` fails with `stream.transport`. A channel that
+    /// closes under the stream parks it the same way, without this call.
+    pub fn detach_transport(&self) {
+        self.shared.post(Event::Command(Command::DetachTransport));
+    }
+
+    /// Send on `output` from now on (8.8), whether the stream is parked or
+    /// still on its old transport. The stream keeps its own sink policy
+    /// (`output`'s is not used) and its encoder session; the first frame on
+    /// the new transport is a keyframe in the same wire generation (the peer
+    /// keeps its decoder), of the latest image when there is one, and nothing
+    /// submitted before it is sent there. The result is
+    /// `Completed`, or `stream.cancelled` when the stream is revoked or
+    /// closing.
+    pub fn attach_transport(&self, output: Arc<VideoOutput>) -> OpToken {
+        let op = self.next_command();
+        self.shared
+            .post(Event::Command(Command::AttachTransport(op, output)));
+        op
+    }
+
     /// Post a `Stats` job to the observer queue.
     pub fn request_stats(&self) {
         self.shared.post(Event::Command(Command::Stats));
