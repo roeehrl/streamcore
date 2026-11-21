@@ -28,7 +28,7 @@ const WINDOW_US: u64 = 10_000_000;
 /// Drift is fitted over at most this many recent samples.
 const SAMPLES: usize = 256;
 /// Unanswered pings remembered for matching their pongs.
-const OUTSTANDING: usize = 32;
+pub(crate) const OUTSTANDING: usize = 32;
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 

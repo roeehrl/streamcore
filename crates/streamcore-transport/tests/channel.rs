@@ -542,7 +542,7 @@ async fn a_probe_needs_typed_pings_and_sane_arguments_and_ends_at_its_deadline()
     ));
     let (_listener, server, client) =
         channels_with(ChannelTransport::TlsTcp, clock_options(), clock_options()).await;
-    for (count, spacing, deadline) in [(0, 20, 500), (33, 20, 500), (5, 20, 0), (5, 20, 10_001)] {
+    for (count, spacing, deadline) in [(0, 20, 500), (17, 20, 500), (5, 20, 0), (5, 20, 10_001)] {
         assert!(matches!(
             client.probe(count, spacing, deadline).await,
             Err(streamcore_transport::channel::ChannelError::InvalidConfiguration)
@@ -560,4 +560,21 @@ async fn a_probe_needs_typed_pings_and_sane_arguments_and_ends_at_its_deadline()
     if let Ok(result) = gone {
         assert!(result.answered < result.sent || result.sent == 0);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_probe_keeps_its_pings_while_others_ping_on_the_channel() {
+    let (_listener, _server, client) =
+        channels_with(ChannelTransport::TlsTcp, clock_options(), clock_options()).await;
+    // An application pinging throughout, as a client's clock sync does.
+    let pinging = client.clone();
+    let background = tokio::spawn(async move {
+        for _ in 0..16 {
+            let _ = pinging.send_clock_ping();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let result = client.probe(16, 5, 1_000).await.unwrap();
+    background.await.unwrap();
+    assert_eq!((result.sent, result.answered), (16, 16));
 }
