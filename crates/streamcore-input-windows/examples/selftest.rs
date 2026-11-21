@@ -70,8 +70,9 @@ mod selftest {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-        KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, SetFocus, VIRTUAL_KEY,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, INPUT, INPUT_0, INPUT_KEYBOARD,
+        KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, SetFocus, VIRTUAL_KEY,
+        VK_NUMLOCK,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, ES_AUTOVSCROLL,
@@ -258,6 +259,13 @@ mod selftest {
         // SAFETY: takes a virtual key and returns its state; no other effect.
         let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
         state < 0
+    }
+
+    /// Whether Num Lock is on.
+    fn num_lock_on() -> bool {
+        // SAFETY: takes a virtual key and returns its state; the low bit is the toggle.
+        let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK.0)) };
+        state & 1 != 0
     }
 
     /// A window's rectangle on the desktop.
@@ -685,18 +693,14 @@ mod selftest {
 
         fn capabilities(&self) -> Outcome {
             let capabilities = self.injector.capabilities();
+            let available = |there| if there { "available" } else { "not available" };
+            // Num Lock decides how Windows treats Shift with a navigation key that is not sent
+            // as extended, so the shortcut checks depend on it. It is only read, never toggled.
             Ok(format!(
-                "pen device {}, touch device {}",
-                if capabilities.pen {
-                    "available"
-                } else {
-                    "not available"
-                },
-                if capabilities.touch {
-                    "available"
-                } else {
-                    "not available"
-                },
+                "pen device {}, touch device {}, Num Lock {}",
+                available(capabilities.pen),
+                available(capabilities.touch),
+                if num_lock_on() { "on" } else { "off" },
             ))
         }
 
@@ -819,6 +823,21 @@ mod selftest {
                 self.expect_selection((0, TWO_LINES_LENGTH))?;
                 self.inject(tap(KeySpec::named(NamedKey::Delete), 0))?;
                 self.expect_text("")?;
+                Ok(String::new())
+            })
+        }
+
+        fn shift_arrows(&self) -> Outcome {
+            self.shortcut_check(|| {
+                self.need_focus()?;
+                self.clear();
+                self.inject(text("abcdef"))?;
+                self.expect_text("abcdef")?;
+                for _ in 0..3 {
+                    self.inject(tap(KeySpec::named(NamedKey::Left), SHIFT))?;
+                }
+                // Without Shift the caret would just sit at 3.
+                self.expect_selection((3, 6))?;
                 Ok(String::new())
             })
         }
@@ -1140,6 +1159,7 @@ mod selftest {
         report.check("shortcut-ctrl-home", bench.ctrl_home());
         report.check("shortcut-ctrl-end", bench.ctrl_end());
         report.check("shortcut-shift-select", bench.shift_select());
+        report.check("shortcut-shift-arrows", bench.shift_arrows());
         report.check("shortcut-copy-paste", bench.copy_paste());
         let ctrl_a = bench.ctrl_a();
         report.line(&format!("INFO ctrl-a: {ctrl_a}"));
