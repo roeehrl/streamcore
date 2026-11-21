@@ -190,6 +190,12 @@ pub struct LinkStats {
     pub bulk_bytes_sent: u64,
 }
 
+/// The most pings one probe sends: half of what the clock remembers as
+/// unanswered (`clock::OUTSTANDING`), so other pings on the channel at the same
+/// time (an application's clock pings, another probe) cannot push a probe's own
+/// out of that window and make an answered ping read as lost.
+pub const MAX_PROBE_PINGS: u8 = 16;
+
 /// What [`SecureChannel::probe`] measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct ProbeResult {
@@ -204,6 +210,9 @@ pub struct ProbeResult {
     /// How long the probe took.
     pub elapsed_ms: u32,
 }
+
+// A probe and as many other pings again fit the clock's window together.
+const _: () = assert!(MAX_PROBE_PINGS as usize * 2 <= crate::clock::OUTSTANDING);
 
 #[uniffi::export]
 impl SecureChannel {
@@ -324,14 +333,15 @@ impl SecureChannel {
     /// at most `deadline_ms` in all (`clock.v1` only): how a client judges a
     /// newly connected transport, a cable for example, before it moves a live
     /// session onto it. It sends nothing but the pings, so it may run before
-    /// any application message. The caller decides what passes.
+    /// any application message. The caller decides what passes. At most
+    /// [`MAX_PROBE_PINGS`] pings.
     pub async fn probe(
         &self,
         count: u8,
         spacing_ms: u32,
         deadline_ms: u32,
     ) -> Result<ProbeResult, ChannelError> {
-        if count == 0 || count > 32 || deadline_ms == 0 || deadline_ms > 10_000 {
+        if count == 0 || count > MAX_PROBE_PINGS || deadline_ms == 0 || deadline_ms > 10_000 {
             return Err(ChannelError::InvalidConfiguration);
         }
         if self.io.clock.is_none() {
