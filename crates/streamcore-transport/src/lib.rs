@@ -8,6 +8,7 @@ pub mod channel;
 pub mod clock;
 pub mod identity;
 pub mod multiplex;
+pub mod owner;
 pub mod pairing;
 pub mod pairing_transport;
 pub mod protocol;
