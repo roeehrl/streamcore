@@ -79,10 +79,16 @@ if [[ "${STREAMCORE_VIDEO_SKIP_TESTS:-0}" != 1 ]]; then
         -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
     # The client tests on an iOS Simulator, when one is named (STREAMCORE_VIDEO_IOS_SIMULATOR, or
     # the CI's CORE_SIMULATOR_ID): real VideoToolbox decode and the stream decoder there.
-    SIMULATOR="${STREAMCORE_VIDEO_IOS_SIMULATOR:-${CORE_SIMULATOR_ID:-}}"
-    if [[ -n "$SIMULATOR" ]]; then
+    # Also on a Simulator named StreamCore-iOS18 when this Mac has one: the package's minimum,
+    # where only the layer display path exists and a newer type in a stored property crashes
+    # the process at launch.
+    SIMULATORS=("${STREAMCORE_VIDEO_IOS_SIMULATOR:-${CORE_SIMULATOR_ID:-}}")
+    MINIMUM_SIMULATOR="$(xcrun simctl list devices available | sed -n 's/^ *StreamCore-iOS18 (\([0-9A-F-]*\)).*/\1/p' | head -1)"
+    [[ -n "$MINIMUM_SIMULATOR" ]] && SIMULATORS+=("$MINIMUM_SIMULATOR")
+    for SIMULATOR in "${SIMULATORS[@]}"; do
+        [[ -n "$SIMULATOR" ]] || continue
         (cd StreamCoreVideo && xcodebuild test -scheme StreamCoreVideo-Package -destination "id=$SIMULATOR" \
             -only-testing:StreamCoreAppleClientTests -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios-test" \
             CODE_SIGNING_ALLOWED=NO -quiet)
-    fi
+    done
 fi

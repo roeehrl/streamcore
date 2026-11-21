@@ -109,15 +109,25 @@ public final class ReceiverVideoDisplay: VideoDisplay, @unchecked Sendable {
 
     /// The receiver, confined to this actor. Its async `enqueue` suspends here, so a
     /// `flush` can still run meanwhile and cancel it.
+    ///
+    /// The receiver is stored type-erased: the runtime realizes this actor's class at launch
+    /// on every system, and a stored property naming the iOS and macOS 27 receiver type would
+    /// crash it on an older one (see `SampleBufferFeed.Sample`). Only code that runs on 27
+    /// casts it back.
     private actor Port {
-        private let receiver: AVSampleBufferVideoRenderer.Receiver
+        private let stored: Any
         // periphery:ignore - keeps the receiver's synchronizer alive as long as the receiver
         private let synchronizer: AVSampleBufferRenderSynchronizer
         private var flushed: UInt64 = 0
 
         init(_ receiver: sending AVSampleBufferVideoRenderer.Receiver, synchronizer: AVSampleBufferRenderSynchronizer) {
-            self.receiver = receiver
+            stored = receiver
             self.synchronizer = synchronizer
+        }
+
+        private var receiver: AVSampleBufferVideoRenderer.Receiver {
+            // swiftlint:disable:next force_cast
+            stored as! AVSampleBufferVideoRenderer.Receiver
         }
 
         var events: some Sendable & AsyncSequence<AVSampleBufferVideoRenderer.Receiver.RenderingEvent, Never> {
@@ -133,8 +143,9 @@ public final class ReceiverVideoDisplay: VideoDisplay, @unchecked Sendable {
         func enqueue(_ sample: SampleBufferFeed.Sample, epoch: UInt64) async -> SampleBufferFeed.Outcome {
             flush(through: epoch)
             guard epoch == flushed else { return .taken }  // flushed since: drop it
+            let ready = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>(unsafeBuffer: sample.buffer)
             do {
-                switch try await receiver.enqueue(sample) {
+                switch try await receiver.enqueue(ready) {
                 case .enqueued, .enqueuedWithDecodeFailures, .cancelledDueToFlush: return .taken
                 case .cancelledDueToFlushRequiredToResume, .cancelledDueToError: return .failed
                 @unknown default: return .failed
