@@ -38,6 +38,9 @@ pub enum ChannelError {
     Backpressure,
     #[error("network runtime is unavailable")]
     Runtime,
+    /// A listener's pending-handshake queue is full: offer the pipe again later.
+    #[error("too many pending handshakes")]
+    Busy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -419,6 +422,7 @@ impl SecureListener {
             .accept_stream(io, PeerLocator::Usb { medium, device })
             .map_err(|error| match error {
                 TransportError::Closed => ChannelError::Closed,
+                TransportError::Busy => ChannelError::Busy,
                 _ => ChannelError::ConnectionFailed,
             })
     }

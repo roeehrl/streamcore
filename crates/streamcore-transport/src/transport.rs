@@ -67,6 +67,10 @@ pub trait PipeStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> PipeStream for T {}
 pub type PipeIo = Box<dyn PipeStream>;
 
+/// A USB device as the admission bound counts it: a provider's label is only
+/// unique within its medium.
+type UsbDevice = (Medium, String);
+
 /// Pending handshakes one USB device may hold at a time: a device that opens
 /// pipes and stalls cannot use up the listener's shared handshake budget.
 const MAX_PENDING_PER_DEVICE: usize = 2;
@@ -94,6 +98,10 @@ pub enum TransportError {
     InvalidPaths,
     #[error("no authenticated path succeeded")]
     NoPath,
+    /// The listener's pending-handshake queue is full: the pipe was not taken,
+    /// and the provider may offer one again later.
+    #[error("too many pending handshakes")]
+    Busy,
     #[error("protocol ALPN mismatch")]
     Alpn,
     #[error("network I/O failed")]
@@ -260,8 +268,9 @@ impl SessionListener {
     /// Hands over a pipe a provider opened to a device. The listener is the
     /// TLS server on it, with the same identity, pins, admission bounds and
     /// trust generation as a TCP connection, and the session arrives through
-    /// [`Self::accept`]. A pipe over the pending bounds (the listener's, or two
-    /// per device) is dropped, which closes it.
+    /// [`Self::accept`]. With the listener's handshake queue full the pipe is
+    /// refused with [`TransportError::Busy`]; a third pending pipe from one
+    /// device is dropped, which closes it.
     pub fn accept_stream(&self, io: PipeIo, locator: PeerLocator) -> Result<(), TransportError> {
         if !matches!(locator, PeerLocator::Usb { .. }) {
             return Err(TransportError::InvalidPaths);
@@ -269,7 +278,7 @@ impl SessionListener {
         self.pipes
             .try_send((io, locator))
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => TransportError::Connection,
+                mpsc::error::TrySendError::Full(_) => TransportError::Busy,
                 mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
             })
     }
@@ -384,9 +393,9 @@ async fn accept_connections(
     tuning: TransportTuning,
     sender: mpsc::Sender<Result<Session, TransportError>>,
 ) {
-    let mut pending: JoinSet<(Option<String>, Result<Session, TransportError>)> = JoinSet::new();
-    // Pending handshakes per USB device label.
-    let mut per_device: std::collections::HashMap<String, usize> = Default::default();
+    let mut pending: JoinSet<(Option<UsbDevice>, Result<Session, TransportError>)> = JoinSet::new();
+    // Pending handshakes per USB device.
+    let mut per_device: std::collections::HashMap<UsbDevice, usize> = Default::default();
     loop {
         let incoming = tokio::select! {
             _ = sender.closed() => break,
@@ -435,14 +444,15 @@ async fn accept_connections(
             Err(_) => break,
         };
         let device = match &incoming {
-            Incoming::Pipe(_, PeerLocator::Usb { device, .. }) => {
-                let count = per_device.entry(device.clone()).or_default();
+            Incoming::Pipe(_, PeerLocator::Usb { medium, device }) => {
+                let key = (*medium, device.clone());
+                let count = per_device.entry(key.clone()).or_default();
                 if *count >= MAX_PENDING_PER_DEVICE {
                     // Dropping the pipe closes it.
                     continue;
                 }
                 *count += 1;
-                Some(device.clone())
+                Some(key)
             }
             _ => None,
         };

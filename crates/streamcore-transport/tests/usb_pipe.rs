@@ -165,7 +165,24 @@ async fn a_device_holds_at_most_two_pending_handshakes() {
     .expect("the third pipe was not closed");
     assert_eq!(read.unwrap(), 0);
 
-    // Another device still connects while those two stall.
+    // The same label on another medium is another device, with its own bound.
+    let (host_end, mut other_medium) = tokio::io::duplex(1024);
+    let same_label = PeerLocator::Usb {
+        medium: Medium::UsbMux,
+        device: "stalling".into(),
+    };
+    listener
+        .accept_stream(Box::new(host_end), same_label)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let still_open = tokio::time::timeout(
+        Duration::from_millis(100),
+        tokio::io::AsyncReadExt::read(&mut other_medium, &mut byte),
+    )
+    .await;
+    assert!(still_open.is_err(), "another medium shared the bound");
+
+    // Another device still connects while those stall.
     let (host_end, device_end) = tokio::io::duplex(64 * 1024);
     listener
         .accept_stream(Box::new(host_end), usb("device-2"))
