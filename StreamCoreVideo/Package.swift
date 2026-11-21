@@ -13,6 +13,9 @@ let package = Package(
         // The Apple host media code (design 4.1): capture, compositors, the surface store,
         // the VideoToolbox encoder and its probe.
         .library(name: "StreamCoreAppleHost", targets: ["StreamCoreAppleHost"]),
+        // The Apple client media code (design 5): VideoToolbox decode, the presenter and
+        // the display paths, on iOS and macOS.
+        .library(name: "StreamCoreAppleClient", targets: ["StreamCoreAppleClient"]),
     ],
     targets: [
         .binaryTarget(name: "streamcore_videoFFI", path: "Artifacts/StreamCoreVideoFFI.xcframework"),
@@ -24,5 +27,7 @@ let package = Package(
         .testTarget(name: "StreamCoreVideoTests", dependencies: ["StreamCoreVideo"]),
         .target(name: "StreamCoreAppleHost", dependencies: ["StreamCoreVideo"]),
         .testTarget(name: "StreamCoreAppleHostTests", dependencies: ["StreamCoreAppleHost"]),
+        .target(name: "StreamCoreAppleClient", dependencies: ["StreamCoreVideo"]),
+        .testTarget(name: "StreamCoreAppleClientTests", dependencies: ["StreamCoreAppleClient", "StreamCoreAppleHost"]),
     ]
 )
