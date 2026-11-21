@@ -154,9 +154,17 @@ impl SecureChannel {
                 medium: Medium::UsbAdb | Medium::UsbMux | Medium::UsbAoa
             }
         ) {
+            let tuning = crate::tuning::transport_tuning();
+            let bound = |custom: Option<u32>, default: Duration| {
+                custom.map_or(default, |ms| Duration::from_millis(ms.max(1).into()))
+            };
             io.start_liveness(
                 crate::multiplex::PIPE_PING_INTERVAL,
-                crate::multiplex::PIPE_DEAD_AFTER,
+                bound(tuning.pipe_dead_after_ms, crate::multiplex::PIPE_DEAD_AFTER),
+                bound(
+                    tuning.pipe_pong_deadline_ms,
+                    crate::multiplex::PIPE_PONG_DEADLINE,
+                ),
             );
         }
         Arc::new(Self {

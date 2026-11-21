@@ -297,9 +297,11 @@ async fn a_secure_channel_over_a_pipe_carries_messages_and_reports_its_locator()
 
 /// A relay between two in-memory pipes that stops moving bytes when told to,
 /// while keeping both ends open: the half-open state a real relay can be in
-/// after an unplug.
+/// after an unplug. `capacity` is each side's buffer and `chunk_delay` a wait
+/// after every 16 KiB moved, to stand for a real relay's buffers and rate.
 fn stalling_relay(
     capacity: usize,
+    chunk_delay: Duration,
 ) -> (
     tokio::io::DuplexStream,
     tokio::io::DuplexStream,
@@ -318,11 +320,17 @@ fn stalling_relay(
                     std::future::pending::<()>().await;
                 }
                 read = host_side.read(&mut from_host) => match read {
-                    Ok(n) if n > 0 => { let _ = device_side.write_all(&from_host[..n]).await; }
+                    Ok(n) if n > 0 => {
+                        let _ = device_side.write_all(&from_host[..n]).await;
+                        tokio::time::sleep(chunk_delay).await;
+                    }
                     _ => break,
                 },
                 read = device_side.read(&mut from_device) => match read {
-                    Ok(n) if n > 0 => { let _ = host_side.write_all(&from_device[..n]).await; }
+                    Ok(n) if n > 0 => {
+                        let _ = host_side.write_all(&from_device[..n]).await;
+                        tokio::time::sleep(chunk_delay).await;
+                    }
                     _ => break,
                 },
             }
@@ -395,7 +403,7 @@ fn watch_for_close(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pipe_that_goes_half_open_is_dead_within_a_second_on_both_sides() {
-    let (host_end, device_end, stall) = stalling_relay(64 * 1024);
+    let (host_end, device_end, stall) = stalling_relay(64 * 1024, Duration::ZERO);
     let (_listener, server, channel) =
         channels_over(host_end, device_end, vec![CLOCK_CAPABILITY.into()]).await;
     let (device_closed, host_closed) = (watch_for_close(&channel), watch_for_close(&server));
@@ -423,10 +431,84 @@ async fn a_pipe_that_goes_half_open_is_dead_within_a_second_on_both_sides() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_typed_pings_a_pipe_has_no_liveness_of_its_own() {
-    let (host_end, device_end, stall) = stalling_relay(64 * 1024);
+    let (host_end, device_end, stall) = stalling_relay(64 * 1024, Duration::ZERO);
     let (_listener, _server, channel) = channels_over(host_end, device_end, vec![]).await;
     let closed = watch_for_close(&channel);
     stall.send(true).unwrap();
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     assert!(!closed.is_finished(), "the channel closed without clock.v1");
+}
+
+/// Reads on a task, counting bulk messages, until the channel reports an error.
+fn count_bulk(
+    channel: &Arc<streamcore_transport::channel::SecureChannel>,
+) -> (
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (channel, count) = (
+        channel.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    );
+    let counted = count.clone();
+    let task = tokio::spawn(async move {
+        while let Ok(message) = channel.receive().await {
+            if message.first() == Some(&0x40) {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
+    (count, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_busy_pipe_is_not_mistaken_for_a_dead_one() {
+    use streamcore_media::binary::Frame;
+    // A relay with megabytes of buffer on each side that moves about 4 MB/s: a
+    // pong queues behind the transfer for longer than the silent bound, while
+    // bytes keep arriving the whole time.
+    const MESSAGES: usize = 40;
+    let (host_end, device_end, _stall) = stalling_relay(4 * 1024 * 1024, Duration::from_millis(4));
+    let (_listener, server, channel) =
+        channels_over(host_end, device_end, vec![CLOCK_CAPABILITY.into()]).await;
+    let (received, reading) = count_bulk(&channel);
+    let host_closed = watch_for_close(&server);
+    let payload = vec![0x5a; 256 * 1024];
+    for _ in 0..MESSAGES {
+        let frame = Frame {
+            kind: 0x40,
+            payload: &payload,
+        }
+        .encode()
+        .unwrap();
+        // The bulk lane's queue is bounded: wait for room.
+        loop {
+            match server.enqueue_application_frame(frame.clone()) {
+                Ok(_) => break,
+                Err(streamcore_transport::channel::ChannelError::Backpressure) => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("the busy pipe was closed: {error:?}"),
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while received.load(std::sync::atomic::Ordering::Relaxed) < MESSAGES {
+        assert!(
+            !reading.is_finished(),
+            "the device side closed mid-transfer"
+        );
+        assert!(
+            !host_closed.is_finished(),
+            "the host side closed mid-transfer"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the transfer never finished"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // And it is still a working channel afterwards.
+    let probe = server.probe(3, 20, 2_000).await.unwrap();
+    assert_eq!(probe.answered, 3);
 }

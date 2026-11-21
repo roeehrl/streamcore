@@ -64,6 +64,16 @@ pub struct TransportTuning {
     /// `VideoSink`, which provides those inputs: a process that sends video
     /// through the sink turns it on before its listeners and dials start.
     pub bulk_token_bucket: bool,
+    /// A channel on a relayed USB pipe closes after this long with nothing
+    /// received at all: an unplugged cable or a half-open relay. `None`: 750 ms.
+    #[uniffi(default = None)]
+    pub pipe_dead_after_ms: Option<u32>,
+    /// A channel on a relayed USB pipe closes after this long with no pong
+    /// matched although bytes still arrive: a link that carries one direction
+    /// only. It is long because a pong shares the pipe with everything else and
+    /// queues behind a large transfer in the relay's buffers. `None`: 5 s.
+    #[uniffi(default = None)]
+    pub pipe_pong_deadline_ms: Option<u32>,
 }
 
 static TUNING: Mutex<TransportTuning> = Mutex::new(TransportTuning {
@@ -77,6 +87,8 @@ static TUNING: Mutex<TransportTuning> = Mutex::new(TransportTuning {
         congestion: QuicCongestion::Cubic,
     },
     bulk_token_bucket: false,
+    pipe_dead_after_ms: None,
+    pipe_pong_deadline_ms: None,
 });
 
 /// Replaces the process's transport tuning. Listeners and dials started later,
@@ -112,6 +124,8 @@ pub fn candidate_transport_tuning() -> TransportTuning {
             congestion: QuicCongestion::Cubic,
         },
         bulk_token_bucket: true,
+        pipe_dead_after_ms: None,
+        pipe_pong_deadline_ms: None,
     }
 }
 

@@ -387,10 +387,15 @@ pub(crate) struct Multiplexer {
 
 /// Liveness on a relayed pipe (a cable through adb or the device multiplexer):
 /// neither end gets an unplug event there, and a half-open relay may never
-/// deliver end-of-file. A ping this often, and the channel is dead after this
-/// long with no bytes, or with no pong although pings went out.
+/// deliver end-of-file. A ping this often; the channel is dead after
+/// `PIPE_DEAD_AFTER` with nothing received at all, or after
+/// `PIPE_PONG_DEADLINE` with no pong matched while bytes still arrive (one
+/// direction only). The second is long: a pong shares the pipe with everything
+/// else, and on a healthy cable it queues behind a large transfer in the
+/// relay's buffers. Both defaults can be changed in `TransportTuning`.
 pub(crate) const PIPE_PING_INTERVAL: Duration = Duration::from_millis(150);
 pub(crate) const PIPE_DEAD_AFTER: Duration = Duration::from_millis(750);
+pub(crate) const PIPE_PONG_DEADLINE: Duration = Duration::from_secs(5);
 
 /// What a channel negotiated or was configured with when it was created.
 #[derive(Clone, Copy, Default)]
@@ -432,9 +437,15 @@ impl Multiplexer {
         })
     }
     /// Pings every `interval` and closes the channel once `dead_after` passes
-    /// with nothing received, or with no pong matched (the link carries bytes
-    /// one way only). Needs `clock.v1`; without it this does nothing.
-    pub(crate) fn start_liveness(self: &Arc<Self>, interval: Duration, dead_after: Duration) {
+    /// with nothing received, or `pong_deadline` passes with no pong matched
+    /// (the link carries bytes one way only). Needs `clock.v1`; without it this
+    /// does nothing.
+    pub(crate) fn start_liveness(
+        self: &Arc<Self>,
+        interval: Duration,
+        dead_after: Duration,
+        pong_deadline: Duration,
+    ) {
         if self.clock.is_none() {
             return;
         }
@@ -442,6 +453,7 @@ impl Multiplexer {
         crate::runtime::cleanup(async move {
             let mut closed = this.closed.subscribe();
             let dead_after_us = u64::try_from(dead_after.as_micros()).unwrap_or(u64::MAX);
+            let pong_deadline_us = u64::try_from(pong_deadline.as_micros()).unwrap_or(u64::MAX);
             let now = monotonic_now_us();
             this.last_received_us.store(now, Ordering::Relaxed);
             this.last_pong_us.store(now, Ordering::Relaxed);
@@ -456,7 +468,7 @@ impl Multiplexer {
                 let now = monotonic_now_us();
                 let silent = now.saturating_sub(this.last_received_us.load(Ordering::Relaxed));
                 let unanswered = now.saturating_sub(this.last_pong_us.load(Ordering::Relaxed));
-                if silent > dead_after_us || unanswered > dead_after_us {
+                if silent > dead_after_us || unanswered > pong_deadline_us {
                     this.shutdown(false);
                     return;
                 }
