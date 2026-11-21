@@ -26,7 +26,54 @@ const MAX_PENDING_HANDSHAKES: usize = 16;
 pub enum TransportKind {
     Quic,
     TlsTcp,
+    /// The TLS/TCP path's framing over a byte stream that is not a TCP socket
+    /// this crate opened: a pipe a USB provider handed over.
+    TlsStream {
+        medium: Medium,
+    },
 }
+
+/// What carries a [`TransportKind::TlsStream`] session. A cable is not
+/// authentication: every medium runs the same pinned mutual TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum Medium {
+    /// A USB network interface (an IP link over the cable).
+    UsbNet,
+    /// A pipe through the Android debug bridge.
+    UsbAdb,
+    /// A pipe through the Apple mobile device multiplexer.
+    UsbMux,
+    /// A pipe over the Android Open Accessory bulk endpoints.
+    UsbAoa,
+}
+
+/// Where a session's peer is, for routing and display only. It is never
+/// identity: certificate pins identify the peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerLocator {
+    Socket(SocketAddr),
+    /// `device` is the provider's label for the device (a serial or similar).
+    /// It is private to this machine: show it locally, never send or log it
+    /// where it leaves the machine, and never base a trust decision on it.
+    Usb {
+        medium: Medium,
+        device: String,
+    },
+}
+
+/// A byte stream a provider opened to the peer: the TLS handshake and the
+/// TLS/TCP framing run on it unchanged.
+pub trait PipeStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> PipeStream for T {}
+pub type PipeIo = Box<dyn PipeStream>;
+
+/// A USB device as the admission bound counts it: a provider's label is only
+/// unique within its medium.
+type UsbDevice = (Medium, String);
+
+/// Pending handshakes one USB device may hold at a time: a device that opens
+/// pipes and stalls cannot use up the listener's shared handshake budget.
+const MAX_PENDING_PER_DEVICE: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct DialPath {
@@ -51,6 +98,10 @@ pub enum TransportError {
     InvalidPaths,
     #[error("no authenticated path succeeded")]
     NoPath,
+    /// The listener's pending-handshake queue is full: the pipe was not taken,
+    /// and the provider may offer one again later.
+    #[error("too many pending handshakes")]
+    Busy,
     #[error("protocol ALPN mismatch")]
     Alpn,
     #[error("network I/O failed")]
@@ -68,7 +119,7 @@ pub struct Session {
     pub(crate) writer: Box<dyn AsyncWrite + Unpin + Send>,
     pub kind: TransportKind,
     pub peer_fingerprint: String,
-    pub(crate) peer_address: SocketAddr,
+    pub locator: PeerLocator,
     pub capabilities: Vec<String>,
     accepted_generation: Option<u64>,
     // Keep the endpoint alive for the lifetime of an outbound QUIC connection.
@@ -154,6 +205,7 @@ pub struct SessionListener {
     trust: Arc<StdMutex<ListenerTrust>>,
     quic: quinn::Endpoint,
     accepted: Mutex<mpsc::Receiver<Result<Session, TransportError>>>,
+    pipes: mpsc::Sender<(PipeIo, PeerLocator)>,
     accepting: JoinHandle<()>,
 }
 
@@ -192,9 +244,11 @@ impl SessionListener {
             generation: 1,
         }));
         let (sender, receiver) = mpsc::channel(MAX_PENDING_HANDSHAKES);
+        let (pipes, pipe_receiver) = mpsc::channel(MAX_PENDING_HANDSHAKES);
         let accepting = tokio::spawn(accept_connections(
             tcp,
             quic.clone(),
+            pipe_receiver,
             trust.clone(),
             hello,
             tuning,
@@ -206,8 +260,27 @@ impl SessionListener {
             trust,
             quic,
             accepted: Mutex::new(receiver),
+            pipes,
             accepting,
         })
+    }
+
+    /// Hands over a pipe a provider opened to a device. The listener is the
+    /// TLS server on it, with the same identity, pins, admission bounds and
+    /// trust generation as a TCP connection, and the session arrives through
+    /// [`Self::accept`]. With the listener's handshake queue full the pipe is
+    /// refused with [`TransportError::Busy`]; a third pending pipe from one
+    /// device is dropped, which closes it.
+    pub fn accept_stream(&self, io: PipeIo, locator: PeerLocator) -> Result<(), TransportError> {
+        if !matches!(locator, PeerLocator::Usb { .. }) {
+            return Err(TransportError::InvalidPaths);
+        }
+        self.pipes
+            .try_send((io, locator))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => TransportError::Busy,
+                mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
+            })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
@@ -305,6 +378,7 @@ fn quic_server(
 enum Incoming {
     Tcp(TcpStream),
     Quic(Box<quinn::Incoming>),
+    Pipe(PipeIo, PeerLocator),
 }
 
 // An unauthenticated peer that stalls must not hold up another user's pairing
@@ -313,22 +387,41 @@ enum Incoming {
 async fn accept_connections(
     tcp: TcpListener,
     quic: quinn::Endpoint,
+    mut pipes: mpsc::Receiver<(PipeIo, PeerLocator)>,
     trust: Arc<StdMutex<ListenerTrust>>,
     hello: Hello,
     tuning: TransportTuning,
     sender: mpsc::Sender<Result<Session, TransportError>>,
 ) {
-    let mut pending = JoinSet::new();
+    let mut pending: JoinSet<(Option<UsbDevice>, Result<Session, TransportError>)> = JoinSet::new();
+    // Pending handshakes per USB device.
+    let mut per_device: std::collections::HashMap<UsbDevice, usize> = Default::default();
     loop {
         let incoming = tokio::select! {
             _ = sender.closed() => break,
             completed = pending.join_next(), if !pending.is_empty() => {
                 if let Some(completed) = completed {
+                    let (device, result) =
+                        completed.unwrap_or((None, Err(TransportError::Connection)));
+                    if let Some(device) = device
+                        && let Some(count) = per_device.get_mut(&device)
+                    {
+                        *count -= 1;
+                        if *count == 0 {
+                            per_device.remove(&device);
+                        }
+                    }
                     // A full result queue closes the excess session immediately.
                     // It cannot turn an absent native consumer into unbounded memory.
-                    let _ = sender.try_send(completed.unwrap_or(Err(TransportError::Connection)));
+                    let _ = sender.try_send(result);
                 }
                 continue;
+            }
+            pipe = pipes.recv(), if pending.len() < MAX_PENDING_HANDSHAKES => {
+                match pipe {
+                    Some((io, locator)) => Incoming::Pipe(io, locator),
+                    None => break,
+                }
             }
             stream = tcp.accept(), if pending.len() < MAX_PENDING_HANDSHAKES => {
                 match stream {
@@ -350,11 +443,29 @@ async fn accept_connections(
             ),
             Err(_) => break,
         };
+        let device = match &incoming {
+            Incoming::Pipe(_, PeerLocator::Usb { medium, device }) => {
+                let key = (*medium, device.clone());
+                let count = per_device.entry(key.clone()).or_default();
+                if *count >= MAX_PENDING_PER_DEVICE {
+                    // Dropping the pipe closes it.
+                    continue;
+                }
+                *count += 1;
+                Some(key)
+            }
+            _ => None,
+        };
         let hello = hello.clone();
         pending.spawn(async move {
-            let mut session = accept_connection(incoming, tls, hello, tuning).await?;
-            session.accepted_generation = Some(generation);
-            Ok(session)
+            let session =
+                accept_connection(incoming, tls, hello, tuning)
+                    .await
+                    .map(|mut session| {
+                        session.accepted_generation = Some(generation);
+                        session
+                    });
+            (device, session)
         });
     }
 }
@@ -368,31 +479,16 @@ async fn accept_connection(
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let session = match incoming {
             Incoming::Tcp(stream) => {
-                let peer_address = stream.peer_addr()?;
+                let locator = PeerLocator::Socket(stream.peer_addr()?);
                 configure_tcp(&stream, &tuning)?;
-                let tls = tls.accept(stream).await?;
-                let (_, state) = tls.get_ref();
-                if state.alpn_protocol() != Some(SESSION_ALPN) {
-                    return Err(TransportError::Alpn);
-                }
-                let peer = state
-                    .peer_certificates()
-                    .and_then(|p| p.first())
-                    .ok_or(TransportError::Connection)?;
-                let peer_fingerprint = certificate_fingerprint(peer);
-                let (reader, writer) = tokio::io::split(tls);
-                Session {
-                    lanes: vec![],
-                    reader: Box::new(reader),
-                    writer: Box::new(writer),
-                    kind: TransportKind::TlsTcp,
-                    peer_fingerprint,
-                    peer_address,
-                    capabilities: vec![],
-                    accepted_generation: None,
-                    endpoint: None,
-                    quic: None,
-                }
+                tls_server_session(tls, stream, TransportKind::TlsTcp, locator).await?
+            }
+            Incoming::Pipe(io, locator) => {
+                let PeerLocator::Usb { medium, .. } = &locator else {
+                    return Err(TransportError::InvalidPaths);
+                };
+                let kind = TransportKind::TlsStream { medium: *medium };
+                tls_server_session(tls, io, kind, locator).await?
             }
             Incoming::Quic(incoming) => {
                 let connection = (*incoming).await.map_err(|_| TransportError::Connection)?;
@@ -411,7 +507,7 @@ async fn accept_connection(
                     writer: Box::new(writer),
                     kind: TransportKind::Quic,
                     peer_fingerprint,
-                    peer_address,
+                    locator: PeerLocator::Socket(peer_address),
                     capabilities: vec![],
                     accepted_generation: None,
                     endpoint: None,
@@ -420,6 +516,100 @@ async fn accept_connection(
             }
         };
         session.negotiate(&hello).await
+    })
+    .await
+    .map_err(|_| TransportError::Timeout)?
+}
+
+/// The server side of a TLS stream session: handshake, ALPN and the peer's pin.
+async fn tls_server_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    tls: tokio_rustls::TlsAcceptor,
+    stream: S,
+    kind: TransportKind,
+    locator: PeerLocator,
+) -> Result<Session, TransportError> {
+    let tls = tls.accept(stream).await?;
+    let (_, state) = tls.get_ref();
+    if state.alpn_protocol() != Some(SESSION_ALPN) {
+        return Err(TransportError::Alpn);
+    }
+    let peer = state
+        .peer_certificates()
+        .and_then(|p| p.first())
+        .ok_or(TransportError::Connection)?;
+    let peer_fingerprint = certificate_fingerprint(peer);
+    let (reader, writer) = tokio::io::split(tls);
+    Ok(Session {
+        lanes: vec![],
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        kind,
+        peer_fingerprint,
+        locator,
+        capabilities: vec![],
+        accepted_generation: None,
+        endpoint: None,
+        quic: None,
+    })
+}
+
+/// The client side of a TLS stream session.
+async fn tls_client_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    config: Arc<rustls::ClientConfig>,
+    stream: S,
+    kind: TransportKind,
+    locator: PeerLocator,
+) -> Result<Session, TransportError> {
+    let name = rustls::pki_types::ServerName::try_from(PEER_DNS_NAME)
+        .map_err(|_| TransportError::Connection)?;
+    let tls = tokio_rustls::TlsConnector::from(config)
+        .connect(name, stream)
+        .await?;
+    let (_, state) = tls.get_ref();
+    if state.alpn_protocol() != Some(SESSION_ALPN) {
+        return Err(TransportError::Alpn);
+    }
+    let peer = state
+        .peer_certificates()
+        .and_then(|p| p.first())
+        .ok_or(TransportError::Connection)?;
+    let peer_fingerprint = certificate_fingerprint(peer);
+    let (reader, writer) = tokio::io::split(tls);
+    Ok(Session {
+        lanes: vec![],
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        kind,
+        peer_fingerprint,
+        locator,
+        capabilities: vec![],
+        accepted_generation: None,
+        endpoint: None,
+        quic: None,
+    })
+}
+
+/// Dials over a pipe the device side accepted from a provider (the host is
+/// always the TLS server). One attempt within the handshake timeout and no
+/// retry: a pipe that fails is gone, and the provider opens another.
+pub async fn dial_pipe(
+    identity: &PeerIdentity,
+    trusted_peer: Vec<u8>,
+    io: PipeIo,
+    locator: PeerLocator,
+    hello: Hello,
+) -> Result<Session, TransportError> {
+    let PeerLocator::Usb { medium, .. } = &locator else {
+        return Err(TransportError::InvalidPaths);
+    };
+    let kind = TransportKind::TlsStream { medium: *medium };
+    hello.negotiate(&hello)?;
+    let config = identity.client_config(trusted_peer)?;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        tls_client_session(config, io, kind, locator)
+            .await?
+            .negotiate(&hello)
+            .await
     })
     .await
     .map_err(|_| TransportError::Timeout)?
@@ -454,6 +644,7 @@ pub async fn dial_tuned(
         || paths.len() > MAX_PATHS
         || paths.iter().any(|p| {
             p.delay > Duration::from_secs(2)
+                || matches!(p.kind, TransportKind::TlsStream { .. })
                 || p.address.port() == 0
                 || p.address.ip().is_unspecified()
                 || p.address.ip().is_multicast()
@@ -528,34 +719,11 @@ async fn connect_path_once(
         TransportKind::TlsTcp => {
             let stream = TcpStream::connect(path.address).await?;
             configure_tcp(&stream, tuning)?;
-            let name = rustls::pki_types::ServerName::try_from(PEER_DNS_NAME)
-                .map_err(|_| TransportError::Connection)?;
-            let tls = tokio_rustls::TlsConnector::from(config)
-                .connect(name, stream)
-                .await?;
-            let (_, state) = tls.get_ref();
-            if state.alpn_protocol() != Some(SESSION_ALPN) {
-                return Err(TransportError::Alpn);
-            }
-            let peer = state
-                .peer_certificates()
-                .and_then(|p| p.first())
-                .ok_or(TransportError::Connection)?;
-            let peer_fingerprint = certificate_fingerprint(peer);
-            let (reader, writer) = tokio::io::split(tls);
-            Session {
-                lanes: vec![],
-                reader: Box::new(reader),
-                writer: Box::new(writer),
-                kind: TransportKind::TlsTcp,
-                peer_fingerprint,
-                peer_address: path.address,
-                capabilities: vec![],
-                accepted_generation: None,
-                endpoint: None,
-                quic: None,
-            }
+            let locator = PeerLocator::Socket(path.address);
+            tls_client_session(config, stream, TransportKind::TlsTcp, locator).await?
         }
+        // A pipe is dialed with `dial_pipe`, never as a socket path.
+        TransportKind::TlsStream { .. } => return Err(TransportError::InvalidPaths),
         TransportKind::Quic => {
             let bind = if path.address.is_ipv4() {
                 "0.0.0.0:0"
@@ -588,7 +756,7 @@ async fn connect_path_once(
                 writer: Box::new(writer),
                 kind: TransportKind::Quic,
                 peer_fingerprint,
-                peer_address: path.address,
+                locator: PeerLocator::Socket(path.address),
                 capabilities: vec![],
                 accepted_generation: None,
                 endpoint: Some(endpoint),
