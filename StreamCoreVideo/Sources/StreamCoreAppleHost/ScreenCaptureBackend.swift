@@ -40,10 +40,19 @@ public final class ScreenCaptureBackend: NSObject, CaptureBackend, SCStreamOutpu
     /// stream queue touches it.
     private var shape: (format: PixelFormat, width: UInt32, height: UInt32, color: ColorTags)?
 
+    /// The captured content's size in points (the display, window or app the filter
+    /// shows): what a region is normalized to. Nil: the capture cannot move a region.
+    private let contentSize: CGSize?
+    /// ScreenCaptureKit began (true) or stopped (false) delivering suspended frames: the
+    /// Mac is locked, at the login window, or the display is asleep. On the stream queue.
+    public var onSuspended: ((Bool) -> Void)?
+    private var suspended = false
+
     public init(configuration: SCStreamConfiguration, surfaces: SurfaceStore,
-         trace: (any FrameTrace)?, meter: (any FrameMeter)?) {
+                trace: (any FrameTrace)?, meter: (any FrameMeter)?, contentSize: CGSize? = nil) {
         self.configuration = configuration
         self.surfaces = surfaces; self.trace = trace; self.meter = meter
+        self.contentSize = contentSize.flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
     }
 
     /// The stream this backend captures; set once before the controller starts.
@@ -52,7 +61,7 @@ public final class ScreenCaptureBackend: NSObject, CaptureBackend, SCStreamOutpu
     // MARK: CaptureBackend
 
     public func caps() -> CaptureCaps {
-        CaptureCaps(targetKinds: [.display, .window, .app], windowFit: true, liveRegionMove: true,
+        CaptureCaps(targetKinds: [.display, .window, .app], windowFit: true, liveRegionMove: contentSize != nil,
                     cursorModes: [.hidden, .composited], surfaceKinds: [.ioSurface],
                     poolDepth: UInt8(configuration.queueDepth), virtualDisplays: false, regionInSurface: true)
     }
@@ -86,9 +95,19 @@ public final class ScreenCaptureBackend: NSObject, CaptureBackend, SCStreamOutpu
                 self.configuration.minimumFrameInterval = CMTime(value: CMTimeValue(interval), timescale: 1_000_000_000)
             }
             if let cursor = update.cursor { self.configuration.showsCursor = cursor == .composited }
+            if let region = update.region, let contentSize {
+                // A live move: ScreenCaptureKit crops the same stream, no restart.
+                self.configuration.sourceRect = CGRect(x: region.x * contentSize.width, y: region.y * contentSize.height,
+                                                       width: region.width * contentSize.width,
+                                                       height: region.height * contentSize.height)
+            }
             return (self.stream, self.events, self.configuration)
         }
         guard let stream, let events else { return }
+        if update.region != nil, contentSize == nil {
+            events.opDone(op: op, error: MediaError.Unsupported)
+            return
+        }
         measured {
             stream.updateConfiguration(configuration) { error in
                 events.opDone(op: op, error: error.map { _ in MediaError.Internal })
@@ -134,6 +153,7 @@ public final class ScreenCaptureBackend: NSObject, CaptureBackend, SCStreamOutpu
         if let status, status != .complete {
             // Idle and blank frames carry no new image: the latest one stays.
             trace?.count(status == .idle ? .statusIdle : .statusOther)
+            self.status(status)
             return
         }
         trace?.count(.captured)
@@ -142,10 +162,22 @@ public final class ScreenCaptureBackend: NSObject, CaptureBackend, SCStreamOutpu
         deliver(image, h0: h0, h1: h1, to: events)
     }
 
+    /// A frame status without a new image, on the stream queue: suspension is reported
+    /// once when it begins.
+    func status(_ status: SCFrameStatus) {
+        guard status == .suspended, !suspended else { return }
+        suspended = true
+        onSuspended?(true)
+    }
+
     /// A complete image, as a capture callback delivers it: register it and hand it to
     /// Rust, which may drain inline (admission and submit) on this thread.
     public func deliver(_ image: CVPixelBuffer, h0: UInt64, h1: UInt64, to events: CaptureEvents? = nil) {
         guard let events = events ?? lock.withLock({ self.events }) else { return }
+        if suspended {
+            suspended = false
+            onSuspended?(false)
+        }
         let id = surfaces.insert(image, h0: h0, h1: h1)
         let pixelFormat = CVPixelBufferGetPixelFormatType(image)
         let format: PixelFormat = pixelFormat == kCVPixelFormatType_32BGRA ? .bgra : .nv12
