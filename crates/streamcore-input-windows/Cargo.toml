@@ -10,10 +10,15 @@ description = "Windows input injection for a stream host: a synthetic pen and to
 [dependencies]
 streamcore-input = { path = "../streamcore-input" }
 
+# Win32_System_DataExchange, Win32_System_LibraryLoader and Win32_System_Memory are for
+# examples/selftest.rs only (the clipboard and its window).
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Controls",
@@ -27,7 +32,8 @@ windows = { workspace = true, features = [
 # Not `[lints] workspace = true`: every Win32 call is an `unsafe fn` in windows-rs, so this crate
 # cannot inherit `unsafe_code = "forbid"`. As in streamcore-video-windows, unsafe stays denied
 # crate-wide; it is allowed only in `src/win/sys/`, which wraps each API family in safe functions,
-# and every block carries a SAFETY comment.
+# and every block carries a SAFETY comment. examples/selftest.rs allows it for itself, for the
+# test window it needs.
 [lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
