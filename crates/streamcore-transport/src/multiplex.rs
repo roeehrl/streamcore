@@ -10,6 +10,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 use streamcore_media::{
     binary::{ClockPing, ClockPong, Frame},
@@ -378,7 +379,23 @@ pub(crate) struct Multiplexer {
     /// Present when both peers negotiated `clock.v1`.
     pub(crate) clock: Option<Clock>,
     pub(crate) features: Features,
+    /// When the last record arrived and when the last pong was matched
+    /// (`clock::monotonic_now_us`), for [`Self::start_liveness`].
+    last_received_us: AtomicU64,
+    last_pong_us: AtomicU64,
 }
+
+/// Liveness on a relayed pipe (a cable through adb or the device multiplexer):
+/// neither end gets an unplug event there, and a half-open relay may never
+/// deliver end-of-file. A ping this often; the channel is dead after
+/// `PIPE_DEAD_AFTER` with nothing received at all, or after
+/// `PIPE_PONG_DEADLINE` with no pong matched while bytes still arrive (one
+/// direction only). The second is long: a pong shares the pipe with everything
+/// else, and on a healthy cable it queues behind a large transfer in the
+/// relay's buffers. Both defaults can be changed in `TransportTuning`.
+pub(crate) const PIPE_PING_INTERVAL: Duration = Duration::from_millis(150);
+pub(crate) const PIPE_DEAD_AFTER: Duration = Duration::from_millis(750);
+pub(crate) const PIPE_PONG_DEADLINE: Duration = Duration::from_secs(5);
 
 /// What a channel negotiated or was configured with when it was created.
 #[derive(Clone, Copy, Default)]
@@ -415,7 +432,50 @@ impl Multiplexer {
             endpoint,
             clock: features.clock.then(Clock::default),
             features,
+            last_received_us: AtomicU64::new(monotonic_now_us()),
+            last_pong_us: AtomicU64::new(monotonic_now_us()),
         })
+    }
+    /// Pings every `interval` and closes the channel once `dead_after` passes
+    /// with nothing received, or `pong_deadline` passes with no pong matched
+    /// (the link carries bytes one way only). Needs `clock.v1`; without it this
+    /// does nothing.
+    pub(crate) fn start_liveness(
+        self: &Arc<Self>,
+        interval: Duration,
+        dead_after: Duration,
+        pong_deadline: Duration,
+    ) {
+        if self.clock.is_none() {
+            return;
+        }
+        let this = self.clone();
+        crate::runtime::cleanup(async move {
+            let mut closed = this.closed.subscribe();
+            let dead_after_us = u64::try_from(dead_after.as_micros()).unwrap_or(u64::MAX);
+            let pong_deadline_us = u64::try_from(pong_deadline.as_micros()).unwrap_or(u64::MAX);
+            let now = monotonic_now_us();
+            this.last_received_us.store(now, Ordering::Relaxed);
+            this.last_pong_us.store(now, Ordering::Relaxed);
+            loop {
+                if *closed.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = closed.changed() => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let now = monotonic_now_us();
+                let silent = now.saturating_sub(this.last_received_us.load(Ordering::Relaxed));
+                let unanswered = now.saturating_sub(this.last_pong_us.load(Ordering::Relaxed));
+                if silent > dead_after_us || unanswered > pong_deadline_us {
+                    this.shutdown(false);
+                    return;
+                }
+                // A full queue skips this ping; the next interval sends another.
+                let _ = this.ping();
+            }
+        });
     }
     pub(crate) fn close(&self) {
         self.shutdown(true);
@@ -718,6 +778,7 @@ impl Multiplexer {
             }
             ClockMessage::Pong(pong) => {
                 clock.answered(pong, received_us);
+                self.last_pong_us.store(received_us, Ordering::Relaxed);
                 Ok(())
             }
         }
@@ -928,6 +989,8 @@ impl Multiplexer {
                 .read_exact(&mut bytes)
                 .await
                 .map_err(|_| ChannelError::Io)?;
+            self.last_received_us
+                .store(monotonic_now_us(), Ordering::Relaxed);
             self.ingest(&bytes, only)?;
         }
     }
