@@ -362,9 +362,11 @@ impl SessionListener {
     /// the device's first byte (60 s by default, `TransportTuning`), outside
     /// the handshake budget, and the handshake deadline starts at that byte.
     /// The returned handle reports how the pipe ended up, so a provider knows
-    /// whether to open another. With the listener's pipe queue full the pipe is
-    /// refused with [`TransportError::Busy`]; a third pipe from one device is
-    /// [`PipeOutcome::Refused`].
+    /// whether to open another. A pipe the listener has no room for ends as
+    /// [`PipeOutcome::Refused`]: a third pipe from one device, too many idle
+    /// pipes, or no handshake room when its first byte arrives.
+    /// [`TransportError::Busy`] is returned only when pipes are handed over
+    /// faster than the listener takes them.
     pub fn accept_stream(
         &self,
         io: PipeIo,
@@ -556,11 +558,14 @@ async fn accept_connections(
     tuning: TransportTuning,
     sender: mpsc::Sender<Result<Session, TransportError>>,
 ) {
-    let mut pending: JoinSet<(Option<PipeTicket>, Result<Session, TransportError>)> =
-        JoinSet::new();
+    let mut pending: JoinSet<Result<Session, TransportError>> = JoinSet::new();
     // Pipes that have not carried a byte yet. They are outside the handshake
     // budget: a provider opens them ahead of the device dialing.
-    let mut idle: JoinSet<(PipeTicket, PeerLocator, Result<PipeIo, PipeOutcome>)> = JoinSet::new();
+    let mut idle: JoinSet<(PeerLocator, Result<PipeIo, PipeOutcome>)> = JoinSet::new();
+    // Each pipe's ticket stays here, keyed by its task, not inside the task:
+    // a task that panics or is cancelled still gives its ticket back, so the
+    // device's count and the provider's outcome are never lost.
+    let mut tickets: HashMap<tokio::task::Id, PipeTicket> = HashMap::new();
     // Idle pipes and handshakes per USB device.
     let mut per_device: HashMap<UsbDevice, usize> = HashMap::new();
     let idle_limit = tuning.pipe_idle_limit_ms.map_or(PIPE_IDLE_LIMIT, |ms| {
@@ -569,11 +574,13 @@ async fn accept_connections(
     loop {
         let (incoming, ticket) = tokio::select! {
             _ = sender.closed() => break,
-            completed = pending.join_next(), if !pending.is_empty() => {
+            completed = pending.join_next_with_id(), if !pending.is_empty() => {
                 if let Some(completed) = completed {
-                    let (ticket, result) =
-                        completed.unwrap_or((None, Err(TransportError::Connection)));
-                    if let Some(ticket) = ticket {
+                    let (id, result) = match completed {
+                        Ok((id, result)) => (id, result),
+                        Err(error) => (error.id(), Err(TransportError::Connection)),
+                    };
+                    if let Some(ticket) = tickets.remove(&id) {
                         let outcome = match &result {
                             Ok(_) => PipeOutcome::Accepted,
                             Err(error) => failed_outcome(error),
@@ -600,15 +607,24 @@ async fn accept_connections(
                     continue;
                 }
                 *count += 1;
-                let ticket = PipeTicket { device, outcome };
-                idle.spawn(async move {
+                let task = idle.spawn(async move {
                     let first = first_bytes(io, idle_limit).await;
-                    (ticket, locator, first)
+                    (locator, first)
                 });
+                tickets.insert(task.id(), PipeTicket { device, outcome });
                 continue;
             }
-            spoke = idle.join_next(), if !idle.is_empty() => {
-                let Some(Ok((ticket, locator, first))) = spoke else { continue };
+            spoke = idle.join_next_with_id(), if !idle.is_empty() => {
+                let Some(spoke) = spoke else { continue };
+                let (id, spoke) = match spoke {
+                    Ok((id, spoke)) => (id, Some(spoke)),
+                    Err(error) => (error.id(), None),
+                };
+                let Some(ticket) = tickets.remove(&id) else { continue };
+                let Some((locator, first)) = spoke else {
+                    ticket.finish(&mut per_device, PipeOutcome::HandshakeFailed);
+                    continue;
+                };
                 match first {
                     // The device dialed: the handshake deadline starts now.
                     Ok(io) if pending.len() < MAX_PENDING_HANDSHAKES => {
@@ -645,16 +661,17 @@ async fn accept_connections(
             Err(_) => break,
         };
         let hello = hello.clone();
-        pending.spawn(async move {
-            let session =
-                accept_connection(incoming, tls, hello, tuning)
-                    .await
-                    .map(|mut session| {
-                        session.accepted_generation = Some(generation);
-                        session
-                    });
-            (ticket, session)
+        let task = pending.spawn(async move {
+            accept_connection(incoming, tls, hello, tuning)
+                .await
+                .map(|mut session| {
+                    session.accepted_generation = Some(generation);
+                    session
+                })
         });
+        if let Some(ticket) = ticket {
+            tickets.insert(task.id(), ticket);
+        }
     }
 }
 

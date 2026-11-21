@@ -625,3 +625,70 @@ async fn a_pipe_handed_over_early_waits_for_the_device_and_reports_how_it_ended(
         .unwrap();
     assert_eq!(third.outcome().await, PipeOutcome::Refused);
 }
+
+/// A pipe whose read panics, as a broken foreign stream could.
+struct PanickingPipe;
+
+impl tokio::io::AsyncRead for PanickingPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        _buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        panic!("a broken pipe implementation");
+    }
+}
+
+impl tokio::io::AsyncWrite for PanickingPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn a_pipe_whose_task_dies_still_reports_and_frees_its_place() {
+    use streamcore_transport::transport::PipeOutcome;
+    let host = PeerIdentity::generate().unwrap();
+    let client = PeerIdentity::generate().unwrap();
+    let listener = listener(&host, &client).await;
+    // Two pipes from one device, each of which kills its task: both report,
+    // and neither keeps one of the device's two places.
+    for _ in 0..2 {
+        let handle = listener
+            .accept_stream(Box::new(PanickingPipe), usb("device-1"))
+            .unwrap();
+        assert_eq!(handle.outcome().await, PipeOutcome::HandshakeFailed);
+    }
+    let (host_end, device_end) = tokio::io::duplex(64 * 1024);
+    let handle = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    let (dialed, accepted) = tokio::join!(
+        dial_pipe(
+            &client,
+            host.certificate(),
+            Box::new(device_end),
+            usb("host"),
+            hello()
+        ),
+        listener.accept(),
+    );
+    assert!(dialed.is_ok() && accepted.is_ok());
+    assert_eq!(handle.outcome().await, PipeOutcome::Accepted);
+}
