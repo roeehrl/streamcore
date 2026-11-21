@@ -41,7 +41,9 @@ pub enum UsbError {
     /// The service answered, but not as its protocol requires.
     #[error("the USB service broke its protocol")]
     Protocol,
-    /// The service refused the request (a device gone, a port closed).
+    /// The service refused the request (a device gone, a port closed). The
+    /// text is the service's own reason and may name the device: like a device
+    /// label it is for this machine only, never for a log that leaves it.
     #[error("the USB service refused: {0}")]
     Refused(String),
     #[error("the USB service did not answer in time")]

@@ -66,15 +66,20 @@ fn valid_serial(serial: &str) -> bool {
 }
 
 /// The cabled devices in a `devices-l` listing that are ready (`device`
-/// state). Wireless-debugging and network entries are left out: their serials
-/// carry a host and port or an mDNS service name, and they are not a cable.
+/// state). Wireless-debugging and network entries are left out (their serials
+/// carry a host and port or an mDNS service name), and so are emulators: none
+/// of them is a cable. The rule goes by the serial, not by the listing's
+/// `usb:` field, because not every platform's server prints that field.
 pub fn parse_devices(listing: &str) -> BTreeSet<String> {
     listing
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let (serial, state) = (fields.next()?, fields.next()?);
-            let cabled = valid_serial(serial) && !serial.contains("._tcp") && !serial.contains('.');
+            let cabled = valid_serial(serial)
+                && !serial.contains("._tcp")
+                && !serial.contains('.')
+                && !serial.starts_with("emulator-");
             (state == "device" && cabled).then(|| serial.to_owned())
         })
         .collect()
@@ -248,6 +253,8 @@ impl AdbProvider {
 #[async_trait::async_trait]
 impl UsbPipeProvider for AdbProvider {
     async fn next_event(&self) -> Option<UsbEvent> {
+        // Held across the wait for the next listing, which has no deadline:
+        // nothing else may take this lock (`open` does not).
         let mut tracking = self.tracking.lock().await;
         loop {
             if let Some(event) = tracking.queued.pop_front() {
@@ -311,6 +318,7 @@ SERIAL0003             unauthorized usb:1-2 transport_id:4
 adb-SERIAL0001-AbCdEf._adb-tls-connect._tcp device product:x transport_id:6
 emulator-5554          offline transport_id:7
 SERIAL0002             device usb:2-1 transport_id:8
+emulator-5556          device product:x model:y device:z transport_id:9
 
 garbage
 ";
