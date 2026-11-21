@@ -14,7 +14,14 @@ import Foundation
 /// Thread-safe. The receiver itself is confined to its `Port` (an actor).
 @available(iOS 27.0, macOS 27.0, *)
 public final class SampleBufferFeed: @unchecked Sendable {
-    public typealias Sample = CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
+    /// A sample on its way to the receiver. It holds the plain `CMSampleBuffer`: no stored
+    /// property of a class may name a type that is missing on an older system
+    /// (`CMReadySampleBuffer` is iOS and macOS 26), even in a class only created on a newer
+    /// one, because the runtime realizes every class at launch on any system and a missing
+    /// type's metadata crashes it there. The receiver's side makes the ready buffer.
+    public struct Sample: @unchecked Sendable {
+        public let buffer: CMSampleBuffer
+    }
 
     /// What the receiver made of one sample.
     public enum Outcome: Sendable {
@@ -73,7 +80,7 @@ public final class SampleBufferFeed: @unchecked Sendable {
 
     /// Queues `sample` behind the backlog; callers check `isReady` first.
     public func enqueue(_ sample: sending CMSampleBuffer) {
-        let ready = Sample(unsafeBuffer: sample)
+        let ready = Sample(buffer: sample)
         lock.withLock {
             backlog += 1
             continuation.yield(Item(sample: ready, epoch: epoch))
