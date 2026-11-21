@@ -231,7 +231,7 @@ async fn closing_a_credit_stalled_lane_releases_every_pending_write() {
         // was always immediate. Allow more than one keep-alive interval.
         let limit = match transport {
             ChannelTransport::Quic => Duration::from_secs(5),
-            ChannelTransport::TlsTcp => Duration::from_secs(2),
+            ChannelTransport::TlsTcp | ChannelTransport::TlsStream { .. } => Duration::from_secs(2),
         };
         loop {
             if tokio::time::timeout(limit, server.receive())
@@ -239,7 +239,7 @@ async fn closing_a_credit_stalled_lane_releases_every_pending_write() {
                 .unwrap_or_else(|_| {
                     let name = match transport {
                         ChannelTransport::Quic => "QUIC",
-                        ChannelTransport::TlsTcp => "TLS/TCP",
+                        ChannelTransport::TlsTcp | ChannelTransport::TlsStream { .. } => "TLS/TCP",
                     };
                     panic!("{name} server did not observe the close within {limit:?}")
                 })

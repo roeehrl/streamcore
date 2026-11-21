@@ -10,7 +10,10 @@ use crate::{
         check_frames_version,
     },
     protocol::{self, Hello},
-    transport::{self, DialPath, Session, SessionListener, TransportKind},
+    transport::{
+        self, DialPath, Medium, PeerLocator, PipeIo, Session, SessionListener, TransportError,
+        TransportKind,
+    },
 };
 use std::{
     collections::BTreeSet,
@@ -37,10 +40,33 @@ pub enum ChannelError {
     Runtime,
 }
 
-#[derive(Clone, Copy, uniffi::Enum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum ChannelTransport {
     Quic,
     TlsTcp,
+    /// The TLS/TCP framing over a pipe a USB provider opened.
+    TlsStream {
+        medium: Medium,
+    },
+}
+
+/// Where a channel's peer is, for routing and display only; never identity.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChannelLocator {
+    /// A numeric socket address.
+    Socket { address: String },
+    /// `device` is the provider's label for the device. It is private to this
+    /// machine: show it locally, and never send or log it where it leaves the
+    /// machine.
+    Usb { medium: Medium, device: String },
+}
+
+/// A byte stream a USB provider opened between this machine and a device.
+pub struct UsbPipe {
+    pub io: PipeIo,
+    pub medium: Medium,
+    /// The provider's label for the device, for local display only.
+    pub device: String,
 }
 
 #[derive(Clone, uniffi::Record)]
@@ -91,7 +117,7 @@ pub struct SecureChannel {
     io: Arc<Multiplexer>,
     transport: ChannelTransport,
     peer: String,
-    peer_address: std::net::SocketAddr,
+    locator: PeerLocator,
     capabilities: Vec<String>,
     lanes: LanePolicy,
 }
@@ -119,13 +145,13 @@ impl SecureChannel {
             io.start(reader, writer, Some(index + 1));
         }
         Arc::new(Self {
-            transport: if quic {
-                ChannelTransport::Quic
-            } else {
-                ChannelTransport::TlsTcp
+            transport: match session.kind {
+                TransportKind::Quic => ChannelTransport::Quic,
+                TransportKind::TlsTcp => ChannelTransport::TlsTcp,
+                TransportKind::TlsStream { medium } => ChannelTransport::TlsStream { medium },
             },
             peer: session.peer_fingerprint.clone(),
-            peer_address: session.peer_address,
+            locator: session.locator.clone(),
             capabilities: session.capabilities.clone(),
             lanes,
             io,
@@ -171,13 +197,27 @@ impl SecureChannel {
     }
     /// Routing/display information only. Certificate pins, never addresses,
     /// identify the peer. QUIC reports its current path after migration.
+    /// Empty for a channel over a USB pipe, which has no address: see
+    /// [`Self::locator`].
     pub fn remote_address(&self) -> String {
-        self.io
-            .quic
-            .as_ref()
-            .map(quinn::Connection::remote_address)
-            .unwrap_or(self.peer_address)
-            .to_string()
+        match (&self.io.quic, &self.locator) {
+            (Some(quic), _) => quic.remote_address().to_string(),
+            (None, PeerLocator::Socket(address)) => address.to_string(),
+            (None, PeerLocator::Usb { .. }) => String::new(),
+        }
+    }
+    /// Where the peer is: its current socket address, or the USB medium and
+    /// the provider's device label.
+    pub fn locator(&self) -> ChannelLocator {
+        match &self.locator {
+            PeerLocator::Usb { medium, device } => ChannelLocator::Usb {
+                medium: *medium,
+                device: device.clone(),
+            },
+            PeerLocator::Socket(_) => ChannelLocator::Socket {
+                address: self.remote_address(),
+            },
+        }
     }
     pub fn capabilities(&self) -> Vec<String> {
         self.capabilities.clone()
@@ -361,6 +401,29 @@ impl Drop for SecureListener {
     }
 }
 
+impl SecureListener {
+    /// Hands over a pipe a USB provider opened to a device. The listener is the
+    /// TLS server on it, with the same identity, pins, admission bounds, trust
+    /// fence and lane rule as a TCP connection; the channel arrives through
+    /// [`Self::accept`].
+    pub fn accept_stream(&self, pipe: UsbPipe) -> Result<(), ChannelError> {
+        let UsbPipe { io, medium, device } = pipe;
+        let listener = self
+            .state
+            .lock()
+            .map_err(|_| ChannelError::Closed)?
+            .listener
+            .clone()
+            .ok_or(ChannelError::Closed)?;
+        listener
+            .accept_stream(io, PeerLocator::Usb { medium, device })
+            .map_err(|error| match error {
+                TransportError::Closed => ChannelError::Closed,
+                _ => ChannelError::ConnectionFailed,
+            })
+    }
+}
+
 #[uniffi::export]
 impl SecureListener {
     pub fn address(&self) -> String {
@@ -538,6 +601,10 @@ pub async fn connect_secure_with(
                 kind: match p.transport {
                     ChannelTransport::Quic => TransportKind::Quic,
                     ChannelTransport::TlsTcp => TransportKind::TlsTcp,
+                    // A pipe is connected with `connect_secure_stream_with`.
+                    ChannelTransport::TlsStream { .. } => {
+                        return Err(ChannelError::InvalidConfiguration);
+                    }
                 },
                 delay: Duration::from_millis(p.delay_ms.into()),
             })
@@ -549,6 +616,35 @@ pub async fn connect_secure_with(
                 &identity,
                 trusted_peer,
                 paths,
+                options.hello(),
+            ))
+            .await
+            .ok_or(ChannelError::Closed)?
+            .map(|session| SecureChannel::from_session(session, lanes))
+            .map_err(|_| ChannelError::ConnectionFailed)
+    })
+    .await
+}
+
+/// Connects over a pipe the device side accepted from a USB provider: the
+/// host is always the TLS server, with the same pins as on the network. One
+/// attempt and no retry; the channel routes application frames with `lanes`.
+pub async fn connect_secure_stream_with(
+    lanes: LanePolicy,
+    identity: Arc<PeerIdentity>,
+    trusted_peer: Vec<u8>,
+    pipe: UsbPipe,
+    options: SessionOptions,
+    cancellation: Arc<crate::OperationCancellation>,
+) -> Result<Arc<SecureChannel>, ChannelError> {
+    let UsbPipe { io, medium, device } = pipe;
+    on_runtime(async move {
+        cancellation
+            .run(transport::dial_pipe(
+                &identity,
+                trusted_peer,
+                io,
+                PeerLocator::Usb { medium, device },
                 options.hello(),
             ))
             .await

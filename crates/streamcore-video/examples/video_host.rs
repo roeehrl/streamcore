@@ -726,6 +726,7 @@ async fn main() {
                     match channel.transport() {
                         ChannelTransport::Quic => "QUIC",
                         ChannelTransport::TlsTcp => "TLS/TCP",
+                        ChannelTransport::TlsStream { .. } => "TLS over a pipe",
                     },
                     channel.remote_address(),
                     channel.frames_v4()

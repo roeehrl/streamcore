@@ -338,6 +338,7 @@ async fn measure(
         transport: match transport {
             ChannelTransport::Quic => "quic",
             ChannelTransport::TlsTcp => "tls_tcp",
+            ChannelTransport::TlsStream { .. } => "tls_stream",
         },
         remote: address,
         seconds,
