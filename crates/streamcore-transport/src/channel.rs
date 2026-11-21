@@ -190,6 +190,21 @@ pub struct LinkStats {
     pub bulk_bytes_sent: u64,
 }
 
+/// What [`SecureChannel::probe`] measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct ProbeResult {
+    /// Pings sent (fewer than asked when the deadline came first).
+    pub sent: u32,
+    /// Pongs that arrived before the deadline.
+    pub answered: u32,
+    /// Round trips of the answered pings, excluding the peer's hold time.
+    /// `None` when nothing was answered.
+    pub rtt_p50_us: Option<u64>,
+    pub rtt_p95_us: Option<u64>,
+    /// How long the probe took.
+    pub elapsed_ms: u32,
+}
+
 #[uniffi::export]
 impl SecureChannel {
     pub fn transport(&self) -> ChannelTransport {
@@ -302,7 +317,74 @@ impl SecureChannel {
     /// it; the answer updates [`Self::clock_estimate`] and is also delivered to
     /// the application as a pong frame, for liveness.
     pub fn send_clock_ping(&self) -> Result<(), ChannelError> {
-        self.io.ping()
+        self.io.ping().map(|_| ())
+    }
+
+    /// Measures the link with `count` typed pings `spacing_ms` apart, waiting
+    /// at most `deadline_ms` in all (`clock.v1` only): how a client judges a
+    /// newly connected transport, a cable for example, before it moves a live
+    /// session onto it. It sends nothing but the pings, so it may run before
+    /// any application message. The caller decides what passes.
+    pub async fn probe(
+        &self,
+        count: u8,
+        spacing_ms: u32,
+        deadline_ms: u32,
+    ) -> Result<ProbeResult, ChannelError> {
+        if count == 0 || count > 32 || deadline_ms == 0 || deadline_ms > 10_000 {
+            return Err(ChannelError::InvalidConfiguration);
+        }
+        if self.io.clock.is_none() {
+            return Err(ChannelError::InvalidConfiguration);
+        }
+        let io = self.io.clone();
+        on_runtime(async move {
+            let started = tokio::time::Instant::now();
+            let deadline = started + Duration::from_millis(deadline_ms.into());
+            let spacing = Duration::from_millis(spacing_ms.into());
+            let mut nonces = Vec::with_capacity(count.into());
+            for index in 0..u32::from(count) {
+                let at = started + spacing * index;
+                if at >= deadline {
+                    break;
+                }
+                tokio::time::sleep_until(at).await;
+                nonces.push(io.ping()?);
+            }
+            let round_trips = |io: &Multiplexer| {
+                io.clock
+                    .as_ref()
+                    .map(|clock| clock.round_trips(&nonces))
+                    .unwrap_or_default()
+            };
+            // Every pong, the deadline, or the channel closing ends the wait.
+            let mut closed = io.closed.subscribe();
+            let mut answered = round_trips(&io);
+            while answered.len() < nonces.len()
+                && tokio::time::Instant::now() < deadline
+                && !*closed.borrow()
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(2)) => {}
+                    _ = closed.changed() => {}
+                }
+                answered = round_trips(&io);
+            }
+            answered.sort_unstable();
+            let percentile = |per_hundred: usize| {
+                answered
+                    .get((answered.len() * per_hundred).div_ceil(100).max(1) - 1)
+                    .copied()
+            };
+            Ok(ProbeResult {
+                sent: u32::try_from(nonces.len()).unwrap_or(u32::MAX),
+                answered: u32::try_from(answered.len()).unwrap_or(u32::MAX),
+                rtt_p50_us: percentile(50),
+                rtt_p95_us: percentile(95),
+                elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            })
+        })
+        .await
     }
 
     /// The peer clock relative to ours, once a typed ping has been answered.

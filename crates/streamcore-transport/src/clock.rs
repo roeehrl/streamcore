@@ -62,6 +62,7 @@ pub struct ClockEstimate {
 
 #[derive(Clone, Copy)]
 struct Sample {
+    nonce: u64,
     at_us: u64,
     rtt_us: u64,
     offset_us: i64,
@@ -76,6 +77,7 @@ fn sample(t1: u64, pong: ClockPong, t4: u64) -> Option<Sample> {
     let t4 = i128::from(t4);
     let offset = (i128::from(pong.receive_us) - t1 + i128::from(pong.send_us) - t4) / 2;
     Some(Sample {
+        nonce: pong.nonce,
         at_us: u64::try_from(t4).ok()?,
         rtt_us: rtt,
         offset_us: i64::try_from(offset).ok()?,
@@ -129,6 +131,18 @@ impl Clock {
             }
             state.samples.push_back(sample);
         }
+    }
+    /// The round trips of the answered pings among `nonces`, in microseconds.
+    pub(crate) fn round_trips(&self, nonces: &[u64]) -> Vec<u64> {
+        let Ok(state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .samples
+            .iter()
+            .filter(|sample| nonces.contains(&sample.nonce))
+            .map(|sample| sample.rtt_us)
+            .collect()
     }
     pub(crate) fn estimate(&self, now_us: u64) -> Option<ClockEstimate> {
         let state = self.state.lock().ok()?;

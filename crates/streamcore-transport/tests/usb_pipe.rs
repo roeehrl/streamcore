@@ -9,6 +9,7 @@ use streamcore_transport::{
         ChannelLocator, ChannelTransport, SessionOptions, UsbPipe, connect_secure_stream_with,
         listen_secure,
     },
+    clock::CLOCK_CAPABILITY,
     identity::PeerIdentity,
     multiplex::binary_lanes,
     protocol::{Hello, PROTOCOL_MAJOR},
@@ -223,8 +224,8 @@ async fn a_secure_channel_over_a_pipe_carries_messages_and_reports_its_locator()
     let host = Arc::new(PeerIdentity::generate().unwrap());
     let client = Arc::new(PeerIdentity::generate().unwrap());
     let options = SessionOptions {
-        capabilities: vec![],
-        required: vec![],
+        capabilities: vec![CLOCK_CAPABILITY.into()],
+        required: vec![CLOCK_CAPABILITY.into()],
     };
     let listener = listen_secure(
         "127.0.0.1:0".into(),
@@ -272,11 +273,24 @@ async fn a_secure_channel_over_a_pipe_carries_messages_and_reports_its_locator()
         }
     );
     assert_eq!(server.remote_address(), "");
+    // The probe a client runs on a new pipe before it moves a session onto it.
+    let probe = channel.probe(5, 20, 500).await.unwrap();
+    assert_eq!((probe.sent, probe.answered), (5, 5));
+    assert!(probe.rtt_p50_us.unwrap() < 100_000);
+    // Pings and pongs are also delivered, as liveness signals: skip them.
+    async fn next(channel: &streamcore_transport::channel::SecureChannel) -> Vec<u8> {
+        loop {
+            let message = channel.receive().await.unwrap();
+            if !matches!(message.first(), Some(2 | 3)) {
+                break message;
+            }
+        }
+    }
     channel
         .send(b"hello over the cable".to_vec())
         .await
         .unwrap();
-    assert_eq!(server.receive().await.unwrap(), b"hello over the cable");
+    assert_eq!(next(&server).await, b"hello over the cable");
     server.send(b"hello back".to_vec()).await.unwrap();
-    assert_eq!(channel.receive().await.unwrap(), b"hello back");
+    assert_eq!(next(&channel).await, b"hello back");
 }
