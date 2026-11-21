@@ -21,6 +21,7 @@ wire protocol will change.
 | `crates/streamcore-media` | `frames.v3` media headers, the typed binary lane frames and video stream continuity. No network dependencies. |
 | `crates/streamcore-session` | Host-owned logical sessions that survive transport replacement, and resume references. |
 | `crates/streamcore-transport` | Pinned identities, OPAQUE pairing, the versioned hello, QUIC and TLS/TCP sessions, the five bounded multiplexed lanes and the secure channel. Its `examples/` hold the two-machine `network_probe` and the `scheduling_probe`. |
+| `crates/streamcore-usb` | USB pipe providers ([design](docs/STREAMCORE-VIDEO.md), section 8.4): byte streams to a cabled device, handed to the secure transport, which runs the same pinned TLS on them. The adb provider so far. |
 | `crates/streamcore-input`, `crates/streamcore-input-ffi` | The input model (Pad's apps and MyCNC) and its JSON C ABI (`include/streamcore_input.h`). `crates/streamcore-input/CHANGES.md` is the change log apps read before re-pinning. |
 | `crates/streamcore-video` | The video control plane ([design](docs/STREAMCORE-VIDEO.md)): backend traits (UniFFI foreign traits), one serial executor per stream, lifecycle, latest-frame retention and recovery, and the per-frame C ABI for foreign backends (`include/streamcore_video_native.h`). P1 core; no platform backend yet. |
 | `StreamCoreInput/` | The input model's Swift package (XCFramework plus UniFFI bindings, built by a script below). |

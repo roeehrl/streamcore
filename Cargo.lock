@@ -1294,6 +1294,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamcore-usb"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "streamcore-transport",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "streamcore-video"
 version = "0.1.0"
 dependencies = [
