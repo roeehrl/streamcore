@@ -6,6 +6,7 @@
 
 pub mod channel;
 pub mod clock;
+pub mod duplex;
 pub mod identity;
 pub mod multiplex;
 pub mod owner;

@@ -11,8 +11,8 @@ use crate::{
     },
     protocol::{self, Hello},
     transport::{
-        self, DialPath, Medium, PeerLocator, PipeHandle, PipeIo, Session, SessionListener,
-        TransportError, TransportKind,
+        self, DialPath, Medium, PeerLocator, PipeHandle, PipeIo, PipeOutcome, Session,
+        SessionListener, TransportError, TransportKind,
     },
 };
 use std::{
@@ -507,6 +507,23 @@ struct ListenerState {
     channels: Vec<Weak<SecureChannel>>,
 }
 
+/// How a pipe handed to [`SecureListener::accept_pipe`] ends up.
+#[derive(uniffi::Object)]
+pub struct PipeAdmission(Mutex<Option<PipeHandle>>);
+
+#[uniffi::export]
+impl PipeAdmission {
+    /// Resolves when the pipe was accepted (its channel then arrives through
+    /// `accept`) or given up. Asked a second time, it reports `Refused`.
+    pub async fn outcome(&self) -> PipeOutcome {
+        let handle = self.0.lock().ok().and_then(|mut handle| handle.take());
+        match handle {
+            Some(handle) => handle.outcome().await,
+            None => PipeOutcome::Refused,
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct SecureListener {
     state: Mutex<ListenerState>,
@@ -550,6 +567,18 @@ impl SecureListener {
 
 #[uniffi::export]
 impl SecureListener {
+    /// [`Self::accept_stream`] for a native host: hands over a pipe and
+    /// returns its outcome's handle. A pipe handle is used once; a second use
+    /// is `InvalidConfiguration`.
+    pub fn accept_pipe(
+        &self,
+        pipe: Arc<crate::duplex::UsbPipeHandle>,
+    ) -> Result<Arc<PipeAdmission>, ChannelError> {
+        let pipe = pipe.take().ok_or(ChannelError::InvalidConfiguration)?;
+        let handle = self.accept_stream(pipe)?;
+        Ok(Arc::new(PipeAdmission(Mutex::new(Some(handle)))))
+    }
+
     pub fn address(&self) -> String {
         self.address.clone()
     }
@@ -679,6 +708,29 @@ pub async fn listen_secure_with(
             lanes,
         }))
     })
+    .await
+}
+
+/// [`connect_secure_stream_with`] with StreamCore's binary lanes only, for a
+/// native client: connects over a pipe this device accepted from the host.
+/// A handle is used once; a second use is `InvalidConfiguration`.
+#[uniffi::export]
+pub async fn connect_secure_pipe(
+    identity: Arc<PeerIdentity>,
+    trusted_peer: Vec<u8>,
+    pipe: Arc<crate::duplex::UsbPipeHandle>,
+    options: SessionOptions,
+    cancellation: Arc<crate::OperationCancellation>,
+) -> Result<Arc<SecureChannel>, ChannelError> {
+    let pipe = pipe.take().ok_or(ChannelError::InvalidConfiguration)?;
+    connect_secure_stream_with(
+        binary_lanes,
+        identity,
+        trusted_peer,
+        pipe,
+        options,
+        cancellation,
+    )
     .await
 }
 

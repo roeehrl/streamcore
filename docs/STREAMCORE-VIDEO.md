@@ -947,13 +947,22 @@ impl SecureListener {
     pub async fn accept_stream(&self, io: Arc<dyn ByteDuplex>, locator: PeerLocator) -> Result<(), ChannelError>;
 }
 impl SecureChannel { pub fn locator(&self) -> PeerLocator; pub async fn probe(&self, n: u8, spacing: Duration) -> ProbeResult; }
-#[uniffi::export(with_foreign)]
-pub trait ByteDuplex: Send + Sync {                                    // macOS IOUSBHost AOA only
-    async fn read(&self, max: u32) -> Result<Vec<u8>, IoError>;       // empty = EOF
-    async fn write(&self, data: Vec<u8>) -> Result<(), IoError>;
-    fn close(&self);
+#[uniffi::export(rust, foreign)]
+pub trait ByteDuplex: Send + Sync {                                    // a platform's raw stream (AOA)
+    fn read(&self, max: u32) -> Result<Vec<u8>, DuplexError>;         // blocks; empty or Closed = EOF
+    fn write(&self, data: Vec<u8>) -> Result<(), DuplexError>;        // blocks until taken
+    fn shutdown(&self);                                                // a blocked call returns
 }
 ```
+
+- `ByteDuplex` calls block (`streamcore_transport::duplex`): each stream gets a reading and a
+  writing thread, at most 64 KiB per call, small writes joined, and a write queue of 2 chunks so a
+  slow cable pushes back. Dropping the pipe calls `shutdown()`, which must make a blocked call
+  return.
+- Native apps reach pipes through `UsbPipeHandle` (used once), `SecureListener::accept_pipe` (its
+  `PipeAdmission::outcome()` is the pipe's `PipeOutcome`) and `connect_secure_pipe`. Producers of
+  handles live in `streamcore-usb` behind its `ffi` feature (`UsbAccessoryLink` first;
+  `streamcore-video`'s `usb` feature links them into the one native library).
 
 - A `Pipe` path runs the TLS client handshake on the pipe, then the TLS/TCP path. **Pipe paths are
   excluded from `connect_path`'s retry loop**: one attempt, then the path fails.
@@ -993,9 +1002,12 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
   fallback port list the host also probes.
 - **AOA** (Android; macOS via IOUSBHost over `ByteDuplex`, Linux via `nusb`; not Windows): a link
   layer over the bulk endpoints (16-byte header: magic, kind, flags, sequence, session, length;
-  kinds `linkHello` (first frame, carries the link version), `open`, `opened`, `data`, `close`,
-  `ping`/`pong`, `pad`). Any gap, duplicate or desync closes that session and its channel. Only the
-  consumer a device is paired with may switch it; a cross-consumer lock stops two hosts fighting.
+  kinds `linkHello` (first frame, carries the link version and the sender's role), `open`,
+  `opened`, `data`, `close`, `ping`/`pong`, `pad`). The host opens a session per pipe; the device
+  holds at most 4. A gap or duplicate closes that session and its channel; a bad header loses the
+  framing and ends the link with every session on it (`streamcore_usb::aoa::AccessoryLink`). Only
+  the consumer a device is paired with may switch it; a cross-consumer lock stops two hosts
+  fighting.
 - **usbmux** (iOS/iPadOS): a Rust client for the header + plist protocol (`/var/run/usbmuxd`, or
   `127.0.0.1:27015` on Windows). **USB-C network interface** (Mac ↔ iPad/iPhone): an IP link with
   interface-scoped `UsbNet` candidates, QUIC off until qualified.

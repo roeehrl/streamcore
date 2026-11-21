@@ -8,12 +8,18 @@
 //! machine: show it locally, never send or log it where it leaves the machine.
 
 pub mod adb;
+pub mod aoa;
 pub mod device;
+#[cfg(feature = "ffi")]
+pub mod ffi;
 pub mod keeper;
 mod plist;
 pub mod usbmux;
 
 use streamcore_transport::transport::{Medium, PipeIo};
+
+#[cfg(feature = "ffi")]
+uniffi::setup_scaffolding!();
 
 /// A cabled device as a provider sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +38,7 @@ pub enum UsbEvent {
 
 /// Which listener on the device a pipe goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum UsbService {
     Session,
     Pairing,

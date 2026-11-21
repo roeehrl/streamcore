@@ -77,7 +77,7 @@ const PIPE_IDLE_LIMIT: Duration = Duration::from_secs(60);
 const MAX_IDLE_PIPES: usize = 32;
 
 /// How a pipe handed to [`SessionListener::accept_stream`] ended up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum PipeOutcome {
     /// A session was negotiated on it and queued for `accept`.
     Accepted,

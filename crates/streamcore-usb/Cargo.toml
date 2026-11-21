@@ -12,9 +12,18 @@ streamcore-transport = { path = "../streamcore-transport" }
 thiserror.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+uniffi = { workspace = true, optional = true }
+
+[features]
+# The binding surface for native apps (`ffi.rs`).
+ffi = ["dep:uniffi"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "aoa_link"
+required-features = ["ffi"]
