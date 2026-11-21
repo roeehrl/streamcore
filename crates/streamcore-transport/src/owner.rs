@@ -47,6 +47,11 @@ pub struct OwnerPolicy {
     pub flap_limit: usize,
     pub flap_window_ms: u64,
     pub flap_stay_ms: u64,
+    /// A resume that fails is tried again after this pause, doubling up to
+    /// `resume_retry_max_ms`, and given up after `resume_attempts` in a row.
+    pub resume_retry_ms: u64,
+    pub resume_retry_max_ms: u64,
+    pub resume_attempts: u32,
 }
 
 impl Default for OwnerPolicy {
@@ -63,6 +68,9 @@ impl Default for OwnerPolicy {
             flap_limit: 3,
             flap_window_ms: 60_000,
             flap_stay_ms: 300_000,
+            resume_retry_ms: 150,
+            resume_retry_max_ms: 30_000,
+            resume_attempts: 8,
         }
     }
 }
@@ -102,6 +110,8 @@ pub enum State {
 pub enum Timer {
     StabilityHold,
     HelloAnswer,
+    /// The pause before the next resume attempt.
+    ResumeRetry,
 }
 
 /// What happened. Events about a candidate are ignored when there is none.
@@ -201,6 +211,8 @@ pub struct TransportOwner {
     usb_losses: Vec<u64>,
     /// How long the next flap bar lasts.
     next_flap_stay_ms: u64,
+    /// Resume attempts that failed in a row.
+    resume_failures: u32,
 }
 
 impl TransportOwner {
@@ -212,6 +224,7 @@ impl TransportOwner {
             usb_barred_until: 0,
             usb_losses: Vec::new(),
             next_flap_stay_ms: policy.flap_stay_ms,
+            resume_failures: 0,
         }
     }
 
@@ -264,6 +277,7 @@ impl TransportOwner {
 
     fn resume(&mut self, actions: &mut Vec<Action>) {
         self.state = State::Resuming;
+        self.resume_failures = 0;
         actions.push(Action::Report(Status::Resuming));
         actions.push(Action::Connect {
             usb_first: self.pipe_ready,
@@ -272,12 +286,32 @@ impl TransportOwner {
 
     /// Ends a switch whose candidate failed: back on the live transport, or,
     /// when that died meanwhile, resuming.
-    fn candidate_failed(&mut self, from: Route, live_closed: bool, actions: &mut Vec<Action>) {
+    ///
+    /// A cable candidate that fails (its dial, its probe, a rejected hello, or
+    /// closing early) counts as a cable loss and holds cable triggers for a
+    /// while: a cable that is plugged in but never good enough must not be
+    /// dialed and probed every few seconds for as long as it stays plugged in.
+    fn candidate_failed(
+        &mut self,
+        now_ms: u64,
+        from: Route,
+        to: Route,
+        live_closed: bool,
+        actions: &mut Vec<Action>,
+    ) {
+        if to == Route::Usb {
+            self.usb_lost(now_ms);
+            self.usb_barred_until = self
+                .usb_barred_until
+                .max(now_ms.saturating_add(self.policy.trigger_hold_ms));
+        }
         if live_closed {
-            actions.push(Action::Connect {
-                usb_first: self.pipe_ready,
-            });
+            // Already reported as resuming when the live transport closed.
             self.state = State::Resuming;
+            self.resume_failures = 0;
+            actions.push(Action::Connect {
+                usb_first: self.pipe_ready && self.usb_allowed(now_ms),
+            });
         } else {
             self.state = State::Live { route: from };
         }
@@ -305,7 +339,8 @@ impl TransportOwner {
                     }
                 }
                 State::Live { .. } => actions.push(Action::CloseLive),
-                State::Connecting | State::Resuming => {}
+                State::Resuming => actions.push(Action::CancelTimer(Timer::ResumeRetry)),
+                State::Connecting => {}
             }
             if self.state != State::Idle {
                 actions.push(Action::Report(Status::Disconnected));
@@ -333,6 +368,29 @@ impl TransportOwner {
                     actions.push(Action::Report(Status::Live(route)));
                     // A pipe that lost the connect race is still a trigger.
                     self.maybe_switch_to_usb(now_ms, &mut actions);
+                }
+                // A first connect that fails is the consumer's to ask for again.
+                // A resume keeps trying with a growing pause, and the status
+                // stays "resuming" until it gives up.
+                Event::ConnectFailed if self.state == State::Resuming => {
+                    self.resume_failures += 1;
+                    if self.resume_failures >= self.policy.resume_attempts {
+                        self.state = State::Idle;
+                        actions.push(Action::Report(Status::Disconnected));
+                    } else {
+                        let doublings = (self.resume_failures - 1).min(32);
+                        let pause = self
+                            .policy
+                            .resume_retry_ms
+                            .saturating_mul(1u64 << doublings)
+                            .min(self.policy.resume_retry_max_ms);
+                        actions.push(Action::SetTimer(Timer::ResumeRetry, pause));
+                    }
+                }
+                Event::TimerFired(Timer::ResumeRetry) if self.state == State::Resuming => {
+                    actions.push(Action::Connect {
+                        usb_first: self.pipe_ready && self.usb_allowed(now_ms),
+                    });
                 }
                 Event::ConnectFailed => {
                     self.state = State::Idle;
@@ -442,7 +500,7 @@ impl TransportOwner {
                         if to == Route::Usb {
                             self.pipe_ready = false;
                         }
-                        self.candidate_failed(from, live_closed, &mut actions);
+                        self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     (
                         Stage::Probing,
@@ -473,7 +531,7 @@ impl TransportOwner {
                             ));
                         } else {
                             actions.push(Action::CloseCandidate);
-                            self.state = State::Live { route: from };
+                            self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                         }
                     }
                     (Stage::AwaitingAnswer, Event::HelloAccepted) => {
@@ -492,18 +550,25 @@ impl TransportOwner {
                     (Stage::AwaitingAnswer, Event::HelloRejected) => {
                         actions.push(Action::CancelTimer(Timer::HelloAnswer));
                         actions.push(Action::CloseCandidate);
-                        self.candidate_failed(from, live_closed, &mut actions);
+                        self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     (
                         Stage::Dialing | Stage::Probing | Stage::AwaitingAnswer,
                         Event::CandidateClosed,
                     ) => {
                         actions.push(Action::CancelTimer(Timer::HelloAnswer));
-                        self.candidate_failed(from, live_closed, &mut actions);
+                        self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
-                    // No answer in time: keep both channels until one answers
-                    // or closes. Nothing to do but stop waiting on the clock.
-                    (Stage::AwaitingAnswer, Event::TimerFired(Timer::HelloAnswer)) => {}
+                    // No answer in time. With the live transport still up,
+                    // keep both channels until one answers or closes. With it
+                    // gone the candidate is the only channel: give it up and
+                    // resume, or the client would wait on it for ever.
+                    (Stage::AwaitingAnswer, Event::TimerFired(Timer::HelloAnswer))
+                        if live_closed =>
+                    {
+                        actions.push(Action::CloseCandidate);
+                        self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
+                    }
                     _ => {}
                 }
             }
@@ -917,5 +982,131 @@ mod tests {
             owner.handle(9_000, E::ConnectFailed),
             [A::Report(Status::Disconnected)]
         );
+    }
+
+    #[test]
+    fn with_the_live_transport_gone_an_unanswered_candidate_is_given_up() {
+        let mut owner = live_on_network();
+        to_awaiting_answer(&mut owner, 0);
+        owner.handle(2_250, E::LiveClosed);
+        // The candidate is the only channel, and the host never answers.
+        assert_eq!(
+            owner.handle(7_200, E::TimerFired(Timer::HelloAnswer)),
+            [A::CloseCandidate, A::Connect { usb_first: false }]
+        );
+        assert_eq!(owner.state(), State::Resuming);
+    }
+
+    #[test]
+    fn a_resume_is_retried_with_a_growing_pause_before_it_is_given_up() {
+        let mut owner = live_on_network();
+        assert_eq!(
+            owner.handle(1_000, E::LiveClosed),
+            [A::Report(Status::Resuming), A::Connect { usb_first: false }]
+        );
+        // Seven failures: a pause that doubles, and no status change.
+        let mut now = 1_000;
+        for pause in [150, 300, 600, 1_200, 2_400, 4_800, 9_600] {
+            now += 100;
+            assert_eq!(
+                owner.handle(now, E::ConnectFailed),
+                [A::SetTimer(Timer::ResumeRetry, pause)]
+            );
+            assert_eq!(owner.state(), State::Resuming);
+            now += pause;
+            assert_eq!(
+                owner.handle(now, E::TimerFired(Timer::ResumeRetry)),
+                [A::Connect { usb_first: false }]
+            );
+        }
+        // The eighth ends it.
+        assert_eq!(
+            owner.handle(now + 100, E::ConnectFailed),
+            [A::Report(Status::Disconnected)]
+        );
+        assert_eq!(owner.state(), State::Idle);
+
+        // A resume that succeeds starts the count again, and the pause is capped.
+        let mut owner = TransportOwner::new(OwnerPolicy {
+            resume_attempts: 20,
+            ..OwnerPolicy::default()
+        });
+        owner.handle(0, E::ConnectRequested);
+        owner.handle(
+            0,
+            E::Connected {
+                route: Route::Network,
+            },
+        );
+        owner.handle(10, E::LiveClosed);
+        owner.handle(20, E::ConnectFailed);
+        owner.handle(
+            30,
+            E::Connected {
+                route: Route::Network,
+            },
+        );
+        owner.handle(40, E::LiveClosed);
+        assert_eq!(
+            owner.handle(50, E::ConnectFailed),
+            [A::SetTimer(Timer::ResumeRetry, 150)]
+        );
+        let mut last = 0;
+        for _ in 0..12 {
+            if let [A::SetTimer(Timer::ResumeRetry, pause)] = owner.handle(60, E::ConnectFailed)[..]
+            {
+                last = pause;
+            }
+        }
+        assert_eq!(last, 30_000);
+        // A disconnect while waiting to retry cancels the timer.
+        assert_eq!(
+            owner.handle(70, E::Disconnect),
+            [
+                A::CancelTimer(Timer::ResumeRetry),
+                A::Report(Status::Disconnected)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cable_that_is_never_good_enough_is_not_tried_every_few_seconds() {
+        let slow = E::Probed {
+            answered: 5,
+            rtt_p50_us: Some(9_000),
+            elapsed_ms: 120,
+            live_rtt_p50_us: Some(3_000),
+        };
+        let mut owner = live_on_network();
+        let mut now = 0;
+        // Each failed candidate holds the cable for ten seconds.
+        for round in 0..3 {
+            assert_eq!(
+                owner.handle(now, E::UsbPipeReady),
+                [A::SetTimer(Timer::StabilityHold, 2_000)],
+                "round {round}"
+            );
+            owner.handle(now + 2_000, E::TimerFired(Timer::StabilityHold));
+            owner.handle(now + 2_010, E::CandidateDialed);
+            assert_eq!(owner.handle(now + 2_200, slow), [A::CloseCandidate]);
+            // The keeper's next pipe, two seconds later: ignored.
+            assert_eq!(owner.handle(now + 4_200, E::UsbPipeReady), []);
+            now += 2_200 + 10_000;
+        }
+        // Three in a minute: left alone for five minutes.
+        assert_eq!(owner.handle(now, E::UsbPipeReady), []);
+        assert_eq!(owner.handle(now + 280_000, E::UsbPipeReady), []);
+        assert_eq!(
+            owner.handle(now + 301_000, E::UsbPipeReady),
+            [A::SetTimer(Timer::StabilityHold, 2_000)]
+        );
+        // The session stayed on the network throughout.
+        assert!(matches!(
+            owner.state(),
+            State::Switching {
+                from: Route::Network,
+                ..
+            }
+        ));
     }
 }
