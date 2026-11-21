@@ -512,3 +512,116 @@ async fn a_busy_pipe_is_not_mistaken_for_a_dead_one() {
     let probe = server.probe(3, 20, 2_000).await.unwrap();
     assert_eq!(probe.answered, 3);
 }
+
+#[tokio::test]
+async fn a_pipe_handed_over_early_waits_for_the_device_and_reports_how_it_ended() {
+    use streamcore_transport::{transport::PipeOutcome, tuning::TransportTuning};
+    let host = PeerIdentity::generate().unwrap();
+    let client = PeerIdentity::generate().unwrap();
+    let stranger = PeerIdentity::generate().unwrap();
+    let bind = async |idle_limit_ms: Option<u32>| {
+        SessionListener::bind_tuned(
+            "127.0.0.1:0".parse().unwrap(),
+            &host,
+            vec![client.certificate()],
+            hello(),
+            TransportTuning {
+                pipe_idle_limit_ms: idle_limit_ms,
+                ..TransportTuning::default()
+            },
+        )
+        .await
+        .unwrap()
+    };
+
+    // Opened well before the device dials: longer than the handshake deadline
+    // (5 s), which starts only at the device's first byte.
+    let listener = bind(None).await;
+    let (host_end, device_end) = tokio::io::duplex(64 * 1024);
+    let early = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5_500)).await;
+    let (dialed, accepted) = tokio::join!(
+        dial_pipe(
+            &client,
+            host.certificate(),
+            Box::new(device_end),
+            usb("host"),
+            hello()
+        ),
+        listener.accept(),
+    );
+    assert!(dialed.is_ok() && accepted.is_ok());
+    assert_eq!(early.outcome().await, PipeOutcome::Accepted);
+
+    // A device that never dials: the pipe is closed at the idle limit.
+    let listener = bind(Some(200)).await;
+    let (host_end, mut device_end) = tokio::io::duplex(1024);
+    let idle = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    assert_eq!(idle.outcome().await, PipeOutcome::IdleTimeout);
+    let mut byte = [0u8; 1];
+    assert_eq!(
+        tokio::io::AsyncReadExt::read(&mut device_end, &mut byte)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // A pipe that closes before a byte: normal, not a failure.
+    let listener = bind(None).await;
+    let (host_end, device_end) = tokio::io::duplex(1024);
+    let closed = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    drop(device_end);
+    assert_eq!(closed.outcome().await, PipeOutcome::ClosedIdle);
+
+    // Bytes that are not a handshake: a failure.
+    let (host_end, mut device_end) = tokio::io::duplex(1024);
+    let garbage = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut device_end, b"not a TLS hello at all\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(garbage.outcome().await, PipeOutcome::HandshakeFailed);
+
+    // An unpaired device: told apart, because retrying cannot help.
+    let (host_end, device_end) = tokio::io::duplex(64 * 1024);
+    let untrusted = listener
+        .accept_stream(Box::new(host_end), usb("device-1"))
+        .unwrap();
+    let dial = tokio::spawn(async move {
+        let _ = dial_pipe(
+            &stranger,
+            host.certificate(),
+            Box::new(device_end),
+            usb("host"),
+            hello(),
+        )
+        .await;
+    });
+    assert_eq!(untrusted.outcome().await, PipeOutcome::Untrusted);
+    let _ = listener.accept().await;
+    dial.await.unwrap();
+
+    // A third pipe from one device while two wait: refused, the others kept.
+    let mut waiting = Vec::new();
+    for _ in 0..2 {
+        let (host_end, device_end) = tokio::io::duplex(1024);
+        waiting.push((
+            listener
+                .accept_stream(Box::new(host_end), usb("device-2"))
+                .unwrap(),
+            device_end,
+        ));
+    }
+    let (host_end, _device_end) = tokio::io::duplex(1024);
+    let third = listener
+        .accept_stream(Box::new(host_end), usb("device-2"))
+        .unwrap();
+    assert_eq!(third.outcome().await, PipeOutcome::Refused);
+}

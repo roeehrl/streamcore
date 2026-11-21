@@ -74,6 +74,10 @@ pub struct TransportTuning {
     /// queues behind a large transfer in the relay's buffers. `None`: 5 s.
     #[uniffi(default = None)]
     pub pipe_pong_deadline_ms: Option<u32>,
+    /// How long a USB pipe handed to a listener may wait for the device's
+    /// first byte before the listener closes it. `None`: 60 s.
+    #[uniffi(default = None)]
+    pub pipe_idle_limit_ms: Option<u32>,
 }
 
 static TUNING: Mutex<TransportTuning> = Mutex::new(TransportTuning {
@@ -89,6 +93,7 @@ static TUNING: Mutex<TransportTuning> = Mutex::new(TransportTuning {
     bulk_token_bucket: false,
     pipe_dead_after_ms: None,
     pipe_pong_deadline_ms: None,
+    pipe_idle_limit_ms: None,
 });
 
 /// Replaces the process's transport tuning. Listeners and dials started later,
@@ -126,6 +131,7 @@ pub fn candidate_transport_tuning() -> TransportTuning {
         bulk_token_bucket: true,
         pipe_dead_after_ms: None,
         pipe_pong_deadline_ms: None,
+        pipe_idle_limit_ms: None,
     }
 }
 
