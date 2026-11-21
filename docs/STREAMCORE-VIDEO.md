@@ -529,7 +529,7 @@ Idle ─start→ Starting ─op_done(ok)→ Running ─update→ Updating ─ok�
 - **Source gone:** `Fail` fails the stream; `FallBackToMain` switches to the main display.
   **Suspend** (locked, login window, display asleep): stop submitting, keep the stream, send the
   retained frame as an IDR on resume.
-- **Handover** (8.8): `detach_transport()` parks, `attach_transport(sink)` rebinds. **Close** (3.5)
+- **Handover** (8.8): `detach_transport()` parks, `attach_transport(output)` rebinds. **Close** (3.5)
   leads from any state through `Closing` to `Closed`; a stop that times out reports `StopUnknown`.
 
 ### 3.7 Errors and wire codes
@@ -548,7 +548,8 @@ Wire codes are ported unchanged from the reference host into a `protocol/` file 
 Sources: `stream.target`, `stream.dimensions`, `stream.content`, `stream.viewport`, `stream.fit`,
 `stream.scale`, `stream.restore`. Capture and encode: `stream.start`, `stream.stop`,
 `stream.update`, `stream.capture`, `stream.output`, `stream.encoder`, `stream.encode`,
-`stream.sequence`. Canvas: `stream.firstFrame`, `stream.memberUnavailable`, `stream.layoutChanged`.
+`stream.sequence`, `stream.transport`. Canvas: `stream.firstFrame`, `stream.memberUnavailable`,
+`stream.layoutChanged`.
 Permissions: `permission.*` ([input model](INPUT-MODEL.md)).
 
 ### 3.8 Bindings per platform
@@ -1101,7 +1102,7 @@ fingerprint, with lane-0 pings answered meanwhile so the probe fits.
    subscription; the transport object becomes a sink only.
 2. Screen authority and the input lease are keyed by session, so they survive a generation bump.
 3. At attach with resume, whether the previous transport is live or parked, the host rebinds each
-   stream's sink on that stream's executor (`attach_transport(sink)`), drops video not yet sent to
+   stream's sink on that stream's executor (`attach_transport(output)`), drops video not yet sent to
    the old sink, resets the post-encoder bounds, forces an IDR with the same stream ID and
    generation (a keyframe after a gap already decodes, 2.2), resends the audio config, releases held
    keys and buttons, and lists the moved streams in the control hello ack's `continued` field. The
@@ -1112,9 +1113,18 @@ fingerprint, with lane-0 pings answered meanwhile so the probe fits.
    `lost_seq`, no recovery) and are not counted as shed (6.4).
 4. A superseded transport only closes its pipe.
 5. **Park.** When a transport is lost, its session's streams stop admitting frames but keep their
-   state for `T_park` = 3 s (`detach_transport()`); a resume within it rebinds them, after it they
-   stop as today. A parked session is not current, so another device can still take the screen.
+   state for `T_park` (`StreamTimings::park_ns`, 3 s by default) and report `TransportParked`; a
+   resume within it rebinds them, after it they fail with `stream.transport` and stop as today. A
+   stream parks by `detach_transport()`, and by itself when its sink finds the channel closed: a
+   closed channel is not a refusal, so it counts no loss and starts no recovery. A parked session
+   is not current, so another device can still take the screen.
 6. A session has at most one attached transport. The probing channel is pre-hello and owns nothing.
+
+In `streamcore-video` the seam is `VideoOutput`: `attach_transport(output)` swaps the sink's
+transport and keeps the stream's own sink policy, encoder session, stream ID and wire generation.
+Reports that still arrive from the old transport are ignored. Rate adaptation keeps its target and
+forgets the old path's delays, and LTR acknowledgements from the old one no longer count.
+`StatsSnapshot` counts `transport_parks`, `transport_attaches` and `handover_dropped`.
 
 **Ownership.** StreamCore: `DialTarget::Pipe`, TLS over `ByteDuplex`, `accept_stream`, handshake
 caps, no pipe retry, timestamped ping and `probe()`, USB liveness, `detach_transport` /

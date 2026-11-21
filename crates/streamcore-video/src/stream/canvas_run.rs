@@ -426,7 +426,7 @@ impl StreamState {
 
     /// `layoutInfo` for this epoch (9.4, frames.v4 only): the union of the
     /// members in global units fills the whole picture, upright.
-    fn send_canvas_layout(&mut self, cx: &Arc<Shared>) {
+    pub(super) fn send_canvas_layout(&mut self, cx: &Arc<Shared>) {
         let Some(run) = &self.canvas else {
             return;
         };

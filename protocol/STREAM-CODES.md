@@ -32,6 +32,7 @@ test checks against this file. The only code new in v1 is `session.stale`.
 | | `stream.encoder` | The encoder could not be created or re-created, or failed too often. |
 | | `stream.encode` | Encoding a frame failed unrecoverably. |
 | | `stream.sequence` | The stream's sequence or generation space is exhausted. |
+| | `stream.transport` | The stream lost its transport and got no new one in time. |
 | Canvas | `stream.firstFrame` | A canvas member produced no first image in time. |
 | | `stream.memberUnavailable` | A canvas member is unavailable. |
 | | `stream.layoutChanged` | The display layout changed under a canvas. |

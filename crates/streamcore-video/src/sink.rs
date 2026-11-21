@@ -141,6 +141,12 @@ pub trait SinkTransport: Send + Sync {
     fn link_stats(&self) -> Option<LinkStats> {
         None
     }
+    /// The transport is gone for good (its channel closed): a refusal or a
+    /// failure then parks the sink instead of counting as a lost frame, so the
+    /// stream waits for another transport (8.8). A leaf call.
+    fn closed(&self) -> bool {
+        false
+    }
 }
 
 /// One enqueued message's completions. Dropping it before [`Self::written`]
@@ -225,6 +231,9 @@ impl SinkTransport for ChannelTransport {
     }
     fn link_stats(&self) -> Option<LinkStats> {
         Some(self.0.link_stats())
+    }
+    fn closed(&self) -> bool {
+        self.0.is_closed()
     }
     fn enqueue(&self, frame: Vec<u8>, ticket: SendTicket) -> Result<(), SendTicket> {
         let pending = match self.0.enqueue_application_frame(frame) {
@@ -364,6 +373,8 @@ pub(crate) enum Shed {
 /// What the sink reports to the executor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SinkEvent {
+    /// The transport closed under the sink: it parked itself. Posted once.
+    Closed,
     /// A keyframe or an LTR refresh was written (it can end a recovery).
     Written { encoder: u64, sequence: u64 },
     /// Refused or failed by the transport (a loss).
@@ -548,6 +559,9 @@ const MAX_CAPACITY_BPS: u64 = 10_000_000_000;
 #[derive(Default)]
 struct Core {
     revoked: bool,
+    /// No transport to send on (detached, or its channel closed): nothing is
+    /// enqueued and pushed frames are dropped, until a rebind.
+    parked: bool,
     next_id: u64,
     queue: VecDeque<Queued>,
     transit: VecDeque<Transit>,
@@ -589,14 +603,35 @@ struct Snapshot {
     rtt_recent_ns: Option<u64>,
 }
 
-struct Inner {
+/// What a sink sends through: replaced as a whole when the stream moves to
+/// another transport ([`VideoSink::rebind`]).
+#[derive(Clone)]
+struct Link {
     transport: Arc<dyn SinkTransport>,
+    frames_v4: bool,
+    bucket_enabled: bool,
+    capacity_hint: Option<u64>,
+}
+
+impl Link {
+    fn new(output: &VideoOutput, medium_cap_bps: Option<u64>) -> Self {
+        Self {
+            frames_v4: output.transport.frames_v4(),
+            bucket_enabled: output.transport.bulk_bucket_enabled(),
+            transport: output.transport.clone(),
+            capacity_hint: output.capacity_bps.or(medium_cap_bps),
+        }
+    }
+}
+
+struct Inner {
+    /// A leaf lock: read (cloned) and released, never held across a call.
+    link: Mutex<Link>,
+    /// The plan's medium cap, for a rebind's capacity hint.
+    medium_cap_bps: Option<u64>,
     clock: Arc<dyn Clock>,
     executor: OnceLock<Weak<Shared>>,
     policy: SinkPolicy,
-    capacity_hint: Option<u64>,
-    frames_v4: bool,
-    bucket_enabled: bool,
     age_bound: bool,
     stream_id: u32,
     fps: AtomicU32,
@@ -632,13 +667,11 @@ impl VideoSink {
             || plan.extensions.contains(&FrameExtension::TemporalId);
         Self {
             inner: Arc::new_cyclic(|me| Inner {
-                frames_v4: output.transport.frames_v4(),
-                bucket_enabled: output.transport.bulk_bucket_enabled(),
-                transport: output.transport.clone(),
+                link: Mutex::new(Link::new(output, plan.medium_cap_bps)),
+                medium_cap_bps: plan.medium_cap_bps,
                 clock,
                 executor: OnceLock::new(),
                 policy: output.policy,
-                capacity_hint: output.capacity_bps.or(plan.medium_cap_bps),
                 age_bound: output.policy.delta_age_bound && confirmed,
                 stream_id,
                 fps: AtomicU32::new(plan.fps.max(1)),
@@ -662,12 +695,12 @@ impl VideoSink {
     }
 
     pub(crate) fn frames_v4(&self) -> bool {
-        self.inner.frames_v4
+        self.inner.frames_v4()
     }
 
     /// The bulk bucket is wanted but the channel does not run it.
     pub(crate) fn bucket_inactive(&self) -> bool {
-        self.inner.policy.bulk_bucket && !self.inner.bucket_enabled
+        self.inner.policy.bulk_bucket && !self.inner.bucket_enabled()
     }
 
     /// The delta age bound is in effect.
@@ -676,7 +709,7 @@ impl VideoSink {
     }
 
     pub(crate) fn now_us(&self) -> u64 {
-        self.inner.transport.now_us()
+        self.inner.transport().now_us()
     }
 
     pub(crate) fn set_fps(&self, fps: u32) {
@@ -696,7 +729,7 @@ impl VideoSink {
 
     /// The transport's link statistics. A leaf call.
     pub(crate) fn link_stats(&self) -> Option<LinkStats> {
-        self.inner.transport.link_stats()
+        self.inner.transport().link_stats()
     }
 
     /// Pairs each `(sequence, value)` of wire generation `generation` with
@@ -762,7 +795,7 @@ impl VideoSink {
     pub(crate) fn push(&self, unit: SinkUnit) -> Vec<SinkEvent> {
         let inner = &self.inner;
         let now = inner.clock.now_ns();
-        let h5_us = inner.transport.now_us();
+        let h5_us = inner.transport().now_us();
         inner.with_core(|core| {
             if core.revoked {
                 core.events.push(SinkEvent::Failed {
@@ -770,6 +803,11 @@ impl VideoSink {
                     sequence: unit.sequence,
                     keyframe: unit.keyframe,
                 });
+                return;
+            }
+            if core.parked {
+                // No transport: the frame goes nowhere, and that is not a loss.
+                // The rebind's keyframe restarts the picture.
                 return;
             }
             let bytes = unit.messages.iter().map(Vec::len).sum();
@@ -799,7 +837,7 @@ impl VideoSink {
     /// enqueued, and what happened to queued frames meanwhile.
     pub(crate) fn send_layout(&self, info: LayoutInfo) -> (bool, Vec<SinkEvent>) {
         let inner = &self.inner;
-        if !inner.frames_v4 {
+        if !inner.frames_v4() {
             return (false, Vec::new());
         }
         let info = LayoutInfo {
@@ -821,12 +859,69 @@ impl VideoSink {
             // Odd ids: only the frames' own tickets report outcomes.
             core.next_id += 2;
             let ticket = SendTicket::new(inner.me.clone(), core.next_id + 1);
-            match inner.transport.enqueue(message, ticket) {
+            match inner.transport().enqueue(message, ticket) {
                 Ok(()) => sent = true,
                 Err(ticket) => ticket.disarm(),
             }
         });
         (sent, events)
+    }
+
+    /// No transport for now (8.8, park): queued and in-flight frames are
+    /// dropped without being counted as lost, and nothing is enqueued until
+    /// [`Self::rebind`]. On the executor.
+    pub(crate) fn park(&self) {
+        let inner = &self.inner;
+        let _ = inner.with_core(|core| {
+            if !core.revoked {
+                inner.park(core);
+            }
+        });
+    }
+
+    /// Whether the sink is parked.
+    pub(crate) fn parked(&self) -> bool {
+        lock(&self.inner.core).parked
+    }
+
+    /// Moves the sink to another transport (8.8, attach): what was queued for
+    /// the old one is dropped, the post-encoder bounds and the link's
+    /// measurements start again, and frames flow to `output`. Completions that
+    /// still arrive from the old transport match nothing and are ignored. The
+    /// policy stays the stream's own. On the executor. Returns false when the
+    /// sink was revoked.
+    pub(crate) fn rebind(&self, output: &VideoOutput) -> bool {
+        let inner = &self.inner;
+        let old = inner.link();
+        let mut rebound = false;
+        let _ = inner.with_core(|core| {
+            if core.revoked {
+                return;
+            }
+            *lock(&inner.link) = Link::new(output, inner.medium_cap_bps);
+            core.parked = false;
+            core.queue.clear();
+            core.transit.clear();
+            core.unconsumed.clear();
+            core.rtt.clear();
+            core.pushed.clear();
+            core.capacity.clear();
+            core.sent.clear();
+            core.events.clear();
+            rebound = true;
+        });
+        if rebound {
+            *lock(&inner.rates) = None;
+            inner.waiting.store(false, Ordering::SeqCst);
+            // The old channel's bulk bucket no longer has video beside it.
+            if inner.policy.bulk_bucket
+                && old.bucket_enabled
+                && !Arc::ptr_eq(&old.transport, &output.transport)
+            {
+                old.transport.set_bulk_rate_inputs(0, 0);
+            }
+        }
+        rebound
     }
 
     /// Stop enqueuing for good: queued frames are dropped. Once this returns,
@@ -838,13 +933,29 @@ impl VideoSink {
             core.queue.clear();
             core.events.clear();
         });
-        if inner.policy.bulk_bucket && inner.bucket_enabled {
-            inner.transport.set_bulk_rate_inputs(0, 0);
+        if inner.policy.bulk_bucket && inner.bucket_enabled() {
+            inner.transport().set_bulk_rate_inputs(0, 0);
         }
     }
 }
 
 impl Inner {
+    fn link(&self) -> Link {
+        lock(&self.link).clone()
+    }
+
+    fn transport(&self) -> Arc<dyn SinkTransport> {
+        lock(&self.link).transport.clone()
+    }
+
+    fn frames_v4(&self) -> bool {
+        lock(&self.link).frames_v4
+    }
+
+    fn bucket_enabled(&self) -> bool {
+        lock(&self.link).bucket_enabled
+    }
+
     fn interval_ns(&self) -> u64 {
         1_000_000_000 / u64::from(self.fps.load(Ordering::Relaxed).max(1))
     }
@@ -862,7 +973,7 @@ impl Inner {
         let age_ns = snapshot.oldest_h5_ns.map_or(0, |h5| now.saturating_sub(h5));
         let backpressured = (snapshot.unsent > 0 && age_ns > self.interval_ns())
             || snapshot.unconsumed > self.unconsumed_bound(snapshot.rtt_ns)
-            || self.transport.backpressured();
+            || self.transport().backpressured();
         SinkState {
             unsent_frames: snapshot.unsent,
             oldest_unsent_age_ms: u32::try_from(age_ns / 1_000_000).unwrap_or(u32::MAX),
@@ -916,7 +1027,7 @@ impl Inner {
         IN_SINK.with(|flag| flag.set(nested));
         *lock(&self.snapshot) = snapshot;
         if let Some((capacity, video)) = rates {
-            self.transport.set_bulk_rate_inputs(capacity, video);
+            self.transport().set_bulk_rate_inputs(capacity, video);
         }
         events
     }
@@ -944,6 +1055,23 @@ impl Inner {
         };
         for event in events {
             executor.post(Event::Sink(event));
+        }
+    }
+
+    /// Drops what is queued or in transit and stops enqueuing: there is no
+    /// transport. Nothing dropped here is reported as failed or shed.
+    fn park(&self, core: &mut Core) {
+        core.parked = true;
+        core.queue.clear();
+        core.transit.clear();
+        core.unconsumed.clear();
+    }
+
+    /// The transport closed under the sink: park, and say so once.
+    fn park_closed(&self, core: &mut Core) {
+        if !core.parked && !core.revoked {
+            self.park(core);
+            core.events.push(SinkEvent::Closed);
         }
     }
 
@@ -994,7 +1122,7 @@ impl Inner {
     /// Enqueue queued frames while the multiplexer holds none of this sink's
     /// (bounds on), or all of them (bounds off).
     fn pump(&self, core: &mut Core, now: u64) {
-        while !core.revoked && (!self.policy.bounds || core.transit.is_empty()) {
+        while !core.revoked && !core.parked && (!self.policy.bounds || core.transit.is_empty()) {
             let Some(queued) = core.queue.pop_front() else {
                 return;
             };
@@ -1014,7 +1142,7 @@ impl Inner {
                 let ticket_id = if index + 1 == count { id } else { id + 1 };
                 let ticket = SendTicket::new(self.me.clone(), ticket_id);
                 core.stats.messages += 1;
-                if let Err(ticket) = self.transport.enqueue(message, ticket) {
+                if let Err(ticket) = self.transport().enqueue(message, ticket) {
                     // Refused at once: the frame is lost; nothing else of it
                     // is enqueued.
                     ticket.disarm();
@@ -1023,6 +1151,10 @@ impl Inner {
                 }
             }
             if refused {
+                if self.transport().closed() {
+                    self.park_closed(core);
+                    return;
+                }
                 core.stats.refused += 1;
                 core.events.push(SinkEvent::Failed {
                     encoder: unit.encoder,
@@ -1091,6 +1223,10 @@ impl Inner {
                 let Some(transit) = core.transit.remove(index) else {
                     return;
                 };
+                if self.transport().closed() {
+                    self.park_closed(core);
+                    return;
+                }
                 core.stats.refused += 1;
                 core.events.push(SinkEvent::Failed {
                     encoder: transit.encoder,
@@ -1124,7 +1260,7 @@ impl Inner {
     /// `frameTiming` (`0x14`) for every Nth written frame, under frames.v4.
     fn frame_timing(&self, core: &mut Core, transit: &Transit, at_us: Option<u64>) {
         let every = u64::from(self.policy.frame_timing_every);
-        if !self.frames_v4
+        if !self.frames_v4()
             || every == 0
             || !core.written_frames.is_multiple_of(every)
             || core.revoked
@@ -1132,7 +1268,7 @@ impl Inner {
             return;
         }
         let h6_us = at_us
-            .unwrap_or_else(|| self.transport.now_us())
+            .unwrap_or_else(|| self.transport().now_us())
             .max(transit.h5_us);
         let backpressured = core
             .queue
@@ -1155,7 +1291,7 @@ impl Inner {
         message.extend(body);
         core.next_id += 2;
         let ticket = SendTicket::new(self.me.clone(), core.next_id + 1);
-        match self.transport.enqueue(message, ticket) {
+        match self.transport().enqueue(message, ticket) {
             Ok(()) => core.stats.frame_timing_sent += 1,
             Err(ticket) => ticket.disarm(),
         }
@@ -1194,7 +1330,7 @@ impl Inner {
         } else {
             measured
         };
-        let (capacity, estimated) = match self.capacity_hint {
+        let (capacity, estimated) = match self.link().capacity_hint {
             Some(hint) => (hint, false),
             None => (
                 core.capacity.iter().map(|(_, bps)| *bps).max().unwrap_or(0),
@@ -1212,7 +1348,7 @@ impl Inner {
         core.stats.bulk_video_bps = video;
         core.stats.capacity_bps = capacity;
         core.stats.capacity_estimated = estimated;
-        if !self.policy.bulk_bucket || !self.bucket_enabled || core.revoked || capacity == 0 {
+        if !self.policy.bulk_bucket || !self.bucket_enabled() || core.revoked || capacity == 0 {
             return None;
         }
         let mut last = lock(&self.rates);

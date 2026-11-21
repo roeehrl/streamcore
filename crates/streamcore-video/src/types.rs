@@ -874,6 +874,16 @@ pub struct StatsSnapshot {
     /// `EncoderFactory::create` calls that overran their bound.
     pub create_timeouts: u64,
     pub stale_events: u64,
+    /// Times the stream parked without a transport (8.8).
+    #[uniffi(default = 0)]
+    pub transport_parks: u64,
+    /// Transports attached after the first (8.8).
+    #[uniffi(default = 0)]
+    pub transport_attaches: u64,
+    /// Encoded frames dropped because their transport was gone (8.8): not
+    /// lost, the keyframe after the attach replaces them.
+    #[uniffi(default = 0)]
+    pub handover_dropped: u64,
     pub wire_generation: u64,
     /// Skip cause (a): frames the capture backend dropped unseen
     /// ([`crate::CaptureEvents::skipped`]).
@@ -1091,6 +1101,14 @@ pub enum ObserverJob {
     EncoderFailed {
         error: MediaError,
     },
+    /// The stream has no transport (8.8) and sends nothing until
+    /// [`crate::StreamController::attach_transport`]: after
+    /// `detach_transport`, or (`closed`) because its channel closed. Without
+    /// an attach within `StreamTimings::park_ns` it fails with
+    /// `stream.transport`.
+    TransportParked {
+        closed: bool,
+    },
     Stats {
         snapshot: StatsSnapshot,
     },
@@ -1131,6 +1149,10 @@ pub struct StreamTimings {
     /// for a session (MFT activation or an NVENC open can take over a second
     /// the first time), else the stream reports `stream.encoder`.
     pub create_bound_ns: u64,
+    /// How long a parked stream (8.8: detached, or its channel closed) waits
+    /// for a transport before it fails with `stream.transport` (3 s).
+    #[uniffi(default = 3_000_000_000)]
+    pub park_ns: u64,
 }
 
 impl Default for StreamTimings {
@@ -1142,6 +1164,7 @@ impl Default for StreamTimings {
             recovery_interval_ns: 500_000_000,
             invalidate_bound_ns: 500_000_000,
             create_bound_ns: 3_000_000_000,
+            park_ns: 3_000_000_000,
         }
     }
 }

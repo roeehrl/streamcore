@@ -63,6 +63,10 @@ pub(crate) enum Command {
     ClientFeedback(ClientFeedback),
     /// The stream moved to another transport.
     TransportChanged,
+    /// The transport is going away: park (8.8).
+    DetachTransport,
+    /// Send on this output from now on (8.8).
+    AttachTransport(OpToken, Arc<crate::sink::VideoOutput>),
     Revoked,
     Stats,
 }
@@ -116,6 +120,8 @@ enum TimerKind {
     /// Keep-warm (6.3.1): re-encode the latest image if nothing was submitted
     /// for a refresh interval.
     KeepWarm,
+    /// A parked stream got no transport in time (8.8).
+    Park,
 }
 
 struct EncoderSlot {
@@ -240,6 +246,14 @@ pub(crate) struct StreamState {
     /// A recovery waits for the sink to leave backpressure: it runs on the
     /// sink's next report that finds it ready.
     recovery_wait_ready: bool,
+
+    /// Parked (8.8): no transport to send on. Nothing is submitted, and what
+    /// the encoder still returns is dropped without counting as lost.
+    parked: bool,
+    park_timer: Option<TimerToken>,
+    /// The newest frame submitted before the last park or attach: it and
+    /// everything before it belong to the old transport.
+    fence_seq: u64,
 
     /// Keep-warm (6.3.1): until this executor time, and its timer.
     keep_warm_until: u64,
@@ -477,6 +491,9 @@ impl StreamState {
             in_flight: BTreeMap::new(),
             packetizer: VideoPacketizer::new(stream_id),
             last_config: None,
+            parked: false,
+            park_timer: None,
+            fence_seq: 0,
             submitted_seq: 0,
             delivered_keyframe: 0,
             lost_seq: 0,
@@ -780,6 +797,8 @@ impl StreamState {
                 self.ltr.pending_ack = None;
                 self.ltr.min_seq = self.submitted_seq;
             }
+            Command::DetachTransport => self.park(cx, false),
+            Command::AttachTransport(op, output) => self.attach(cx, op, &output),
             Command::Revoked => {
                 self.cancel_pace();
                 self.stop_keep_warm();
@@ -1271,6 +1290,14 @@ impl StreamState {
                     self.keep_warm_tick(cx);
                 }
             }
+            TimerKind::Park => {
+                if self.park_timer == Some(token) {
+                    self.park_timer = None;
+                    if self.parked {
+                        self.fail(cx, codes::TRANSPORT);
+                    }
+                }
+            }
         }
     }
 
@@ -1580,6 +1607,85 @@ impl StreamState {
     }
 
     // -----------------------------------------------------------------------
+    // Transport handover (8.8).
+
+    /// No transport to send on: by `detach_transport`, or (`closed`) because
+    /// the sink found its channel closed. Capture and the encoder session stay;
+    /// nothing is submitted until an attach. A stream still parked after
+    /// `StreamTimings::park_ns` fails with `stream.transport`.
+    fn park(&mut self, cx: &Arc<Shared>, closed: bool) {
+        if self.closing || cx.revoked() || self.parked {
+            return;
+        }
+        self.parked = true;
+        self.fence_seq = self.submitted_seq;
+        self.stats.transport_parks += 1;
+        debug_assert!(is_current(cx.id));
+        cx.sink.park();
+        self.cancel_pace();
+        self.stop_keep_warm();
+        self.drop_recovery();
+        self.park_timer = Some(self.set_timer(cx, self.timings.park_ns, TimerKind::Park));
+        self.notify(cx, ObserverJob::TransportParked { closed });
+    }
+
+    /// Frames go to `output` from now on, parked or not. What was queued or in
+    /// the encoder for the old transport is dropped without counting as lost;
+    /// the next frame is a keyframe in the same wire generation, of the latest
+    /// image when there is one.
+    fn attach(&mut self, cx: &Arc<Shared>, op: OpToken, output: &crate::sink::VideoOutput) {
+        debug_assert!(is_current(cx.id));
+        if self.closing || cx.revoked() || !cx.sink.rebind(output) {
+            self.reply(cx, op, Self::rejected(codes::CANCELLED));
+            return;
+        }
+        let was_parked = std::mem::replace(&mut self.parked, false);
+        self.park_timer = None;
+        self.cancel_timers(|kind| *kind == TimerKind::Park);
+        self.fence_seq = self.submitted_seq;
+        self.stats.transport_attaches += 1;
+        self.cancel_pace();
+        self.drop_recovery();
+        // Acks and delay figures of the old transport no longer count.
+        self.ltr.acked = None;
+        self.ltr.pending_ack = None;
+        self.ltr.min_seq = self.submitted_seq;
+        // Rate adaptation keeps its target and learns the new path's delays.
+        if let Some(abr) = &mut self.abr {
+            abr.reset_delay();
+        }
+        // One keyframe opens the new transport, in the same wire generation:
+        // the peer kept its decoder, and a keyframe after a gap decodes.
+        self.force_keyframe = true;
+        if was_parked || self.latest.is_some() {
+            let now = cx.clock.now_ns();
+            let restamp = self
+                .time_anchor
+                .map(|(host, local)| host.saturating_add(now.saturating_sub(local)));
+            if let Some(latest) = &mut self.latest {
+                latest.pending = true;
+                latest.admitted = true;
+                latest.restamp = restamp;
+            }
+        }
+        self.reply(cx, op, OpOutcome::Completed);
+        self.send_canvas_layout(cx);
+        self.submit_due(cx);
+    }
+
+    /// Forget every loss and pending recovery: they concern a transport the
+    /// stream no longer sends on.
+    fn drop_recovery(&mut self) {
+        self.clear_recovery();
+        self.ltr.force_refresh = false;
+    }
+
+    /// Whether `seq` was submitted for a transport the stream left.
+    fn fenced(&self, seq: u64) -> bool {
+        self.parked || seq <= self.fence_seq
+    }
+
+    // -----------------------------------------------------------------------
     // Frames, admission and submit.
 
     fn accepts_frames(&self) -> bool {
@@ -1686,7 +1792,7 @@ impl StreamState {
 
     /// The only caller of `convert` and `submit`.
     fn submit_due(&mut self, cx: &Arc<Shared>) {
-        if self.closing || cx.revoked() || self.recreate_scheduled || self.stalled {
+        if self.closing || cx.revoked() || self.recreate_scheduled || self.stalled || self.parked {
             return;
         }
         let Some(slot) = &self.encoder else {
@@ -1952,6 +2058,7 @@ impl StreamState {
             || cx.revoked()
             || !self.accepts_frames()
             || self.encoder.is_none()
+            || self.parked
         {
             return;
         }
@@ -2062,6 +2169,25 @@ impl StreamState {
         // (not cloned per frame).
         let new_config = frame.config_token.and_then(|token| sink.take(token));
         let needs_config = slot.needs_config;
+        if self.fenced(frame.submit_seq) {
+            // Encoded for a transport the stream left (8.8): not sent and not
+            // a loss. The keyframe after the attach replaces it.
+            if let Some(config) = new_config
+                && self.last_config.as_ref() != Some(&config)
+            {
+                // Its configuration was never sent: the next keyframe carries it.
+                self.last_config = Some(config);
+                if let Some(slot) = &mut self.encoder {
+                    slot.needs_config = true;
+                }
+            }
+            if let Some(entry) = entry {
+                entry.finish();
+            }
+            self.stats.handover_dropped += 1;
+            self.submit_due(cx);
+            return;
+        }
         let Some(payload) = payload else {
             // The bytes never arrived: a loss.
             if let Some(entry) = entry {
@@ -2283,10 +2409,19 @@ impl StreamState {
         use crate::sink::{Shed, SinkEvent};
         let current = |encoder| !self.closing && self.is_current_encoder(encoder);
         match event {
+            SinkEvent::Closed => {
+                // The channel closed under the sink: an implicit park (8.8).
+                // A report that an attach overtook is about the old transport.
+                if cx.sink.parked() {
+                    self.park(cx, true);
+                }
+                return;
+            }
             SinkEvent::Written { encoder, sequence } => {
                 // A keyframe or an LTR refresh: nothing before it is referenced
-                // any more.
-                if current(encoder) {
+                // any more. A report from a transport the stream left says
+                // nothing about this one.
+                if current(encoder) && !self.fenced(sequence) {
                     self.delivered_keyframe = self.delivered_keyframe.max(sequence);
                     // One submitted before the loss cannot end its recovery.
                     if sequence > self.lost_seq {
@@ -2302,7 +2437,7 @@ impl StreamState {
                 sequence,
                 keyframe,
             } => {
-                if current(encoder) {
+                if current(encoder) && !self.fenced(sequence) {
                     self.stats.packets_refused += 1;
                     if !keyframe {
                         self.stats.sender_shed += 1;
@@ -2318,7 +2453,7 @@ impl StreamState {
             } => {
                 // A discardable frame breaks no chain; a superseded one is
                 // covered by the newer keyframe. Only an aged delta is a loss.
-                if why == Shed::Aged && current(encoder) {
+                if why == Shed::Aged && current(encoder) && !self.fenced(sequence) {
                     self.stats.sender_shed += 1;
                     self.ltr_refresh_lost(cx, sequence);
                     self.record_loss(cx, sequence);
@@ -2463,7 +2598,7 @@ impl StreamState {
     }
 
     fn record_loss(&mut self, cx: &Shared, seq: u64) {
-        if seq <= self.delivered_keyframe {
+        if seq <= self.delivered_keyframe || self.fenced(seq) {
             return;
         }
         self.lost_seq = self.lost_seq.max(seq);
@@ -2513,7 +2648,7 @@ impl StreamState {
     /// The client may have lost its references (a new decoder), so it gets an
     /// IDR and acknowledges LTR frames again afterwards.
     fn request_recovery(&mut self, cx: &Arc<Shared>) {
-        if cx.revoked() || self.closing || self.encoder.is_none() {
+        if cx.revoked() || self.closing || self.encoder.is_none() || self.parked {
             return;
         }
         self.ltr.acked = None;
@@ -2525,7 +2660,12 @@ impl StreamState {
     }
 
     fn recover(&mut self, cx: &Arc<Shared>) {
-        if cx.revoked() || self.closing || !self.recovery_needed || self.encoder.is_none() {
+        if cx.revoked()
+            || self.closing
+            || !self.recovery_needed
+            || self.encoder.is_none()
+            || self.parked
+        {
             return;
         }
         let now = cx.clock.now_ns();
@@ -2631,6 +2771,11 @@ impl StreamState {
             || cx.revoked()
             || !matches!(self.phase, StreamPhase::Running | StreamPhase::Updating)
         {
+            return;
+        }
+        if self.parked {
+            // No link to measure: the target stays until an attach.
+            self.arm_abr(cx);
             return;
         }
         let now = cx.clock.now_ns();

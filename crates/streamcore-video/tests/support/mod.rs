@@ -963,6 +963,8 @@ pub struct FakeOut {
     pub held_consumed: Mutex<Vec<SendTicket>>,
     /// Refuse every enqueue.
     pub refuse: AtomicBool,
+    /// The channel closed: every enqueue is refused and `closed` says so.
+    pub closed: AtomicBool,
     pub frames_v4: AtomicBool,
     pub bucket: AtomicBool,
     pub now_us: AtomicU64,
@@ -978,6 +980,7 @@ impl FakeOut {
             hold_consumed: AtomicBool::new(false),
             held_consumed: Mutex::new(Vec::new()),
             refuse: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             frames_v4: AtomicBool::new(false),
             bucket: AtomicBool::new(false),
             now_us: AtomicU64::new(1_000_000),
@@ -1061,13 +1064,16 @@ impl SinkTransport for FakeOut {
     fn backpressured(&self) -> bool {
         self.pressured.load(Ordering::SeqCst)
     }
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
     fn enqueue(&self, message: Vec<u8>, ticket: SendTicket) -> Result<(), SendTicket> {
         // A leaf call: any thread (the sink enqueues from write completions),
         // never after Closed.
         if self.log.closed.load(Ordering::SeqCst) {
             self.log.after_close.fetch_add(1, Ordering::SeqCst);
         }
-        if self.refuse.load(Ordering::SeqCst) {
+        if self.refuse.load(Ordering::SeqCst) || self.closed.load(Ordering::SeqCst) {
             return Err(ticket);
         }
         assert!(message.len() > 5);

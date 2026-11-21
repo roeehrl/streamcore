@@ -61,6 +61,8 @@ pub mod codes {
     pub const ENCODER: &str = "stream.encoder";
     pub const ENCODE: &str = "stream.encode";
     pub const SEQUENCE: &str = "stream.sequence";
+    /// A parked stream got no transport in time (8.8).
+    pub const TRANSPORT: &str = "stream.transport";
     // Canvas.
     pub const FIRST_FRAME: &str = "stream.firstFrame";
     pub const MEMBER_UNAVAILABLE: &str = "stream.memberUnavailable";
@@ -97,6 +99,7 @@ pub mod codes {
         ENCODER,
         ENCODE,
         SEQUENCE,
+        TRANSPORT,
         FIRST_FRAME,
         MEMBER_UNAVAILABLE,
         LAYOUT_CHANGED,
