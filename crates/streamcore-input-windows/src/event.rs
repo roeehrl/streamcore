@@ -112,6 +112,13 @@ pub struct UnavailableKey {
     pub notice: Option<ServerNotice>,
 }
 
+/// What a text event costs against the injector's text limit: the UTF-16 units it types plus
+/// the characters it deletes first, each of which is a key to tap.
+pub(crate) fn text_units(message: &TextMessage) -> usize {
+    let deleted = usize::try_from(message.replace_before).unwrap_or(usize::MAX);
+    message.text.encode_utf16().count().saturating_add(deleted)
+}
+
 /// What the injector tells the host. Injection is asynchronous, so outcomes that matter to the
 /// host come back this way.
 #[derive(Debug, Clone, PartialEq)]
@@ -140,11 +147,21 @@ impl<F: Fn(Feedback) + Send + 'static> FeedbackSink for F {
     }
 }
 
-/// Why an event was not accepted.
+/// Why an event was not queued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectError {
     /// The lease was revoked, or belongs to another injector.
     StaleLease,
+    /// The queue is full and this event was a pointer move (a hover, a move of a stroke or of
+    /// touch contacts, a scroll, a pan or a pinch change), so it was dropped. The lease is still
+    /// good and nothing is held because of it; the next move carries on.
+    Dropped,
+    /// The queue is full, or too much text is waiting, and this event could not be dropped
+    /// without losing a key-up or a release. The lease has been revoked, everything queued was
+    /// discarded and everything held is being released, as after
+    /// [`InputLease::revoke`](crate::InputLease::revoke). Nothing of the event was injected: text
+    /// is never cut short. The host takes a new lease when its client is ready again.
+    Overflow,
     /// The injection thread has stopped.
     Stopped,
 }
@@ -153,6 +170,8 @@ impl fmt::Display for InjectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::StaleLease => write!(f, "the input lease is stale"),
+            Self::Dropped => write!(f, "the input queue is full; a pointer move was dropped"),
+            Self::Overflow => write!(f, "the input queue overflowed; the lease was revoked"),
             Self::Stopped => write!(f, "the injection thread has stopped"),
         }
     }

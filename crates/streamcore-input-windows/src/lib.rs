@@ -18,7 +18,9 @@
 //! event. Only the holder of the [`InputLease`] may inject: the lease is exclusive and revocable,
 //! and revoking it releases every key, button and contact that is held.
 //!
-//! Injection runs on the injector's own thread; [`Injector::inject`] posts and returns.
+//! Injection runs on the injector's own thread; [`Injector::inject`] queues and returns. The queue
+//! is bounded: under pressure pointer moves are merged or dropped, and an event that may not be
+//! dropped and does not fit revokes the lease and releases everything, so nothing stays held.
 //!
 //! The rules (key tables, layout mapping, pacing, the pen and touch sessions, the lease,
 //! coordinate mapping and what is held) are portable and tested on every platform, behind the
@@ -36,6 +38,7 @@ pub mod touch;
 mod engine;
 mod event;
 mod injector;
+mod queue;
 
 #[cfg(windows)]
 mod win;
@@ -49,4 +52,5 @@ pub use geometry::{TargetRect, VirtualScreen};
 pub use injector::{Capabilities, Injector, InputLease};
 pub use layout::{HostKeyState, KeyLayout, KeyStroke, KeyUnavailable};
 pub use pen::PenFrame;
+pub use queue::{MAX_PENDING_OPERATIONS, MAX_PENDING_TEXT_UNITS};
 pub use touch::Contacts;

@@ -17,7 +17,7 @@ use streamcore_input::{
 
 use crate::event::{
     ClickEvent, Feedback, FeedbackSink, InputEvent, PanDragEvent, PenEvent, ScrollEvent,
-    TouchEvent, UnavailableKey, ZoomEvent,
+    TouchEvent, UnavailableKey, ZoomEvent, text_units,
 };
 use crate::geometry::{self, VirtualScreen, ZoomNotches};
 use crate::keys;
@@ -196,6 +196,10 @@ pub(crate) struct Engine<B: Backend> {
     /// The paced steps of the job in progress.
     program: VecDeque<(Pace, Vec<SendOp>)>,
     pacer: KeyPacer,
+    /// The text units ([`text_units`]) of the text events waiting in `jobs`.
+    text_waiting: usize,
+    /// The text units of the text being typed; it counts in full until its last key is up.
+    text_typing: usize,
 }
 
 impl<B: Backend> Engine<B> {
@@ -214,6 +218,8 @@ impl<B: Backend> Engine<B> {
             jobs: VecDeque::new(),
             program: VecDeque::new(),
             pacer: KeyPacer::default(),
+            text_waiting: 0,
+            text_typing: 0,
         }
     }
 
@@ -233,7 +239,10 @@ impl<B: Backend> Engine<B> {
             InputEvent::Key(packet) => self.jobs.push_back(KeyJob::Key(packet)),
             InputEvent::KeyTap(key) => self.jobs.push_back(KeyJob::Tap(key)),
             InputEvent::KeyShortcut(message) => self.jobs.push_back(KeyJob::Shortcut(message)),
-            InputEvent::Text(message) => self.jobs.push_back(KeyJob::Text(message)),
+            InputEvent::Text(message) => {
+                self.text_waiting += text_units(&message);
+                self.jobs.push_back(KeyJob::Text(message));
+            }
         }
         self.tick(now);
     }
@@ -246,6 +255,15 @@ impl<B: Backend> Engine<B> {
         self.touch.tick(now, &mut |flags, contacts| {
             backend.inject_touch(flags, contacts)
         });
+    }
+
+    /// The key work not finished yet, as (operations, text units): the key events waiting their
+    /// turn plus the one in progress. The injector counts it against its queue limits.
+    pub(crate) fn backlog(&self) -> (usize, usize) {
+        (
+            self.jobs.len() + usize::from(!self.program.is_empty()),
+            self.text_waiting + self.text_typing,
+        )
     }
 
     /// When [`tick`](Self::tick) next has something to do.
@@ -278,6 +296,8 @@ impl<B: Backend> Engine<B> {
         }
         self.program.clear();
         self.jobs.clear();
+        self.text_waiting = 0;
+        self.text_typing = 0;
         for held in std::mem::take(&mut self.keyboard.shortcuts) {
             ops.push(stroke_op(held.key, true));
             self.add_modifiers(&mut ops, held.pressed, false);
@@ -609,15 +629,21 @@ impl<B: Backend> Engine<B> {
                     self.send(&ops);
                     self.pacer.ran(pace, now);
                 }
-            } else if let Some(job) = self.jobs.pop_front() {
-                match job {
-                    KeyJob::Key(packet) => self.key(packet),
-                    KeyJob::Tap(key) => self.key_tap(key),
-                    KeyJob::Shortcut(message) => self.key_shortcut(message, now),
-                    KeyJob::Text(message) => self.type_text(&message.text, message.replace_before),
-                }
             } else {
-                return;
+                // The job in progress has finished.
+                self.text_typing = 0;
+                match self.jobs.pop_front() {
+                    Some(KeyJob::Key(packet)) => self.key(packet),
+                    Some(KeyJob::Tap(key)) => self.key_tap(key),
+                    Some(KeyJob::Shortcut(message)) => self.key_shortcut(message, now),
+                    Some(KeyJob::Text(message)) => {
+                        let units = text_units(&message);
+                        self.text_waiting = self.text_waiting.saturating_sub(units);
+                        self.text_typing = units;
+                        self.type_text(&message.text, message.replace_before);
+                    }
+                    None => return,
+                }
             }
         }
     }
@@ -1919,6 +1945,30 @@ mod tests {
                 up: false
             }]]
         );
+    }
+
+    #[test]
+    fn the_backlog_counts_key_work_until_it_is_done() {
+        let mut rig = Rig::new();
+        assert_eq!(rig.engine.backlog(), (0, 0));
+        rig.text("ab", 0);
+        rig.text("cde", 0);
+        rig.key(HID_A, true, 0, 0);
+        // "ab" is being typed and counts in full; "cde" and the key wait behind it.
+        assert_eq!(rig.engine.backlog(), (3, 5));
+        rig.engine.tick(10);
+        rig.engine.tick(20);
+        assert_eq!(rig.engine.backlog(), (3, 5));
+        // Its last key is up: the next text starts, and the key still waits.
+        rig.engine.tick(30);
+        assert_eq!(rig.engine.backlog(), (2, 3));
+        for now in (50..=100).step_by(10) {
+            rig.engine.tick(now);
+        }
+        assert_eq!(rig.engine.backlog(), (0, 0));
+        rig.text("abc", 200);
+        rig.engine.release_all();
+        assert_eq!(rig.engine.backlog(), (0, 0));
     }
 
     // Release.
