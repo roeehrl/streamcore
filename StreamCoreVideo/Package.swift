@@ -8,7 +8,12 @@ import PackageDescription
 let package = Package(
     name: "StreamCoreVideo",
     platforms: [.macOS("15.0"), .iOS("18.0")],
-    products: [.library(name: "StreamCoreVideo", targets: ["StreamCoreVideo"])],
+    products: [
+        .library(name: "StreamCoreVideo", targets: ["StreamCoreVideo"]),
+        // The Apple host media code (design 4.1): the surface store, the VideoToolbox
+        // encoder and its probe.
+        .library(name: "StreamCoreAppleHost", targets: ["StreamCoreAppleHost"]),
+    ],
     targets: [
         .binaryTarget(name: "streamcore_videoFFI", path: "Artifacts/StreamCoreVideoFFI.xcframework"),
         // UniFFI 0.32.2's Swift for async foreign-trait methods (`AsyncProbe`) fails Swift 6's
@@ -17,5 +22,7 @@ let package = Package(
         .target(name: "StreamCoreVideo", dependencies: ["streamcore_videoFFI"],
                 swiftSettings: [.swiftLanguageMode(.v5)]),
         .testTarget(name: "StreamCoreVideoTests", dependencies: ["StreamCoreVideo"]),
+        .target(name: "StreamCoreAppleHost", dependencies: ["StreamCoreVideo"]),
+        .testTarget(name: "StreamCoreAppleHostTests", dependencies: ["StreamCoreAppleHost"]),
     ]
 )
