@@ -7,6 +7,19 @@ import Foundation
 /// The native monotonic clock every stage time uses (nanoseconds; mach uptime on Apple).
 public enum MediaClock {
     @inline(__always) public static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
+    #if canImport(Darwin)
+    /// Mach absolute-time ticks (such as ScreenCaptureKit's display time) in nanoseconds.
+    public static func nanoseconds(machTicks ticks: UInt64) -> UInt64 {
+        let (numer, denom) = timebase
+        return UInt64((Double(ticks) * Double(numer) / Double(denom)).rounded())
+    }
+    private static let timebase: (UInt32, UInt32) = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return (info.numer, max(1, info.denom))
+    }()
+    #endif
 }
 
 /// What a submit of an image already submitted once is. StreamCore decides; the encoder
