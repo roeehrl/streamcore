@@ -6,7 +6,8 @@
 //!
 //! It opens its own window with a multi-line edit control, injects into it through an
 //! [`Injector`](streamcore_input_windows::Injector) and reads back what arrived. Every check
-//! prints `PASS name`, `FAIL name: detail` or `SKIP name: reason`; the last line is
+//! prints `PASS name`, `FAIL name: detail` or `SKIP name: reason` (an `INFO` line is not a check);
+//! the last line is
 //! `SELFTEST n passed, m failed`, and the exit code is 0 only when nothing failed. `--out <path>`
 //! writes the same lines to a file, for a launch with no console.
 //!
@@ -64,6 +65,7 @@ mod selftest {
         GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
     };
     use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Controls::EM_GETSEL;
     use windows::Win32::UI::HiDpi::{
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
@@ -94,6 +96,10 @@ mod selftest {
     const ARRIVAL: Duration = Duration::from_secs(4);
     /// How long to watch for input that should not arrive.
     const SETTLE: Duration = Duration::from_millis(300);
+
+    /// What the edit control holds after "line one", Return, "line two", and its length.
+    const TWO_LINES: &str = "line one\r\nline two";
+    const TWO_LINES_LENGTH: u32 = 18;
 
     /// The edit control, for the window procedure (a window handle as an integer).
     static EDIT: AtomicIsize = AtomicIsize::new(0);
@@ -296,6 +302,23 @@ mod selftest {
         // SAFETY: the string is NUL-terminated and outlives the call, which the window's own
         // thread handles.
         let _ = unsafe { SetWindowTextW(edit, &HSTRING::from(text)) };
+    }
+
+    /// The edit control's selection as (start, end) in UTF-16 units; equal for a bare caret.
+    fn selection(edit: HWND) -> (u32, u32) {
+        let (mut start, mut end) = (0u32, 0u32);
+        // SAFETY: EM_GETSEL writes two 32-bit values through the pointers passed as its
+        // parameters; both locals outlive the call, which the control's own thread (in this
+        // process) answers before SendMessageW returns.
+        unsafe {
+            SendMessageW(
+                edit,
+                EM_GETSEL,
+                Some(WPARAM(&raw mut start as usize)),
+                Some(LPARAM(&raw mut end as isize)),
+            );
+        }
+        (start, end)
     }
 
     /// The keyboard layout of the window's thread, as the low 32 bits of its handle.
@@ -723,31 +746,144 @@ mod selftest {
             Ok(String::new())
         }
 
-        fn select_all_delete(&self) -> Outcome {
+        /// Runs a shortcut check. When it fails, the detail also carries every feedback the
+        /// injector gave during it and which modifiers are down right after it, so an
+        /// unavailable key or a stuck or missing modifier shows.
+        fn shortcut_check(&self, body: impl FnOnce() -> Outcome) -> Outcome {
+            self.take_feedback();
+            body().map_err(|problem| match problem {
+                Problem::Failed(detail) => {
+                    let heard = self.take_feedback();
+                    Problem::Failed(format!(
+                        "{detail}; feedback during the check: {heard:?}; modifiers down after it: \
+                         Ctrl {}, Shift {}, Alt {}",
+                        key_is_down(VK_CONTROL),
+                        key_is_down(VK_SHIFT),
+                        key_is_down(VK_MENU),
+                    ))
+                }
+                skipped => skipped,
+            })
+        }
+
+        /// Waits until the edit control's selection is `want` (start, end; equal for a bare
+        /// caret).
+        fn expect_selection(&self, want: (u32, u32)) -> Result<(), Problem> {
+            let started = Instant::now();
+            while selection(self.edit) != want {
+                if started.elapsed() > ARRIVAL {
+                    let got = selection(self.edit);
+                    return fail(format!("expected the selection {want:?}, it is {got:?}"));
+                }
+                sleep(Duration::from_millis(10));
+            }
+            Ok(())
+        }
+
+        /// Types the two lines the caret checks move in, leaving the caret at the end.
+        fn type_two_lines(&self) -> Result<(), Problem> {
             self.need_focus()?;
             self.clear();
-            self.inject(text("to be deleted"))?;
-            self.expect_text("to be deleted")?;
-            self.inject(tap(KeySpec::char_with_hid("a", HID_A), CONTROL))?;
-            self.inject(tap(KeySpec::named(NamedKey::Delete), 0))?;
-            self.expect_text("")?;
-            Ok(String::new())
+            self.inject(text("line one\nline two"))?;
+            self.expect_text(TWO_LINES)
+        }
+
+        fn ctrl_home(&self) -> Outcome {
+            self.shortcut_check(|| {
+                self.type_two_lines()?;
+                self.expect_selection((TWO_LINES_LENGTH, TWO_LINES_LENGTH))?;
+                self.inject(tap(KeySpec::named(NamedKey::Home), CONTROL))?;
+                // A plain Home would stop at the start of the second line (10).
+                self.expect_selection((0, 0))?;
+                Ok(String::new())
+            })
+        }
+
+        fn ctrl_end(&self) -> Outcome {
+            self.shortcut_check(|| {
+                self.type_two_lines()?;
+                self.inject(tap(KeySpec::named(NamedKey::Home), CONTROL))?;
+                self.expect_selection((0, 0))?;
+                self.inject(tap(KeySpec::named(NamedKey::End), CONTROL))?;
+                // A plain End would stop at the end of the first line (8).
+                self.expect_selection((TWO_LINES_LENGTH, TWO_LINES_LENGTH))?;
+                Ok(String::new())
+            })
+        }
+
+        fn shift_select(&self) -> Outcome {
+            self.shortcut_check(|| {
+                self.type_two_lines()?;
+                self.inject(tap(KeySpec::named(NamedKey::End), CONTROL))?;
+                self.inject(tap(KeySpec::named(NamedKey::Home), CONTROL | SHIFT))?;
+                self.expect_selection((0, TWO_LINES_LENGTH))?;
+                self.inject(tap(KeySpec::named(NamedKey::Delete), 0))?;
+                self.expect_text("")?;
+                Ok(String::new())
+            })
         }
 
         fn copy_paste(&self) -> Outcome {
-            self.need_focus()?;
-            self.clear();
-            *self.restore.clipboard.borrow_mut() = Some(clipboard_text());
-            // Shortcuts keep their place in line behind the text, so all of it can be queued.
-            self.inject(text("copy me"))?;
-            self.inject(tap(KeySpec::char_with_hid("a", HID_A), CONTROL))?;
+            self.shortcut_check(|| {
+                self.need_focus()?;
+                self.clear();
+                *self.restore.clipboard.borrow_mut() = Some(clipboard_text());
+                // Not what the copy is expected to put there, so a stale match proves nothing.
+                set_clipboard_text(None);
+                let outcome = self.copy_and_paste();
+                self.restore.restore_clipboard();
+                outcome
+            })
+        }
+
+        fn copy_and_paste(&self) -> Outcome {
+            let line = "copy me";
+            self.inject(text(line))?;
+            self.expect_text(line)?;
+            self.inject(tap(KeySpec::named(NamedKey::Home), CONTROL | SHIFT))?;
+            self.expect_selection((0, 7))?;
+            // A character shortcut with Ctrl, resolved on the layout.
             self.inject(tap(KeySpec::char_with_hid("c", HID_C), CONTROL))?;
-            self.inject(tap(KeySpec::named(NamedKey::End), 0))?;
+            let started = Instant::now();
+            let mut copied = clipboard_text();
+            while copied.as_deref() != Some(line) && started.elapsed() < ARRIVAL {
+                sleep(Duration::from_millis(20));
+                copied = clipboard_text();
+            }
+            if copied.as_deref() != Some(line) {
+                return fail(format!(
+                    "the copy half failed: after Ctrl+C the clipboard text is {copied:?}"
+                ));
+            }
+            self.inject(tap(KeySpec::named(NamedKey::End), CONTROL))?;
             self.inject(tap(KeySpec::char_with_hid("v", HID_V), CONTROL))?;
-            let outcome = self.expect_text("copy mecopy me");
-            self.restore.restore_clipboard();
-            outcome?;
+            self.expect_text("copy mecopy me").map_err(|problem| match problem {
+                Problem::Failed(detail) => Problem::Failed(format!(
+                    "the paste half failed (the clipboard held {copied:?} after Ctrl+C): {detail}"
+                )),
+                skipped => skipped,
+            })?;
             Ok(String::new())
+        }
+
+        /// Whether this edit control selects everything on Ctrl+A. A classic multi-line edit
+        /// control does not, so this informs and is not a check.
+        fn ctrl_a(&self) -> String {
+            if self.type_two_lines().is_err() {
+                return "not tried, the text could not be typed".into();
+            }
+            if self
+                .inject(tap(KeySpec::char_with_hid("a", HID_A), CONTROL))
+                .is_err()
+            {
+                return "not tried, the shortcut was not accepted".into();
+            }
+            sleep(Duration::from_millis(400));
+            if selection(self.edit) == (0, TWO_LINES_LENGTH) {
+                "the control selected all".into()
+            } else {
+                "the control ignored Ctrl+A".into()
+            }
         }
 
         fn raw_key(&self) -> Outcome {
@@ -1001,8 +1137,12 @@ mod selftest {
         report.check("click", bench.click());
         report.check("text-ascii", bench.text_ascii());
         report.check("text-unicode", bench.text_unicode());
-        report.check("shortcut-select-all-delete", bench.select_all_delete());
+        report.check("shortcut-ctrl-home", bench.ctrl_home());
+        report.check("shortcut-ctrl-end", bench.ctrl_end());
+        report.check("shortcut-shift-select", bench.shift_select());
         report.check("shortcut-copy-paste", bench.copy_paste());
+        let ctrl_a = bench.ctrl_a();
+        report.line(&format!("INFO ctrl-a: {ctrl_a}"));
         report.check("raw-key-shift", bench.raw_key());
         report.check("held-key-repeat", bench.held_key());
         report.check("pen", bench.pen());
