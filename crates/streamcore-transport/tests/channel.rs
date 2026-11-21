@@ -497,3 +497,67 @@ async fn frames_v4_lane_zero_kinds_and_extensions_flow_only_when_negotiated() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_measures_the_link_with_typed_pings_on_every_transport() {
+    for transport in [ChannelTransport::Quic, ChannelTransport::TlsTcp] {
+        let (_listener, server, client) =
+            channels_with(transport, clock_options(), clock_options()).await;
+        // Before any application message, and from either side.
+        let result = client.probe(5, 20, 500).await.unwrap();
+        assert_eq!((result.sent, result.answered), (5, 5));
+        let (p50, p95) = (result.rtt_p50_us.unwrap(), result.rtt_p95_us.unwrap());
+        assert!(
+            p50 <= p95 && p95 < 100_000,
+            "loopback round trips {p50}/{p95} µs"
+        );
+        // Four 20 ms gaps, then the last pong: well inside the deadline.
+        assert!(
+            (80..500).contains(&result.elapsed_ms),
+            "{} ms",
+            result.elapsed_ms
+        );
+        let back = server.probe(3, 5, 500).await.unwrap();
+        assert_eq!((back.sent, back.answered), (3, 3));
+        // The probe's own pings feed the clock estimate as any ping does.
+        assert!(client.clock_estimate().is_some());
+        // Messages still flow afterwards.
+        client.send(b"after the probe".to_vec()).await.unwrap();
+        loop {
+            let message = server.receive().await.unwrap();
+            if message == b"after the probe" {
+                break;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_needs_typed_pings_and_sane_arguments_and_ends_at_its_deadline() {
+    // Without clock.v1 there are no typed pings.
+    let (_listener, _server, client) = channels(ChannelTransport::TlsTcp).await;
+    assert!(matches!(
+        client.probe(5, 20, 500).await,
+        Err(streamcore_transport::channel::ChannelError::InvalidConfiguration)
+    ));
+    let (_listener, server, client) =
+        channels_with(ChannelTransport::TlsTcp, clock_options(), clock_options()).await;
+    for (count, spacing, deadline) in [(0, 20, 500), (33, 20, 500), (5, 20, 0), (5, 20, 10_001)] {
+        assert!(matches!(
+            client.probe(count, spacing, deadline).await,
+            Err(streamcore_transport::channel::ChannelError::InvalidConfiguration)
+        ));
+    }
+    // The deadline comes before the third ping is due: two are sent.
+    let short = client.probe(5, 30, 70).await.unwrap();
+    assert!((2..=3).contains(&short.sent), "{} sent", short.sent);
+    assert!(short.elapsed_ms <= 200, "{} ms", short.elapsed_ms);
+    // A peer that has gone: the probe ends without waiting out its deadline.
+    server.close();
+    let started = std::time::Instant::now();
+    let gone = client.probe(5, 20, 5_000).await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    if let Ok(result) = gone {
+        assert!(result.answered < result.sent || result.sent == 0);
+    }
+}

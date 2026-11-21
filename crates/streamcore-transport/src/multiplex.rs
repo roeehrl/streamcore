@@ -485,7 +485,8 @@ impl Multiplexer {
         self.sender.lock().map_or(0, |s| s.bulk_bytes)
     }
     /// Sends a typed ping on lane 0; its send time is stamped as it is written.
-    pub(crate) fn ping(&self) -> Result<(), ChannelError> {
+    /// Returns the ping's nonce.
+    pub(crate) fn ping(&self) -> Result<u64, ChannelError> {
         let clock = self
             .clock
             .as_ref()
@@ -499,7 +500,7 @@ impl Multiplexer {
         .encode()
         .map_err(|_| ChannelError::InvalidConfiguration)?;
         self.enqueue_stamped(ChannelLane::Interactive, frame, Stamp::Ping(nonce))
-            .map(|_| ())
+            .map(|_| nonce)
     }
     fn enqueue_stamped(
         &self,
