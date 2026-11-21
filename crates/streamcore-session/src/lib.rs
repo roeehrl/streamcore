@@ -37,6 +37,11 @@ pub enum SessionError {
     GenerationExhausted,
     #[error("session state unavailable")]
     Unavailable,
+    /// [`SessionDaemon::attach_expecting`]: the session's generation is not the
+    /// one the caller last saw, so another attach got there first. Nothing
+    /// changed; `current` is the generation to retry with.
+    #[error("the session has moved on to generation {current}")]
+    StaleGeneration { current: u64 },
 }
 
 struct Entry {
@@ -80,7 +85,28 @@ impl SessionDaemon {
         peer_fingerprint: String,
         resume: Option<ResumeReference>,
     ) -> Result<SessionLease, SessionError> {
-        self.attach_at(peer_fingerprint, resume, Instant::now())
+        self.attach_at(peer_fingerprint, resume, None, Instant::now())
+    }
+
+    /// Resumes a session only if its generation is still `expected_generation`
+    /// (compare-and-swap): a transport switch says which lease it is replacing,
+    /// so a late hello from an abandoned connection cannot supersede a newer
+    /// one. A different generation fails with [`SessionError::StaleGeneration`]
+    /// and leaves the current lease untouched. A session this daemon no longer
+    /// has (expired, or from before a reset) starts a new one, as [`Self::attach`]
+    /// does: the lease's `resumed` is then false.
+    pub fn attach_expecting(
+        &self,
+        peer_fingerprint: String,
+        resume: ResumeReference,
+        expected_generation: u64,
+    ) -> Result<SessionLease, SessionError> {
+        self.attach_at(
+            peer_fingerprint,
+            Some(resume),
+            Some(expected_generation),
+            Instant::now(),
+        )
     }
 
     /// Stale detach callbacks cannot disconnect a replacement transport.
@@ -112,6 +138,7 @@ impl SessionDaemon {
         &self,
         peer: String,
         resume: Option<ResumeReference>,
+        expected_generation: Option<u64>,
         now: Instant,
     ) -> Result<SessionLease, SessionError> {
         if peer.len() != 64
@@ -142,6 +169,10 @@ impl SessionDaemon {
         if let Some(id) = &existing {
             if state.sessions[id].peer != peer {
                 return Err(SessionError::WrongPeer);
+            }
+            let current = state.sessions[id].generation;
+            if expected_generation.is_some_and(|expected| expected != current) {
+                return Err(SessionError::StaleGeneration { current });
             }
         } else if state.sessions.len() >= MAX_SESSIONS
             || state.sessions.values().filter(|e| e.peer == peer).count() >= MAX_PER_PEER
@@ -237,22 +268,63 @@ mod tests {
         assert!(!daemon.is_current(peer(2), next));
     }
     #[test]
+    fn attach_expecting_is_a_compare_and_swap_on_the_generation() {
+        let daemon = SessionDaemon::new();
+        let first = daemon.attach(peer(1), None).unwrap();
+        // The generation the client last saw: the switch goes through.
+        let switched = daemon
+            .attach_expecting(peer(1), first.reference.clone(), first.generation)
+            .unwrap();
+        assert!(switched.resumed && switched.generation > first.generation);
+        assert_eq!(switched.reference, first.reference);
+        // A late hello from the abandoned flow still names the old generation:
+        // refused with the current one, and the current lease stays current.
+        assert!(matches!(
+            daemon.attach_expecting(peer(1), first.reference.clone(), first.generation),
+            Err(SessionError::StaleGeneration { current }) if current == switched.generation
+        ));
+        assert!(daemon.is_current(peer(1), switched.clone()));
+        // One retry with the generation the rejection carried.
+        let retried = daemon
+            .attach_expecting(peer(1), first.reference.clone(), switched.generation)
+            .unwrap();
+        assert!(retried.resumed && retried.generation > switched.generation);
+        // Another peer never learns a generation: the peer check comes first.
+        assert!(matches!(
+            daemon.attach_expecting(peer(2), first.reference.clone(), retried.generation),
+            Err(SessionError::WrongPeer)
+        ));
+        // Plain attach keeps last-wins.
+        assert!(
+            daemon
+                .attach(peer(1), Some(first.reference.clone()))
+                .is_ok()
+        );
+        // A session the daemon no longer has starts fresh, whatever was expected.
+        daemon.reset().unwrap();
+        let fresh = daemon
+            .attach_expecting(peer(1), first.reference, 7)
+            .unwrap();
+        assert!(!fresh.resumed);
+    }
+    #[test]
     fn detached_expiry_and_restart_produce_fresh_sessions() {
         let daemon = SessionDaemon::new();
         let now = Instant::now();
-        let first = daemon.attach_at(peer(1), None, now).unwrap();
+        let first = daemon.attach_at(peer(1), None, None, now).unwrap();
         daemon.detach_at(&peer(1), &first, now).unwrap();
         let resumed = daemon
             .attach_at(
                 peer(1),
                 Some(first.reference),
+                None,
                 now + DETACHED_TTL - Duration::from_millis(1),
             )
             .unwrap();
         assert!(resumed.resumed);
         daemon.detach_at(&peer(1), &resumed, now).unwrap();
         let expired = daemon
-            .attach_at(peer(1), Some(resumed.reference), now + DETACHED_TTL)
+            .attach_at(peer(1), Some(resumed.reference), None, now + DETACHED_TTL)
             .unwrap();
         assert!(!expired.resumed);
         daemon.reset().unwrap();
@@ -271,14 +343,14 @@ mod tests {
         for n in 0..MAX_SESSIONS {
             if n == MAX_PER_PEER {
                 assert!(matches!(
-                    daemon.attach_at(peer(0), None, now),
+                    daemon.attach_at(peer(0), None, None, now),
                     Err(SessionError::Capacity)
                 ));
             }
             detached.push((
                 peer((n / MAX_PER_PEER) as u64),
                 daemon
-                    .attach_at(peer((n / MAX_PER_PEER) as u64), None, now)
+                    .attach_at(peer((n / MAX_PER_PEER) as u64), None, None, now)
                     .unwrap(),
             ));
         }
@@ -295,7 +367,7 @@ mod tests {
         }
         assert!(
             daemon
-                .attach_at(peer(999), None, now + DETACHED_TTL)
+                .attach_at(peer(999), None, None, now + DETACHED_TTL)
                 .is_ok()
         );
         assert!(daemon.attach("claimed device UUID".into(), None).is_err());

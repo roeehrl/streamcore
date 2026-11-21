@@ -14,6 +14,16 @@ current. A delayed old detach cannot revoke the replacement. The screen arbiter
 ignores an obsolete lease, so a dead transport cannot retain screen ownership.
 This does not add command replay or duplicate execution handling.
 
+`attach_expecting` is the same attach as a compare-and-swap, for a client that
+moves a live session to another transport (a cable while on the network, or
+back): it names the generation it last saw. When the session's generation is
+still that one, the attach supersedes it as above. When it is not, another
+attach got there first: the call fails with `StaleGeneration` carrying the
+current generation, and the current lease and its transport are untouched. So a
+late hello from an abandoned connection cannot take the session back. A client
+whose channels both died with the outcome unknown retries once with the
+generation the rejection carried. Plain `attach` keeps last-wins.
+
 A detached session may resume for 120 seconds. Expired, missing or prior-daemon
 references receive a fresh session with `resumed: false`. A reference to another
 known peer's session is rejected. At most eight sessions per authenticated peer
