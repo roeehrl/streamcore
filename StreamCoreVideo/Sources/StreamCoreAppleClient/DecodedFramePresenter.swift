@@ -38,6 +38,9 @@ public final class DecodedFramePresenter: @unchecked Sendable {
         self.observer = observer
     }
 
+    /// Who hears present requests and superseded frames (held weakly).
+    public func setObserver(_ observer: (any PresentObserver)?) { lock.withLock { self.observer = observer } }
+
     /// Responsive or Smooth, from the next frame.
     public func setMode(_ mode: PresentMode) { lock.withLock { self.mode = mode } }
 

@@ -21,3 +21,24 @@ pub async fn probe_round_trip(probe: Arc<dyn AsyncProbe>, start: u64, rounds: u3
     }
     value
 }
+
+/// A listener on a loopback port for the bindings' own tests (a host and a
+/// client stream in one process): binary lanes, as `connect_secure` dials.
+/// Products listen through their own crate, with their own lane policy.
+#[uniffi::export]
+pub async fn probe_listen(
+    identity: Arc<streamcore_transport::identity::PeerIdentity>,
+    trusted_peer: Vec<u8>,
+    options: streamcore_transport::channel::SessionOptions,
+) -> Result<
+    Arc<streamcore_transport::channel::SecureListener>,
+    streamcore_transport::channel::ChannelError,
+> {
+    streamcore_transport::channel::listen_secure(
+        "127.0.0.1:0".to_owned(),
+        identity,
+        vec![trusted_peer],
+        options,
+    )
+    .await
+}

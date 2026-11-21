@@ -62,11 +62,13 @@ public final class DecompressionSession: @unchecked Sendable {
         public let status: OSStatus
     }
 
-    public init(format: CMVideoFormatDescription, outputGate: OutputGate? = nil,
-         deliver: @escaping @Sendable (DecompressionSession, Output) -> Void) throws {
+    /// `fallbackColor`: the tags for whatever the stream's parameter sets leave out
+    /// (nil: BT.709).
+    public init(format: CMVideoFormatDescription, fallbackColor: ColorTags? = nil, outputGate: OutputGate? = nil,
+                deliver: @escaping @Sendable (DecompressionSession, Output) -> Void) throws {
         self.deliver = deliver
         self.outputGate = outputGate
-        color = Self.colorTags(format)
+        color = Self.colorTags(format, fallback: fallbackColor)
         var specification: [CFString: Any] = [:]
         #if os(macOS)
         specification[kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder] = true
@@ -178,16 +180,31 @@ public final class DecompressionSession: @unchecked Sendable {
     }
 
     /// The image tags the layer converts with: the stream's own (parsed from its
-    /// parameter sets), else BT.709, which every StreamCore host encodes (design 3.3).
-    /// Untagged, the layer would guess by size and pick BT.601 for small frames.
-    public static func colorTags(_ format: CMVideoFormatDescription) -> [CFString: CFString] {
+    /// parameter sets), else `fallback`'s, else BT.709, which every StreamCore host
+    /// encodes (design 3.3). Untagged, the layer would guess by size and pick BT.601 for
+    /// small frames.
+    public static func colorTags(_ format: CMVideoFormatDescription, fallback: ColorTags? = nil) -> [CFString: CFString] {
+        let primaries: CFString = switch fallback?.primaries {
+        case .displayP3: kCVImageBufferColorPrimaries_P3_D65
+        case .bt2020: kCVImageBufferColorPrimaries_ITU_R_2020
+        default: kCVImageBufferColorPrimaries_ITU_R_709_2
+        }
+        let transfer: CFString = switch fallback?.transfer {
+        case .srgb: kCVImageBufferTransferFunction_sRGB
+        case .linear: kCVImageBufferTransferFunction_Linear
+        case .pq: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case .hlg: kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        default: kCVImageBufferTransferFunction_ITU_R_709_2
+        }
+        let matrix: CFString = switch fallback?.matrix {
+        case .bt601: kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        case .bt2020: kCVImageBufferYCbCrMatrix_ITU_R_2020
+        default: kCVImageBufferYCbCrMatrix_ITU_R_709_2
+        }
         let pairs: [(CFString, CFString, CFString)] = [
-            (kCVImageBufferColorPrimariesKey, kCMFormatDescriptionExtension_ColorPrimaries,
-             kCVImageBufferColorPrimaries_ITU_R_709_2),
-            (kCVImageBufferTransferFunctionKey, kCMFormatDescriptionExtension_TransferFunction,
-             kCVImageBufferTransferFunction_ITU_R_709_2),
-            (kCVImageBufferYCbCrMatrixKey, kCMFormatDescriptionExtension_YCbCrMatrix,
-             kCVImageBufferYCbCrMatrix_ITU_R_709_2),
+            (kCVImageBufferColorPrimariesKey, kCMFormatDescriptionExtension_ColorPrimaries, primaries),
+            (kCVImageBufferTransferFunctionKey, kCMFormatDescriptionExtension_TransferFunction, transfer),
+            (kCVImageBufferYCbCrMatrixKey, kCMFormatDescriptionExtension_YCbCrMatrix, matrix),
         ]
         var tags: [CFString: CFString] = [:]
         for (key, ext, fallback) in pairs {
