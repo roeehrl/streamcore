@@ -627,8 +627,6 @@ impl Link {
 struct Inner {
     /// A leaf lock: read (cloned) and released, never held across a call.
     link: Mutex<Link>,
-    /// The plan's medium cap, for a rebind's capacity hint.
-    medium_cap_bps: Option<u64>,
     clock: Arc<dyn Clock>,
     executor: OnceLock<Weak<Shared>>,
     policy: SinkPolicy,
@@ -668,7 +666,6 @@ impl VideoSink {
         Self {
             inner: Arc::new_cyclic(|me| Inner {
                 link: Mutex::new(Link::new(output, plan.medium_cap_bps)),
-                medium_cap_bps: plan.medium_cap_bps,
                 clock,
                 executor: OnceLock::new(),
                 policy: output.policy,
@@ -890,7 +887,7 @@ impl VideoSink {
     /// still arrive from the old transport match nothing and are ignored. The
     /// policy stays the stream's own. On the executor. Returns false when the
     /// sink was revoked.
-    pub(crate) fn rebind(&self, output: &VideoOutput) -> bool {
+    pub(crate) fn rebind(&self, output: &VideoOutput, medium_cap_bps: Option<u64>) -> bool {
         let inner = &self.inner;
         let old = inner.link();
         let mut rebound = false;
@@ -898,7 +895,7 @@ impl VideoSink {
             if core.revoked {
                 return;
             }
-            *lock(&inner.link) = Link::new(output, inner.medium_cap_bps);
+            *lock(&inner.link) = Link::new(output, medium_cap_bps);
             core.parked = false;
             core.queue.clear();
             core.transit.clear();

@@ -66,7 +66,7 @@ pub(crate) enum Command {
     /// The transport is going away: park (8.8).
     DetachTransport,
     /// Send on this output from now on (8.8).
-    AttachTransport(OpToken, Arc<crate::sink::VideoOutput>),
+    AttachTransport(OpToken, Arc<crate::sink::VideoOutput>, Option<u64>),
     Revoked,
     Stats,
 }
@@ -798,7 +798,7 @@ impl StreamState {
                 self.ltr.min_seq = self.submitted_seq;
             }
             Command::DetachTransport => self.park(cx, false),
-            Command::AttachTransport(op, output) => self.attach(cx, op, &output),
+            Command::AttachTransport(op, output, cap) => self.attach(cx, op, &output, cap),
             Command::Revoked => {
                 self.cancel_pace();
                 self.stop_keep_warm();
@@ -1633,9 +1633,15 @@ impl StreamState {
     /// the encoder for the old transport is dropped without counting as lost;
     /// the next frame is a keyframe in the same wire generation, of the latest
     /// image when there is one.
-    fn attach(&mut self, cx: &Arc<Shared>, op: OpToken, output: &crate::sink::VideoOutput) {
+    fn attach(
+        &mut self,
+        cx: &Arc<Shared>,
+        op: OpToken,
+        output: &crate::sink::VideoOutput,
+        medium_cap_bps: Option<u64>,
+    ) {
         debug_assert!(is_current(cx.id));
-        if self.closing || cx.revoked() || !cx.sink.rebind(output) {
+        if self.closing || cx.revoked() || !cx.sink.rebind(output, medium_cap_bps) {
             self.reply(cx, op, Self::rejected(codes::CANCELLED));
             return;
         }
@@ -1650,9 +1656,12 @@ impl StreamState {
         self.ltr.acked = None;
         self.ltr.pending_ack = None;
         self.ltr.min_seq = self.submitted_seq;
-        // Rate adaptation keeps its target and learns the new path's delays.
+        // Rate adaptation keeps its target, learns the new path's delays and
+        // takes the new medium's cap.
+        self.plan.medium_cap_bps = medium_cap_bps;
         if let Some(abr) = &mut self.abr {
             abr.reset_delay();
+            abr.set_medium_cap(medium_cap_bps);
         }
         // One keyframe opens the new transport, in the same wire generation:
         // the peer kept its decoder, and a keyframe after a gap decodes.
@@ -1671,6 +1680,9 @@ impl StreamState {
         self.reply(cx, op, OpOutcome::Completed);
         self.send_canvas_layout(cx);
         self.submit_due(cx);
+        // One keep-warm hold, as after input (6.3.1): with the user idle, the
+        // keyframe alone would be all the new transport carries.
+        self.on_input(cx);
     }
 
     /// Forget every loss and pending recovery: they concern a transport the

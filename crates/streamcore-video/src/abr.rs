@@ -737,6 +737,12 @@ impl AbrController {
         (MIN_TARGET_BPS as f64).max(self.bulk_floor.unwrap_or(0.0))
     }
 
+    /// The new medium's cap (a handover): every tier's ceiling follows it at
+    /// the next tick.
+    pub fn set_medium_cap(&mut self, medium_cap_bps: Option<u64>) {
+        self.config.medium_cap_bps = medium_cap_bps;
+    }
+
     /// Forget delay history (a transport change: new path, new minima).
     pub fn reset_delay(&mut self) {
         self.credit_min.clear();
@@ -1143,6 +1149,35 @@ mod tests {
             abr.tick(&idle(now, 10 * MBPS));
         }
         assert_eq!(abr.target().bitrate_bps, 10 * MBPS);
+    }
+
+    #[test]
+    fn a_new_medium_cap_moves_the_ceiling_both_ways() {
+        let mut config = hd();
+        config.bitrate_bps = 40 * MBPS;
+        let mut abr = AbrController::new(config);
+        let mut now = 0;
+        let mut run = |abr: &mut AbrController| {
+            for _ in 0..100 {
+                now += 100 * MS;
+                let produced = abr.target().bitrate_bps;
+                abr.tick(&idle(now, produced));
+            }
+        };
+        run(&mut abr);
+        assert_eq!(abr.target().bitrate_bps, 40 * MBPS);
+        // A slower medium: the target comes down to its cap.
+        abr.set_medium_cap(Some(10 * MBPS));
+        run(&mut abr);
+        assert_eq!(abr.target().bitrate_bps, 10 * MBPS);
+        // A faster one: it may ramp to the plan's rate again.
+        abr.set_medium_cap(None);
+        run(&mut abr);
+        assert!(abr.target().bitrate_bps > 10 * MBPS, "it ramps again");
+        for _ in 0..10 {
+            run(&mut abr);
+        }
+        assert_eq!(abr.target().bitrate_bps, 40 * MBPS);
     }
 
     #[test]

@@ -13,10 +13,11 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 /// The most bytes asked of one `read` and passed to one `write`.
@@ -24,6 +25,8 @@ pub const DUPLEX_CHUNK: usize = 64 * 1024;
 /// Chunks waiting for the platform's `write`: small, so a slow cable pushes
 /// back on the sender instead of filling a queue.
 const WRITE_QUEUE: usize = 2;
+/// How long a graceful shutdown waits for queued writes to reach the platform.
+const DRAIN_LIMIT: Duration = Duration::from_secs(1);
 /// Chunks read and not yet consumed.
 const READ_QUEUE: usize = 4;
 
@@ -117,16 +120,15 @@ pub fn pipe_from_duplex(io: Arc<dyn ByteDuplex>) -> PipeIo {
             loop {
                 match reader.read(DUPLEX_CHUNK as u32) {
                     Ok(data) if data.is_empty() => break,
-                    Ok(mut data) => {
-                        // A platform that returns more than asked is cut off
-                        // rather than trusted with the queue's memory bound.
-                        data.truncate(DUPLEX_CHUNK);
+                    Ok(data) if data.len() <= DUPLEX_CHUNK => {
                         if read_tx.blocking_send(Ok(data)).is_err() {
                             break;
                         }
                     }
                     Err(DuplexError::Closed) => break,
-                    Err(DuplexError::Failed) => {
+                    // More than asked for breaks the contract: cutting it
+                    // short would corrupt the stream, so the pipe fails.
+                    Ok(_) | Err(DuplexError::Failed) => {
                         let _ = read_tx.blocking_send(Err(io::ErrorKind::Other.into()));
                         break;
                     }
@@ -136,10 +138,14 @@ pub fn pipe_from_duplex(io: Arc<dyn ByteDuplex>) -> PipeIo {
         })
         .is_ok();
     let writer = io.clone();
+    let (drained_tx, drained) = oneshot::channel::<()>();
     let spawned = spawned
         && std::thread::Builder::new()
             .name("streamcore-usb-wr".into())
             .spawn(move || {
+                // Dropped when this thread ends: everything queued was
+                // written, or the stream failed.
+                let _drained = drained_tx;
                 while let Some(mut data) = write_rx.blocking_recv() {
                     // Fewer, larger calls: each one copies across the binding.
                     while data.len() < DUPLEX_CHUNK {
@@ -170,8 +176,10 @@ pub fn pipe_from_duplex(io: Arc<dyn ByteDuplex>) -> PipeIo {
         io,
         read: read_rx,
         rest: Vec::new(),
-        write: write_tx,
+        write: Some(write_tx),
         sending: None,
+        drained,
+        drain_limit: None,
     })
 }
 
@@ -181,9 +189,13 @@ struct DuplexPipe {
     io: Arc<dyn ByteDuplex>,
     read: mpsc::Receiver<io::Result<Vec<u8>>>,
     rest: Vec<u8>,
-    write: mpsc::Sender<Vec<u8>>,
+    /// Gone once the pipe is shut down.
+    write: Option<mpsc::Sender<Vec<u8>>>,
     /// A chunk on its way to the write queue, and its length.
     sending: Option<(Sending, usize)>,
+    /// Resolves when the writing thread has ended.
+    drained: oneshot::Receiver<()>,
+    drain_limit: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl AsyncRead for DuplexPipe {
@@ -237,9 +249,11 @@ impl AsyncWrite for DuplexPipe {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
+            let Some(queue) = self.write.clone() else {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            };
             let take = buf.len().min(DUPLEX_CHUNK);
             let chunk = buf[..take].to_vec();
-            let queue = self.write.clone();
             self.sending = Some((
                 Box::pin(async move { queue.send(chunk).await.is_ok() }),
                 take,
@@ -254,8 +268,24 @@ impl AsyncWrite for DuplexPipe {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.io.shutdown();
+    /// A graceful end: what was written before it (a TLS close, a last
+    /// message) reaches the platform first, within [`DRAIN_LIMIT`]. Dropping
+    /// the pipe instead ends the stream at once.
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.sending.is_some() && self.poll_sending(cx).is_pending() {
+            return Poll::Pending;
+        }
+        // The writing thread ends once its queue is written.
+        self.write = None;
+        let this = &mut *self;
+        let limit = this
+            .drain_limit
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(DRAIN_LIMIT)));
+        if Pin::new(&mut this.drained).poll(cx).is_pending() && limit.as_mut().poll(cx).is_pending()
+        {
+            return Poll::Pending;
+        }
+        this.io.shutdown();
         Poll::Ready(Ok(()))
     }
 }
@@ -393,6 +423,44 @@ mod tests {
         let fake = Arc::new(Fake::default());
         let mut pipe = pipe_from_duplex(fake.clone());
         fake.fail_read();
+        assert!(pipe.read(&mut [0u8; 8]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_graceful_shutdown_writes_what_was_queued_first() {
+        let fake = Arc::new(Fake::default());
+        *fake.write_gate.lock().unwrap() = true;
+        let mut pipe = pipe_from_duplex(fake.clone());
+        pipe.write_all(&[1u8; 3000]).await.unwrap();
+        pipe.write_all(&[2u8; 3000]).await.unwrap();
+        let gate = fake.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            *gate.write_gate.lock().unwrap() = false;
+            gate.write_wake.notify_all();
+        });
+        pipe.shutdown().await.unwrap();
+        assert_eq!(fake.written().len(), 6000, "the queue was written first");
+        assert!(fake.closed.load(Ordering::SeqCst));
+        assert!(pipe.write_all(b"late").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_does_not_wait_forever_for_a_stuck_stream() {
+        let fake = Arc::new(Fake::default());
+        *fake.write_gate.lock().unwrap() = true;
+        let mut pipe = pipe_from_duplex(fake.clone());
+        pipe.write_all(&[1u8; 100]).await.unwrap();
+        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(5), pipe.shutdown());
+        shutdown.await.expect("bounded").unwrap();
+        assert!(fake.closed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn more_bytes_than_asked_for_fail_the_pipe() {
+        let fake = Arc::new(Fake::default());
+        let mut pipe = pipe_from_duplex(fake.clone());
+        fake.feed(&vec![0u8; DUPLEX_CHUNK + 1]);
         assert!(pipe.read(&mut [0u8; 8]).await.is_err());
     }
 

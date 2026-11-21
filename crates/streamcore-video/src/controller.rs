@@ -164,7 +164,9 @@ impl StreamController {
     /// session stay, and nothing is sent until [`Self::attach_transport`]. The
     /// observer gets `TransportParked`; a stream still parked after
     /// `StreamTimings::park_ns` fails with `stream.transport`. A channel that
-    /// closes under the stream parks it the same way, without this call.
+    /// closes under the stream parks it the same way, but only once a send
+    /// is refused or fails: on a still screen nothing is sent, so that is a
+    /// backstop, and this call is the signal.
     pub fn detach_transport(&self) {
         self.shared.post(Event::Command(Command::DetachTransport));
     }
@@ -174,13 +176,23 @@ impl StreamController {
     /// (`output`'s is not used) and its encoder session; the first frame on
     /// the new transport is a keyframe in the same wire generation (the peer
     /// keeps its decoder), of the latest image when there is one, and nothing
-    /// submitted before it is sent there. The result is
+    /// submitted before it is sent there. `medium_cap_bps` is the new medium's
+    /// bitrate cap and replaces the plan's (`None`: no cap), for rate
+    /// adaptation's ceiling and the bulk bucket's capacity. With keep-warm on,
+    /// the attach starts one hold, as input does. The result is
     /// `Completed`, or `stream.cancelled` when the stream is revoked or
     /// closing.
-    pub fn attach_transport(&self, output: Arc<VideoOutput>) -> OpToken {
+    pub fn attach_transport(
+        &self,
+        output: Arc<VideoOutput>,
+        medium_cap_bps: Option<u64>,
+    ) -> OpToken {
         let op = self.next_command();
-        self.shared
-            .post(Event::Command(Command::AttachTransport(op, output)));
+        self.shared.post(Event::Command(Command::AttachTransport(
+            op,
+            output,
+            medium_cap_bps,
+        )));
         op
     }
 

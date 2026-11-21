@@ -1128,14 +1128,18 @@ fingerprint, with lane-0 pings answered meanwhile so the probe fits.
    state for `T_park` (`StreamTimings::park_ns`, 3 s by default) and report `TransportParked`; a
    resume within it rebinds them, after it they fail with `stream.transport` and stop as today. A
    stream parks by `detach_transport()`, and by itself when its sink finds the channel closed: a
-   closed channel is not a refusal, so it counts no loss and starts no recovery. A parked session
+   closed channel is not a refusal, so it counts no loss and starts no recovery. The sink only
+   finds out when a send is refused or fails, and a still screen sends nothing, so the implicit
+   park is a backstop: the consumer's `detach_transport()` is the signal. A parked session
    is not current, so another device can still take the screen.
 6. A session has at most one attached transport. The probing channel is pre-hello and owns nothing.
 
 In `streamcore-video` the seam is `VideoOutput`: `attach_transport(output)` swaps the sink's
 transport and keeps the stream's own sink policy, encoder session, stream ID and wire generation.
-Reports that still arrive from the old transport are ignored. Rate adaptation keeps its target and
-forgets the old path's delays, and LTR acknowledgements from the old one no longer count.
+Reports that still arrive from the old transport are ignored. Rate adaptation keeps its target,
+forgets the old path's delays and takes the new medium's cap (`attach_transport`'s second
+argument, which replaces the plan's), and LTR acknowledgements from the old transport no longer
+count. With keep-warm on, an attach starts one hold, as input does.
 `StatsSnapshot` counts `transport_parks`, `transport_attaches` and `handover_dropped`.
 
 **Ownership.** StreamCore: `DialTarget::Pipe`, TLS over `ByteDuplex`, `accept_stream`, handshake
