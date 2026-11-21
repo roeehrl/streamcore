@@ -72,4 +72,9 @@ if [[ "${STREAMCORE_VIDEO_SKIP_TESTS:-0}" != 1 ]]; then
         -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
     (cd StreamCoreVideo && xcodebuild build -scheme StreamCoreVideo -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
+    # The Apple client media code builds for iOS at the package's minimum (iOS 18).
+    (cd StreamCoreVideo && xcodebuild build -scheme StreamCoreAppleClient -destination 'generic/platform=iOS' \
+        -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
+    (cd StreamCoreVideo && xcodebuild build -scheme StreamCoreAppleClient -destination 'generic/platform=iOS Simulator' \
+        -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
 fi
