@@ -10,7 +10,7 @@ import VideoToolbox
 
 /// Encodes `count` moving pictures with VideoToolbox: the codec configuration atom and
 /// each length-prefixed sample.
-private func encode(codec: Codec, width: Int = 320, height: Int = 192, count: Int) throws -> (config: Data, samples: [(data: Data, keyframe: Bool)]) {
+func encodeTestStream(codec: Codec, width: Int = 320, height: Int = 192, count: Int) throws -> (config: Data, samples: [(data: Data, keyframe: Bool)]) {
     final class Output: @unchecked Sendable {
         let lock = NSLock()
         var config: Data?
@@ -123,7 +123,7 @@ private func frame(_ sequence: UInt64) throws -> DecompressionSession.Frame {
 @Suite(.serialized) struct DecodePresentTests {
     @Test(.timeLimit(.minutes(2)), arguments: [Codec.h264, .hevc])
     func aStreamDecodesFromItsConfigurationWithExactOutputTimes(codec: Codec) async throws {
-        let encoded = try encode(codec: codec, count: 8)
+        let encoded = try encodeTestStream(codec: codec, count: 8)
         let format = try VideoFormat.description(codec: codec, config: encoded.config)
         let dimensions = CMVideoFormatDescriptionGetDimensions(format)
         #expect(dimensions.width == 320 && dimensions.height == 192)
@@ -159,7 +159,7 @@ private func frame(_ sequence: UInt64) throws -> DecompressionSession.Frame {
     }
 
     @Test func theDecoderRefusesAThirdWaitingFrameAndForgetsFlushedOnes() throws {
-        let encoded = try encode(codec: .h264, count: 3)
+        let encoded = try encodeTestStream(codec: .h264, count: 3)
         let format = try VideoFormat.description(codec: .h264, config: encoded.config)
         let held = Mutex<[@Sendable () -> Void]>([])
         let outputs = Mutex(0)

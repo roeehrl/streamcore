@@ -77,4 +77,12 @@ if [[ "${STREAMCORE_VIDEO_SKIP_TESTS:-0}" != 1 ]]; then
         -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
     (cd StreamCoreVideo && xcodebuild build -scheme StreamCoreAppleClient -destination 'generic/platform=iOS Simulator' \
         -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios" CODE_SIGNING_ALLOWED=NO -quiet)
+    # The client tests on an iOS Simulator, when one is named (STREAMCORE_VIDEO_IOS_SIMULATOR, or
+    # the CI's CORE_SIMULATOR_ID): real VideoToolbox decode and the stream decoder there.
+    SIMULATOR="${STREAMCORE_VIDEO_IOS_SIMULATOR:-${CORE_SIMULATOR_ID:-}}"
+    if [[ -n "$SIMULATOR" ]]; then
+        (cd StreamCoreVideo && xcodebuild test -scheme StreamCoreVideo-Package -destination "id=$SIMULATOR" \
+            -only-testing:StreamCoreAppleClientTests -derivedDataPath "$CORE_ROOT/target/streamcore-video-ios-test" \
+            CODE_SIGNING_ALLOWED=NO -quiet)
+    fi
 fi
