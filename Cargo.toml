@@ -3,6 +3,7 @@ members = [
     "crates/streamcore-media",
     "crates/streamcore-session",
     "crates/streamcore-transport",
+    "crates/streamcore-usb",
     "crates/streamcore-input",
     "crates/streamcore-input-ffi",
     "crates/streamcore-video",

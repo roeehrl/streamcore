@@ -1,0 +1,20 @@
+[package]
+name = "streamcore-usb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "StreamCore USB pipe providers: byte streams to a cabled device, handed to the secure transport."
+
+[dependencies]
+streamcore-transport = { path = "../streamcore-transport" }
+thiserror.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true
