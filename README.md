@@ -54,7 +54,9 @@ The names on the wire are StreamCore's own:
 They replaced the names the code was extracted with, before any release. An
 identity or a pinned peer certificate made under the old names does not work
 with this version: loading one fails with `IdentityError::LegacyIdentity`, and
-the devices pair again with new identities. Changing any of these names again
+the devices pair again with new identities. A listener skips old peers in its
+trust set, so one stale entry does not stop it; `legacy_certificate_count` says
+how many must pair again. Changing any of these names again
 is a protocol change that breaks every paired device.
 
 ## Building and testing

@@ -715,10 +715,30 @@ fn a_certificate_under_another_name_is_refused_as_a_legacy_identity() {
         current.client_config(old_certificate.clone()),
         Err(IdentityError::LegacyIdentity)
     ));
-    assert!(matches!(
-        current.server_config(vec![current.certificate(), old_certificate]),
-        Err(IdentityError::LegacyIdentity)
-    ));
+    // A listener skips old peers: one stale entry must not stop it listening.
+    // The count tells the consumer how many must pair again.
+    let other = PeerIdentity::generate().unwrap();
+    let trusted = vec![
+        other.certificate(),
+        old_certificate.clone(),
+        old_certificate.clone(),
+    ];
+    assert!(current.server_config(trusted.clone()).is_ok());
+    assert!(current.server_config(vec![old_certificate.clone()]).is_ok());
+    assert_eq!(
+        streamcore_transport::identity::legacy_certificate_count(trusted),
+        2
+    );
+    // A malformed entry still fails the trust set, and is not counted as old.
+    assert!(
+        current
+            .server_config(vec![other.certificate(), vec![1, 2, 3]])
+            .is_err()
+    );
+    assert_eq!(
+        streamcore_transport::identity::legacy_certificate_count(vec![vec![1, 2, 3]]),
+        0
+    );
     // A current identity round-trips, and garbage is still just invalid.
     let exported = current.export_for_secure_storage().unwrap();
     assert!(PeerIdentity::restore(exported).is_ok());
