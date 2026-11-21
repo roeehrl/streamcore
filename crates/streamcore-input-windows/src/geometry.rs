@@ -2,10 +2,20 @@
 //! and the synthetic pointer devices want, pen tilt and pressure, and pinch zoom to wheel
 //! notches.
 
-/// The rectangle input lands in, in desktop pixels: the coordinates Windows reports window and
-/// monitor rectangles in to a per-monitor DPI-aware caller (physical pixels), whose origin is the
-/// primary monitor's top-left (so a monitor to the left of or above it has negative
+/// The rectangle pointer input lands in, in desktop pixels: the coordinates Windows reports
+/// window and monitor rectangles in to a per-monitor DPI-aware caller (physical pixels), whose
+/// origin is the primary monitor's top-left (so a monitor to the left of or above it has negative
 /// coordinates).
+///
+/// The rectangle is the edge of what the host lets a client point at. Every normalized point is
+/// confined to it: a coordinate below 0 or above 1 lands on the nearest edge pixel inside the
+/// rectangle, never beyond it, and a pan drag stops at its edge. An event with a coordinate that
+/// is not a finite number, or with a rectangle whose width or height is not positive, is refused
+/// ([`InjectError::InvalidEvent`](crate::InjectError::InvalidEvent)).
+///
+/// It scopes the mouse, the pen and touch only. Keys, shortcuts and text carry no rectangle:
+/// Windows delivers them to whichever window has the keyboard focus. A host that confines
+/// control to one window must give that window the focus before it injects keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TargetRect {
     pub x: i32,
@@ -24,28 +34,43 @@ impl TargetRect {
         }
     }
 
-    /// A normalized point (0 to 1 across the rectangle) in desktop pixels.
+    /// Whether the rectangle has any pixels.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    /// A normalized point (0 to 1 across the rectangle) as a desktop pixel inside the rectangle.
+    /// Coordinates outside 0 to 1 are clamped to its edge pixels.
     pub fn point(&self, nx: f32, ny: f32) -> (i32, i32) {
+        let along = |n: f32, origin: i32, size: i32| {
+            let size = size.max(1);
+            // 1.0 is the far edge, whose last pixel is one short of the size.
+            let offset = round(f64::from(n.clamp(0.0, 1.0)) * f64::from(size)).min(size - 1);
+            origin.saturating_add(offset)
+        };
         (
-            self.x.saturating_add(round(f64::from(nx * self.span_x()))),
-            self.y.saturating_add(round(f64::from(ny * self.span_y()))),
+            along(nx, self.x, self.width),
+            along(ny, self.y, self.height),
+        )
+    }
+
+    /// A desktop pixel moved to the nearest pixel inside the rectangle.
+    pub fn confine(&self, x: i32, y: i32) -> (i32, i32) {
+        let within = |value: i32, origin: i32, size: i32| {
+            value.clamp(origin, origin.saturating_add(size.max(1) - 1))
+        };
+        (
+            within(x, self.x, self.width),
+            within(y, self.y, self.height),
         )
     }
 
     /// A normalized distance in pixels.
     pub fn delta(&self, ndx: f64, ndy: f64) -> (f64, f64) {
         (
-            ndx * f64::from(self.span_x()),
-            ndy * f64::from(self.span_y()),
+            ndx * f64::from(self.width.max(1)),
+            ndy * f64::from(self.height.max(1)),
         )
-    }
-
-    fn span_x(&self) -> f32 {
-        self.width.max(1) as f32
-    }
-
-    fn span_y(&self) -> f32 {
-        self.height.max(1) as f32
     }
 }
 
@@ -149,12 +174,37 @@ mod tests {
     fn normalized_points_map_into_the_target() {
         let target = TargetRect::new(-1920, 100, 1920, 1080);
         assert_eq!(target.point(0.0, 0.0), (-1920, 100));
-        assert_eq!(target.point(1.0, 1.0), (0, 1180));
         assert_eq!(target.point(0.5, 0.25), (-960, 370));
         assert_eq!(target.delta(0.5, -0.25), (960.0, -270.0));
-        // An empty rectangle is one pixel, and bad numbers stay on the desktop.
-        assert_eq!(TargetRect::new(7, 8, 0, -4).point(1.0, 1.0), (8, 9));
-        assert_eq!(target.point(f32::NAN, f32::INFINITY), (-1920, i32::MAX));
+        // The far edge is the last pixel inside, not the first one past it.
+        assert_eq!(target.point(1.0, 1.0), (-1, 1179));
+    }
+
+    #[test]
+    fn points_never_leave_the_target() {
+        let target = TargetRect::new(-1920, 100, 1920, 1080);
+        assert_eq!(target.point(3.0, -1.0), (-1, 100));
+        assert_eq!(target.point(-0.001, 1.001), (-1920, 1179));
+        assert_eq!(target.point(f32::INFINITY, f32::NEG_INFINITY), (-1, 100));
+        assert_eq!(target.point(f32::MAX, f32::MIN), (-1, 100));
+        // Not a number is refused before it gets here; if it did, it stays inside too.
+        assert_eq!(target.point(f32::NAN, f32::NAN), (-1920, 100));
+        // A rectangle without pixels is refused as well; here it is treated as one pixel.
+        assert_eq!(TargetRect::new(7, 8, 0, -4).point(1.0, 1.0), (7, 8));
+        assert!(!TargetRect::new(7, 8, 0, 5).is_valid());
+        assert!(!TargetRect::new(7, 8, 5, -1).is_valid());
+        assert!(TargetRect::new(7, 8, 1, 1).is_valid());
+        let edge = TargetRect::new(i32::MAX - 10, 0, 100, 100);
+        assert_eq!(edge.point(1.0, 0.0).0, i32::MAX);
+    }
+
+    #[test]
+    fn desktop_points_are_confined_to_the_target() {
+        let target = TargetRect::new(100, 200, 50, 20);
+        assert_eq!(target.confine(120, 210), (120, 210));
+        assert_eq!(target.confine(0, 0), (100, 200));
+        assert_eq!(target.confine(500, 500), (149, 219));
+        assert_eq!(target.confine(i32::MIN, i32::MAX), (100, 219));
     }
 
     #[test]
