@@ -1252,6 +1252,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamcore-input-windows"
+version = "0.1.0"
+dependencies = [
+ "streamcore-input",
+ "windows",
+]
+
+[[package]]
 name = "streamcore-media"
 version = "0.1.0"
 dependencies = [

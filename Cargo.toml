@@ -6,6 +6,7 @@ members = [
     "crates/streamcore-usb",
     "crates/streamcore-input",
     "crates/streamcore-input-ffi",
+    "crates/streamcore-input-windows",
     "crates/streamcore-video",
     "crates/streamcore-video-windows",
 ]
