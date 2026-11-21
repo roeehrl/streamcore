@@ -147,6 +147,18 @@ impl SecureChannel {
         for (index, (reader, writer)) in session.lanes.drain(..).enumerate() {
             io.start(reader, writer, Some(index + 1));
         }
+        // A relayed pipe reports no unplug: the multiplexer watches it itself.
+        if matches!(
+            session.kind,
+            TransportKind::TlsStream {
+                medium: Medium::UsbAdb | Medium::UsbMux | Medium::UsbAoa
+            }
+        ) {
+            io.start_liveness(
+                crate::multiplex::PIPE_PING_INTERVAL,
+                crate::multiplex::PIPE_DEAD_AFTER,
+            );
+        }
         Arc::new(Self {
             transport: match session.kind {
                 TransportKind::Quic => ChannelTransport::Quic,

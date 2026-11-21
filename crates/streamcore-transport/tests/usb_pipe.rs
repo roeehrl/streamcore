@@ -294,3 +294,139 @@ async fn a_secure_channel_over_a_pipe_carries_messages_and_reports_its_locator()
     server.send(b"hello back".to_vec()).await.unwrap();
     assert_eq!(next(&channel).await, b"hello back");
 }
+
+/// A relay between two in-memory pipes that stops moving bytes when told to,
+/// while keeping both ends open: the half-open state a real relay can be in
+/// after an unplug.
+fn stalling_relay(
+    capacity: usize,
+) -> (
+    tokio::io::DuplexStream,
+    tokio::io::DuplexStream,
+    tokio::sync::watch::Sender<bool>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (host_end, mut host_side) = tokio::io::duplex(capacity);
+    let (device_end, mut device_side) = tokio::io::duplex(capacity);
+    let (stall, mut stalled) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let (mut from_host, mut from_device) = (vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]);
+        loop {
+            tokio::select! {
+                _ = stalled.changed() => {
+                    // Hold both sides open and move nothing more.
+                    std::future::pending::<()>().await;
+                }
+                read = host_side.read(&mut from_host) => match read {
+                    Ok(n) if n > 0 => { let _ = device_side.write_all(&from_host[..n]).await; }
+                    _ => break,
+                },
+                read = device_side.read(&mut from_device) => match read {
+                    Ok(n) if n > 0 => { let _ = host_side.write_all(&from_device[..n]).await; }
+                    _ => break,
+                },
+            }
+        }
+    });
+    (host_end, device_end, stall)
+}
+
+async fn channels_over(
+    host_end: tokio::io::DuplexStream,
+    device_end: tokio::io::DuplexStream,
+    capabilities: Vec<String>,
+) -> (
+    Arc<streamcore_transport::channel::SecureListener>,
+    Arc<streamcore_transport::channel::SecureChannel>,
+    Arc<streamcore_transport::channel::SecureChannel>,
+) {
+    let host = Arc::new(PeerIdentity::generate().unwrap());
+    let client = Arc::new(PeerIdentity::generate().unwrap());
+    let options = SessionOptions {
+        required: capabilities.clone(),
+        capabilities,
+    };
+    let listener = listen_secure(
+        "127.0.0.1:0".into(),
+        host.clone(),
+        vec![client.certificate()],
+        options.clone(),
+    )
+    .await
+    .unwrap();
+    listener
+        .accept_stream(UsbPipe {
+            io: Box::new(host_end),
+            medium: Medium::UsbAdb,
+            device: "device-1".into(),
+        })
+        .unwrap();
+    let accepting = listener.clone();
+    let server = tokio::spawn(async move { accepting.accept().await.unwrap() });
+    let channel = connect_secure_stream_with(
+        binary_lanes,
+        client,
+        host.certificate(),
+        UsbPipe {
+            io: Box::new(device_end),
+            medium: Medium::UsbAdb,
+            device: "host".into(),
+        },
+        options,
+        OperationCancellation::new(),
+    )
+    .await
+    .unwrap();
+    (listener, server.await.unwrap(), channel)
+}
+
+/// Reads on a task until the channel reports an error; the task returns when
+/// that happened. (Cancelling a read in progress closes a channel, so the tests
+/// never time out the read itself.)
+fn watch_for_close(
+    channel: &Arc<streamcore_transport::channel::SecureChannel>,
+) -> tokio::task::JoinHandle<std::time::Instant> {
+    let channel = channel.clone();
+    tokio::spawn(async move {
+        while channel.receive().await.is_ok() {}
+        std::time::Instant::now()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pipe_that_goes_half_open_is_dead_within_a_second_on_both_sides() {
+    let (host_end, device_end, stall) = stalling_relay(64 * 1024);
+    let (_listener, server, channel) =
+        channels_over(host_end, device_end, vec![CLOCK_CAPABILITY.into()]).await;
+    let (device_closed, host_closed) = (watch_for_close(&channel), watch_for_close(&server));
+
+    // An idle but healthy pipe stays up: the pings keep it alive.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(!device_closed.is_finished() && !host_closed.is_finished());
+    channel.send(b"still here".to_vec()).await.unwrap();
+
+    // The cable goes: no end-of-file, no error, the bytes just stop.
+    let stalled_at = std::time::Instant::now();
+    stall.send(true).unwrap();
+    for (side, closed) in [("device", device_closed), ("host", host_closed)] {
+        let at = tokio::time::timeout(Duration::from_secs(3), closed)
+            .await
+            .unwrap_or_else(|_| panic!("the {side} never noticed the dead pipe"))
+            .unwrap();
+        let took = at.duration_since(stalled_at);
+        assert!(
+            took >= Duration::from_millis(500) && took <= Duration::from_millis(2_500),
+            "the {side} took {took:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_typed_pings_a_pipe_has_no_liveness_of_its_own() {
+    let (host_end, device_end, stall) = stalling_relay(64 * 1024);
+    let (_listener, _server, channel) = channels_over(host_end, device_end, vec![]).await;
+    let closed = watch_for_close(&channel);
+    stall.send(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(!closed.is_finished(), "the channel closed without clock.v1");
+}
