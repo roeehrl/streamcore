@@ -20,6 +20,14 @@ impl LeaseTable {
         Some(self.generation)
     }
 
+    /// Ends whichever lease is live and grants a new one, in one step. Returns the new lease and
+    /// whether one was ended.
+    pub fn take_over(&mut self) -> (u64, bool) {
+        let ended = std::mem::replace(&mut self.live, true);
+        self.generation += 1;
+        (self.generation, ended)
+    }
+
     /// Whether this lease may inject.
     pub fn is_current(&self, lease: u64) -> bool {
         self.live && lease == self.generation
@@ -69,6 +77,17 @@ mod tests {
         assert!(table.is_current(second));
         assert!(table.revoke(second));
         assert!(!table.revoke(second));
+    }
+
+    #[test]
+    fn a_take_over_ends_the_live_lease_and_grants_the_next() {
+        let mut table = LeaseTable::default();
+        let (first, ended) = table.take_over();
+        assert!(!ended && table.is_current(first));
+        let (second, ended) = table.take_over();
+        assert!(ended && table.is_current(second) && !table.is_current(first));
+        assert_eq!(table.acquire(), None);
+        assert!(!table.revoke(first));
     }
 
     #[test]

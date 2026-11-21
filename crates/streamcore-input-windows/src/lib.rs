@@ -15,12 +15,26 @@
 //!
 //! The crate decodes no network messages and knows no product protocol. A host hands
 //! [`InputEvent`]s to an [`Injector`], with points normalized to a [`TargetRect`] it supplies per
-//! event. Only the holder of the [`InputLease`] may inject: the lease is exclusive and revocable,
-//! and revoking it releases every key, button and contact that is held.
+//! event.
+//!
+//! **What the target rectangle scopes.** The rectangle confines the mouse, the pen and touch:
+//! every point is clamped into it, and an event with a number that is not finite is refused. It
+//! does not scope the keyboard. Keys, shortcuts and text go to whichever window has the keyboard
+//! focus, wherever that window is. A host that confines control to one window must give that
+//! window the focus before it injects keys, and keep checking that it still has it.
+//!
+//! **The lease.** Only the holder of the [`InputLease`] may inject. The lease is exclusive and
+//! revocable; when it ends, however it ends, every key, button and contact that is held is
+//! released and what was still queued is discarded. Ending a lease takes effect at once and
+//! never waits for the injection thread; the `_and_wait` calls wait, with a timeout, for the
+//! release to be done. A holder whose lease is ended by someone else hears
+//! [`Feedback::LeaseRevoked`].
 //!
 //! Injection runs on the injector's own thread; [`Injector::inject`] queues and returns. The queue
 //! is bounded: under pressure pointer moves are merged or dropped, and an event that may not be
 //! dropped and does not fit revokes the lease and releases everything, so nothing stays held.
+//! [`Capabilities`] (whether a pen and a touch device exist) is read once, when the injector
+//! starts.
 //!
 //! The rules (key tables, layout mapping, pacing, the pen and touch sessions, the lease,
 //! coordinate mapping and what is held) are portable and tested on every platform, behind the
@@ -46,7 +60,7 @@ mod win;
 pub use engine::{Backend, SendOp};
 pub use event::{
     ClickEvent, Feedback, FeedbackSink, InjectError, InputEvent, PanDragEvent, PenEvent,
-    ScrollEvent, TouchEvent, UnavailableKey, ZoomEvent,
+    RevokeReason, ScrollEvent, TouchEvent, UnavailableKey, ZoomEvent,
 };
 pub use geometry::{TargetRect, VirtualScreen};
 pub use injector::{Capabilities, Injector, InputLease};

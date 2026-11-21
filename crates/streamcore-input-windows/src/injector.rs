@@ -1,17 +1,18 @@
 //! The injector: an injection thread, and the lease that says who may post to it.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::engine::{Backend, Engine};
-use crate::event::{FeedbackSink, InjectError, InputEvent, text_units};
+use crate::event::{Feedback, FeedbackSink, InjectError, InputEvent, RevokeReason, text_units};
 use crate::lease::LeaseTable;
 use crate::queue::{Admission, Inbox};
 
-/// What this computer can inject, found when the injector starts.
+/// What this computer can inject. It is read once, when the injector starts, and does not change
+/// afterwards: an injector started where the devices could not be created keeps saying so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capabilities {
     /// A synthetic pen device exists, so strokes carry pressure, tilt and the eraser. Without
@@ -35,6 +36,8 @@ struct State {
     /// release for the thread; a caller waits until `done` reaches the count it asked at.
     releases_asked: u64,
     releases_done: u64,
+    /// Leases ended without their holder's doing, for the thread to tell the host about.
+    notices: VecDeque<RevokeReason>,
     /// The injector was dropped: the thread finishes up and stops.
     closed: bool,
     /// The thread has stopped (or died), and with it everything it held.
@@ -57,7 +60,7 @@ impl Shared {
     }
 
     /// Discards what is queued and asks the thread to release everything held. Returns the
-    /// count [`wait_released`](Self::wait_released) waits for.
+    /// count [`wait_released`](Self::wait_released) waits for. Never waits itself.
     fn ask_release(&self, state: &mut State) -> u64 {
         state.inbox.clear();
         state.releases_asked += 1;
@@ -65,20 +68,48 @@ impl Shared {
         state.releases_asked
     }
 
-    /// Waits until the release asked for at `asked` is done, or the thread is gone.
-    fn wait_released(&self, mut state: MutexGuard<'_, State>, asked: u64) {
+    /// Notes that a lease was ended by someone other than its holder, for the thread to report
+    /// once the release is done.
+    fn notice(&self, state: &mut State, reason: RevokeReason) {
+        // Only a blocked injection thread lets these pile up, and then nobody is listening:
+        // the oldest gives way.
+        if state.notices.len() == MAX_PENDING_NOTICES {
+            state.notices.pop_front();
+        }
+        state.notices.push_back(reason);
+        self.work.notify_one();
+    }
+
+    /// Waits until the release asked for at `asked` is done. False when `timeout` passes first,
+    /// or the thread is gone without having done it.
+    fn wait_released(
+        &self,
+        mut state: MutexGuard<'_, State>,
+        asked: u64,
+        timeout: Duration,
+    ) -> bool {
+        let started = Instant::now();
         while state.releases_done < asked && !state.stopped {
+            let Some(left) = timeout.checked_sub(started.elapsed()) else {
+                break;
+            };
             state = self
                 .released
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
+        state.releases_done >= asked
     }
 }
 
+/// Most lease-ended notices waiting for the injection thread.
+const MAX_PENDING_NOTICES: usize = 16;
+
 /// The right to inject. One lease is live per injector at a time, whichever connection or client
-/// holds it. Revoking it (or dropping it) releases every key, button and contact that is held,
-/// and events posted with it afterwards fail with [`InjectError::StaleLease`].
+/// holds it. Revoking it (or dropping it) discards what it still has queued and releases every
+/// key, button and contact that is held, and events posted with it afterwards fail with
+/// [`InjectError::StaleLease`].
 pub struct InputLease {
     shared: Arc<Shared>,
     generation: u64,
@@ -90,14 +121,27 @@ impl InputLease {
         self.shared.lock().leases.is_current(self.generation)
     }
 
-    /// Ends the lease, discards what it still has queued and releases everything held. Returns
-    /// once that is done. Later calls do nothing.
+    /// Ends the lease. It is stale as soon as this returns: nothing more of it is injected, and
+    /// the injection thread releases everything held as its next step. The call does not wait
+    /// for that. Later calls do nothing.
     pub fn revoke(&self) {
         let mut state = self.shared.lock();
         if state.leases.revoke(self.generation) {
-            let asked = self.shared.ask_release(&mut state);
-            self.shared.wait_released(state, asked);
+            self.shared.ask_release(&mut state);
         }
+    }
+
+    /// Ends the lease as [`revoke`](Self::revoke) does, then waits up to `timeout` for the
+    /// release to be done. True when everything held has been released; false when the time ran
+    /// out or the injection thread has stopped (the lease is ended either way). On a lease that
+    /// has ended already it waits for the release that followed.
+    pub fn revoke_and_wait(&self, timeout: Duration) -> bool {
+        let mut state = self.shared.lock();
+        if state.leases.revoke(self.generation) {
+            self.shared.ask_release(&mut state);
+        }
+        let asked = state.releases_asked;
+        self.shared.wait_released(state, asked, timeout)
     }
 }
 
@@ -114,7 +158,6 @@ impl Drop for InputLease {
 /// queue does.
 pub struct Injector {
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
     capabilities: Capabilities,
 }
 
@@ -134,7 +177,9 @@ impl Injector {
         let shared = Arc::new(Shared::default());
         let (ready, started) = mpsc::sync_channel(1);
         let for_thread = shared.clone();
-        let thread = std::thread::Builder::new()
+        // The thread is not joined: dropping the injector must not wait for it. It ends by itself
+        // once the injector is gone, releasing everything on its way out.
+        std::thread::Builder::new()
             .name("input-injection".into())
             .spawn(move || {
                 // Whatever ends the thread, nobody is left waiting for it.
@@ -154,11 +199,11 @@ impl Injector {
             .map_err(|_| io::Error::other("the injection thread stopped while starting"))?;
         Ok(Self {
             shared,
-            thread: Some(thread),
             capabilities,
         })
     }
 
+    /// What this computer can inject, as found when the injector started.
     pub fn capabilities(&self) -> Capabilities {
         self.capabilities
     }
@@ -172,7 +217,29 @@ impl Injector {
         })
     }
 
+    /// Takes the lease whoever holds it: ends the live lease, if any, and grants a new one in
+    /// one step, so no other caller can take the lease in between. The former holder's queued
+    /// events are discarded, everything it held is released before anything of the new lease is
+    /// injected, and it hears [`Feedback::LeaseRevoked`](crate::Feedback::LeaseRevoked) with
+    /// [`RevokeReason::TakenOver`]. The call does not wait for the release.
+    pub fn take_over(&self) -> InputLease {
+        let mut state = self.shared.lock();
+        let (generation, ended) = state.leases.take_over();
+        if ended {
+            self.shared.ask_release(&mut state);
+            self.shared.notice(&mut state, RevokeReason::TakenOver);
+        }
+        InputLease {
+            shared: self.shared.clone(),
+            generation,
+        }
+    }
+
     /// Queues an event for the injection thread. It never waits.
+    ///
+    /// An event with a number that is not finite, or a target rectangle without pixels, is
+    /// refused with [`InjectError::InvalidEvent`]: nothing is queued and the lease is untouched.
+    /// Points outside their target are not refused; they are clamped into it.
     ///
     /// Fails with [`InjectError::StaleLease`] when the lease has been revoked or is another
     /// injector's. When the queue is full a pointer move is dropped ([`InjectError::Dropped`]);
@@ -185,6 +252,9 @@ impl Injector {
         }
         if state.stopped {
             return Err(InjectError::Stopped);
+        }
+        if !event.is_valid() {
+            return Err(InjectError::InvalidEvent);
         }
         let busy = state.busy;
         match state.inbox.admit(event, busy) {
@@ -200,44 +270,68 @@ impl Injector {
                 // The caller is not made to wait for the release.
                 state.leases.revoke(lease.generation);
                 self.shared.ask_release(&mut state);
+                self.shared.notice(&mut state, RevokeReason::Overflow);
                 Err(InjectError::Overflow)
             }
         }
     }
 
-    /// Ends whichever lease is live, discards what is queued and releases everything held: every
-    /// key, mouse button, touch and pen contact. Returns once that is done. The holder's lease is
-    /// stale from then on.
+    /// Ends whichever lease is live. The holder's lease is stale as soon as this returns: what
+    /// it had queued is discarded, and the injection thread releases everything held (every key,
+    /// mouse button, touch and pen contact) as its next step. The call does not wait for that.
+    /// The holder hears [`Feedback::LeaseRevoked`](crate::Feedback::LeaseRevoked) with
+    /// [`RevokeReason::Revoked`].
     pub fn revoke(&self) {
-        let mut state = self.shared.lock();
-        state.leases.revoke_current();
-        let asked = self.shared.ask_release(&mut state);
-        self.shared.wait_released(state, asked);
+        drop(self.end_lease());
     }
 
-    /// Discards what is queued and releases everything held without ending the lease, for a
-    /// client that went quiet in the middle of a key or a stroke. Returns once that is done.
+    /// Ends the live lease as [`revoke`](Self::revoke) does, then waits up to `timeout` for the
+    /// release to be done. True when everything held has been released; false when the time ran
+    /// out or the injection thread has stopped (the lease is ended either way).
+    pub fn revoke_and_wait(&self, timeout: Duration) -> bool {
+        let (state, asked) = self.end_lease();
+        self.shared.wait_released(state, asked, timeout)
+    }
+
+    fn end_lease(&self) -> (MutexGuard<'_, State>, u64) {
+        let mut state = self.shared.lock();
+        if state.leases.revoke_current() {
+            self.shared.notice(&mut state, RevokeReason::Revoked);
+        }
+        // Asked for even when no lease is live: the host wants everything let go of.
+        let asked = self.shared.ask_release(&mut state);
+        (state, asked)
+    }
+
+    /// Discards what is queued and has the injection thread release everything held, without
+    /// ending the lease: for a client that went quiet in the middle of a key or a stroke. The
+    /// call does not wait for the release.
     pub fn release_all(&self) {
         let mut state = self.shared.lock();
+        self.shared.ask_release(&mut state);
+    }
+
+    /// As [`release_all`](Self::release_all), then waits up to `timeout` for the release to be
+    /// done. True when it was; false when the time ran out or the injection thread has stopped.
+    pub fn release_all_and_wait(&self, timeout: Duration) -> bool {
+        let mut state = self.shared.lock();
         let asked = self.shared.ask_release(&mut state);
-        self.shared.wait_released(state, asked);
+        self.shared.wait_released(state, asked, timeout)
     }
 }
 
 impl Drop for Injector {
+    /// Ends the live lease and tells the injection thread to stop. The thread releases
+    /// everything held on its way out; the drop does not wait for it. A host about to exit calls
+    /// [`revoke_and_wait`](Self::revoke_and_wait) first, or the process may end before the
+    /// release.
     fn drop(&mut self) {
-        {
-            let mut state = self.shared.lock();
-            state.leases.revoke_current();
-            state.inbox.clear();
-            // The thread releases everything on its way out.
-            state.closed = true;
-            self.shared.work.notify_one();
-        }
-        if let Some(thread) = self.thread.take() {
-            // A panic on the injection thread has already been reported there.
-            let _ = thread.join();
-        }
+        let mut state = self.shared.lock();
+        state.leases.revoke_current();
+        state.inbox.clear();
+        state.notices.clear();
+        state.closed = true;
+        self.shared.work.notify_one();
     }
 }
 
@@ -268,6 +362,12 @@ fn run<B: Backend>(mut engine: Engine<B>, shared: &Shared) {
             state = shared.lock();
             state.releases_done = asked;
             shared.released.notify_all();
+        } else if let Some(reason) = state.notices.pop_front() {
+            // After the release above, so the host hears of a lease's end once nothing of it is
+            // held any more.
+            drop(state);
+            engine.report(Feedback::LeaseRevoked(reason));
+            state = shared.lock();
         } else if let Some(event) = state.inbox.take() {
             // In the thread's hands now: it counts as busy until the engine has it.
             state.busy.0 += 1;
@@ -299,8 +399,11 @@ fn run<B: Backend>(mut engine: Engine<B>, shared: &Shared) {
             state = shared.lock();
         }
     }
+    let asked = state.releases_asked;
     drop(state);
     engine.release_all();
+    // Whoever still waits for a release has it now.
+    shared.lock().releases_done = asked;
 }
 
 #[cfg(test)]
@@ -308,7 +411,6 @@ mod tests {
     use super::*;
     use crate::engine::SendOp;
     use crate::engine::testing::{Call, Calls, FakeBackend};
-    use crate::event::Feedback;
     use streamcore_input::{KeyPacket, KeyPhase, KeyShortcutMessage, KeySpec, TextMessage};
 
     fn injector(calls: &Calls) -> Injector {
@@ -360,6 +462,8 @@ mod tests {
         wait_for("the key to go down", || keys(calls).len() > before);
     }
 
+    /// Long enough for the injection thread to do anything it is asked.
+    const WAIT: Duration = Duration::from_secs(10);
     const A: u16 = 0x41;
     const B: u16 = 0x42;
 
@@ -389,14 +493,16 @@ mod tests {
         let injector = injector(&calls);
         let lease = injector.lease().expect("free");
         hold(&injector, &lease, &calls, 0x04);
-        lease.revoke();
-        // The release has happened by the time revoke returns.
+        assert!(lease.revoke_and_wait(WAIT));
         assert_eq!(keys(&calls), [(A, false), (A, true)]);
         assert_eq!(
             injector.inject(key_down(0x05), &lease),
             Err(InjectError::StaleLease)
         );
-        lease.revoke();
+        assert!(
+            lease.revoke_and_wait(WAIT),
+            "the release that followed is done"
+        );
         assert_eq!(
             keys(&calls).len(),
             2,
@@ -411,7 +517,7 @@ mod tests {
         let lease = injector.lease().expect("free");
         hold(&injector, &lease, &calls, 0x04);
         drop(lease);
-        assert_eq!(keys(&calls), [(A, false), (A, true)]);
+        wait_for("the release", || keys(&calls) == [(A, false), (A, true)]);
         assert!(injector.lease().is_some());
     }
 
@@ -421,7 +527,7 @@ mod tests {
         let injector = injector(&calls);
         let old = injector.lease().expect("free");
         hold(&injector, &old, &calls, 0x04);
-        injector.revoke();
+        assert!(injector.revoke_and_wait(WAIT));
         assert_eq!(keys(&calls), [(A, false), (A, true)]);
         assert_eq!(
             injector.inject(key_down(0x04), &old),
@@ -433,7 +539,7 @@ mod tests {
         // The former holder going away late must not release the new holder's key.
         drop(old);
         hold(&injector, &new, &calls, 0x05);
-        new.revoke();
+        assert!(new.revoke_and_wait(WAIT));
         assert_eq!(
             keys(&calls)[2..],
             [(A, false), (B, false), (A, true), (B, true)]
@@ -446,7 +552,7 @@ mod tests {
         let injector = injector(&calls);
         let lease = injector.lease().expect("free");
         hold(&injector, &lease, &calls, 0x04);
-        injector.release_all();
+        assert!(injector.release_all_and_wait(WAIT));
         assert_eq!(keys(&calls), [(A, false), (A, true)]);
         assert!(lease.is_current());
         assert_eq!(injector.inject(key_down(0x05), &lease), Ok(()));
@@ -475,7 +581,7 @@ mod tests {
         let lease = injector.lease().expect("free");
         hold(&injector, &lease, &calls, 0x04);
         drop(injector);
-        assert_eq!(keys(&calls), [(A, false), (A, true)]);
+        wait_for("the release", || keys(&calls) == [(A, false), (A, true)]);
         assert!(!lease.is_current());
         lease.revoke();
     }
@@ -533,7 +639,7 @@ mod tests {
         injector.inject(text(200), &lease).expect("current");
         injector.inject(key_down(0x05), &lease).expect("current");
         wait_for("typing to start", || !keys(&calls).is_empty());
-        lease.revoke();
+        assert!(lease.revoke_and_wait(WAIT));
         let typed = keys(&calls);
         assert!(typed.len() < 400, "the text was cut off");
         assert_eq!(typed.last(), Some(&(A, true)), "the key in mid-tap came up");
@@ -571,7 +677,7 @@ mod tests {
             Err(InjectError::StaleLease)
         );
         // The overflow did not wait for the release; a release that does wait comes after it.
-        injector.release_all();
+        assert!(injector.release_all_and_wait(WAIT));
         let typed = keys(&calls);
         assert!(typed.is_empty() || typed.last() == Some(&(A, true)));
         assert!(
@@ -595,7 +701,7 @@ mod tests {
             Err(InjectError::Overflow)
         );
         assert!(!lease.is_current());
-        injector.release_all();
+        assert!(injector.release_all_and_wait(WAIT));
         assert!(keys(&calls).is_empty(), "none of it was typed");
     }
 
@@ -624,8 +730,206 @@ mod tests {
             injector.inject(key_down(0x04), &lease) == Err(InjectError::Stopped)
         });
         // Nobody waits for a thread that is gone.
+        assert!(!lease.revoke_and_wait(WAIT));
+        assert!(!injector.revoke_and_wait(WAIT));
+        assert!(!injector.release_all_and_wait(WAIT));
+    }
+
+    fn listening_injector(calls: &Calls) -> (Injector, mpsc::Receiver<Feedback>) {
+        let calls = calls.clone();
+        let (heard, feedback) = mpsc::channel();
+        let injector = Injector::with_backend(
+            move || FakeBackend::new(calls),
+            move |feedback| {
+                let _ = heard.send(feedback);
+            },
+        )
+        .expect("starts");
+        (injector, feedback)
+    }
+
+    #[test]
+    fn an_event_with_a_number_that_is_not_finite_is_refused_and_costs_nothing() {
+        let calls = Calls::default();
+        let injector = injector(&calls);
+        let lease = injector.lease().expect("free");
+        let mut bad_hover = hover();
+        if let InputEvent::Pen(pen) = &mut bad_hover {
+            pen.sample.x = f32::NAN;
+        }
+        let mut no_target = hover();
+        if let InputEvent::Pen(pen) = &mut no_target {
+            pen.target = crate::geometry::TargetRect::new(0, 0, 0, 10);
+        }
+        let bad_scroll = InputEvent::Scroll(crate::event::ScrollEvent {
+            dx: f64::INFINITY,
+            dy: 0.0,
+            target: crate::geometry::TargetRect::new(0, 0, 10, 10),
+        });
+        for event in [bad_hover, no_target, bad_scroll] {
+            assert_eq!(
+                injector.inject(event, &lease),
+                Err(InjectError::InvalidEvent)
+            );
+        }
+        // The lease is untouched, and nothing reached the computer.
+        assert!(lease.is_current());
+        assert!(injector.release_all_and_wait(WAIT));
+        assert!(calls.lock().expect("calls").is_empty());
+        assert_eq!(injector.inject(hover(), &lease), Ok(()));
+        // A stale lease is said first: a refused holder learns nothing about its event.
         lease.revoke();
+        let mut bad = hover();
+        if let InputEvent::Pen(pen) = &mut bad {
+            pen.sample.force = f32::NAN;
+        }
+        assert_eq!(injector.inject(bad, &lease), Err(InjectError::StaleLease));
+    }
+
+    #[test]
+    fn revoking_and_dropping_never_wait_for_a_blocked_injection_thread() {
+        let calls = Calls::default();
+        let (open, gate) = mpsc::channel::<()>();
+        let for_backend = calls.clone();
+        let injector = Injector::with_backend(
+            move || {
+                let mut backend = FakeBackend::new(for_backend);
+                backend.gate = Some(gate);
+                backend
+            },
+            |_| {},
+        )
+        .expect("starts");
+        let lease = injector.lease().expect("free");
+        // The key goes down, and the thread stays inside that call.
+        hold(&injector, &lease, &calls, 0x04);
+        let started = Instant::now();
+        lease.revoke();
+        assert!(!lease.is_current(), "the lease is stale at once");
         injector.revoke();
+        injector.release_all();
+        let next = injector.take_over();
+        assert_eq!(injector.inject(key_down(0x05), &next), Ok(()));
+        // The waiting forms give up at their timeout and say so.
+        let short = Duration::from_millis(30);
+        assert!(!next.revoke_and_wait(short));
+        assert!(!injector.revoke_and_wait(short));
+        assert!(!injector.release_all_and_wait(short));
+        drop(next);
+        drop(lease);
+        drop(injector);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "something waited for the thread"
+        );
+        assert_eq!(
+            keys(&calls),
+            [(A, false)],
+            "the thread is still inside its call"
+        );
+        // Let go of the thread: it releases the key on its way out, though nobody waits.
+        drop(open);
+        wait_for("the release", || keys(&calls) == [(A, false), (A, true)]);
+    }
+
+    #[test]
+    fn a_take_over_leaves_no_gap_for_another_caller() {
+        let calls = Calls::default();
+        let injector = injector(&calls);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut held = injector.take_over();
+        std::thread::scope(|scope| {
+            // A competitor grabs the lease the moment it is free.
+            let competitor = scope.spawn(|| {
+                let mut wins = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(lease) = injector.lease() {
+                        wins += 1;
+                        lease.revoke();
+                    }
+                }
+                wins
+            });
+            for _ in 0..20_000 {
+                let next = injector.take_over();
+                assert!(next.is_current(), "somebody else got in between");
+                assert!(!held.is_current());
+                held = next;
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(competitor.join().expect("competitor"), 0);
+        });
+        // The lease taken over works like any other.
+        hold(&injector, &held, &calls, 0x04);
+        assert!(held.revoke_and_wait(WAIT));
+        assert_eq!(keys(&calls), [(A, false), (A, true)]);
+    }
+
+    #[test]
+    fn a_take_over_releases_the_former_holders_keys_before_the_new_ones() {
+        let calls = Calls::default();
+        let (injector, feedback) = listening_injector(&calls);
+        let old = injector.lease().expect("free");
+        hold(&injector, &old, &calls, 0x04);
+        let new = injector.take_over();
+        assert_eq!(
+            injector.inject(key_down(0x04), &old),
+            Err(InjectError::StaleLease)
+        );
+        hold(&injector, &new, &calls, 0x05);
+        assert_eq!(keys(&calls), [(A, false), (A, true), (B, false)]);
+        assert_eq!(
+            feedback.recv_timeout(WAIT),
+            Ok(Feedback::LeaseRevoked(RevokeReason::TakenOver))
+        );
+        // The former holder letting go late changes nothing for the new one.
+        drop(old);
+        assert!(new.is_current());
+    }
+
+    #[test]
+    fn the_holder_hears_when_its_lease_is_ended_for_it() {
+        let calls = Calls::default();
+        let (injector, feedback) = listening_injector(&calls);
+        let heard = || feedback.recv_timeout(WAIT);
+        let quiet = || feedback.recv_timeout(Duration::from_millis(100)).is_err();
+
+        // By the host.
+        let lease = injector.lease().expect("free");
+        assert!(injector.revoke_and_wait(WAIT));
+        assert_eq!(heard(), Ok(Feedback::LeaseRevoked(RevokeReason::Revoked)));
+        // Once per lease: revoking again, with no lease live, says nothing.
+        assert!(injector.revoke_and_wait(WAIT));
+        drop(lease);
+        assert!(quiet());
+
+        // By an overflow.
+        let lease = injector.lease().expect("free");
+        let too_long = text(crate::MAX_PENDING_TEXT_UNITS + 1);
+        assert_eq!(
+            injector.inject(too_long, &lease),
+            Err(InjectError::Overflow)
+        );
+        assert_eq!(heard(), Ok(Feedback::LeaseRevoked(RevokeReason::Overflow)));
+        assert_eq!(
+            injector.inject(text(1), &lease),
+            Err(InjectError::StaleLease)
+        );
+        assert!(quiet());
+
+        // By a take-over; taking over a lease that is not live any more says nothing.
+        let lease = injector.take_over();
+        assert!(quiet());
+        let next = injector.take_over();
+        assert_eq!(heard(), Ok(Feedback::LeaseRevoked(RevokeReason::TakenOver)));
+        drop(lease);
+
+        // Not for the holder's own doing.
+        assert!(next.revoke_and_wait(WAIT));
+        let own = injector.lease().expect("free");
+        drop(own);
+        assert!(injector.release_all_and_wait(WAIT));
+        assert!(quiet());
     }
 
     #[test]

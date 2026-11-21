@@ -553,8 +553,8 @@ mod selftest {
     // Leaving nothing behind.
 
     /// Puts the computer back when the run ends, however it ends: the window is closed and the
-    /// pointer and the clipboard text restored. The injector is declared after this and so is
-    /// dropped before it, which releases everything it held.
+    /// pointer and the clipboard text restored. The bench with the injector is declared after this
+    /// and so is dropped before it, which releases everything it held.
     struct Restore {
         window: isize,
         thread: Option<JoinHandle<()>>,
@@ -596,6 +596,14 @@ mod selftest {
         edit: HWND,
         thread: u32,
         restore: &'a Restore,
+    }
+
+    impl Drop for Bench<'_> {
+        /// Dropping the injector releases what it holds without waiting for that, and the
+        /// process is about to end: wait here, so no key is left down behind it.
+        fn drop(&mut self) {
+            self.injector.revoke_and_wait(Duration::from_secs(3));
+        }
     }
 
     fn sample(phase: PencilPhase, kind: PointerKind, x: f32, y: f32, force: f32) -> PencilSample {
@@ -1126,8 +1134,9 @@ mod selftest {
                 }
                 sleep(Duration::from_millis(10));
             }
-            self.lease.revoke();
-            // The release is done when revoke returns; no waiting here.
+            if !self.lease.revoke_and_wait(Duration::from_secs(3)) {
+                return fail("the release after the revoke was not done within 3 s");
+            }
             let (shift, key_down) = (key_is_down(VK_SHIFT), key_is_down(letter));
             if shift || key_down {
                 return fail(format!(

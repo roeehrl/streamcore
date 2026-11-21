@@ -19,7 +19,7 @@ use crate::event::{
     ClickEvent, Feedback, FeedbackSink, InputEvent, PanDragEvent, PenEvent, ScrollEvent,
     TouchEvent, UnavailableKey, ZoomEvent, text_units,
 };
-use crate::geometry::{self, VirtualScreen, ZoomNotches};
+use crate::geometry::{self, TargetRect, VirtualScreen, ZoomNotches};
 use crate::keys;
 use crate::layout::{self, HostKeyState, KeyLayout, KeyStroke, ShortcutPlan, TextStep};
 use crate::pacer::{KeyPacer, Pace};
@@ -230,6 +230,11 @@ impl<B: Backend> Engine<B> {
         &self.backend
     }
 
+    /// Passes the host something the injector itself has to say.
+    pub(crate) fn report(&self, feedback: Feedback) {
+        self.feedback.feedback(feedback);
+    }
+
     /// Takes one event at `now` (milliseconds on a monotonic clock).
     pub(crate) fn handle(&mut self, event: InputEvent, now: u64) {
         match event {
@@ -343,7 +348,7 @@ impl<B: Backend> Engine<B> {
         }
         self.send(&buttons);
         let steps = self.pan.release();
-        self.post_pan(&steps);
+        self.post_pan(&steps, None);
         self.zoom.reset();
     }
 
@@ -559,14 +564,18 @@ impl<B: Backend> Engine<B> {
     fn pan_drag(&mut self, event: PanDragEvent) {
         let start = match event.anchor {
             Some((x, y)) => event.target.point(x, y),
-            None => self.backend.cursor_position(),
+            None => {
+                let (x, y) = self.backend.cursor_position();
+                event.target.confine(x, y)
+            }
         };
         let (dx, dy) = event.target.delta(event.dx, event.dy);
         let steps = self.pan.plan(event.phase, event.via, dx, dy, start);
-        self.post_pan(&steps);
+        self.post_pan(&steps, Some(event.target));
     }
 
-    fn post_pan(&mut self, steps: &[PanDragStep]) {
+    /// Posts a pan drag's steps. The pointer stays inside `target`, however far the pan goes.
+    fn post_pan(&mut self, steps: &[PanDragStep], target: Option<TargetRect>) {
         let button = |middle| {
             if middle {
                 StrokeButton::Middle
@@ -577,7 +586,10 @@ impl<B: Backend> Engine<B> {
         for step in steps {
             let mut ops = Vec::new();
             match *step {
-                PanDragStep::MoveTo(x, y) => ops.push(self.move_to(x, y)),
+                PanDragStep::MoveTo(x, y) => {
+                    let (x, y) = target.map_or((x, y), |target| target.confine(x, y));
+                    ops.push(self.move_to(x, y));
+                }
                 PanDragStep::Press { middle } => ops.push(SendOp::Button {
                     button: button(middle),
                     down: true,
@@ -935,6 +947,9 @@ pub(crate) mod testing {
         pub touch_refused: bool,
         pub layout: fn() -> FakeLayout,
         pub state: HostKeyState,
+        /// When set, every `send` stays inside the call until a token arrives or the sender is
+        /// dropped: an injection thread stuck in Windows.
+        pub gate: Option<std::sync::mpsc::Receiver<()>>,
     }
 
     impl FakeBackend {
@@ -947,6 +962,7 @@ pub(crate) mod testing {
                 touch_refused: false,
                 layout: FakeLayout::us,
                 state: HostKeyState::default(),
+                gate: None,
             }
         }
 
@@ -973,6 +989,10 @@ pub(crate) mod testing {
 
         fn send(&mut self, batch: &[SendOp]) {
             self.record(Call::Send(batch.to_vec()));
+            if let Some(gate) = &self.gate {
+                // An error is the sender dropped: the gate is open for good.
+                let _ = gate.recv();
+            }
         }
 
         fn pen_available(&self) -> bool {
@@ -1558,6 +1578,151 @@ mod tests {
         assert_eq!(rig.sent(), [[button(left, false)], [space(true)]]);
     }
 
+    // Confinement to the target.
+
+    /// The absolute move to a desktop point.
+    fn moved(x: i32, y: i32) -> SendOp {
+        let (x, y) = SCREEN.absolute(x, y);
+        SendOp::MoveTo { x, y }
+    }
+
+    /// `TARGET`'s first and last pixels: (100, 200) and (1099, 699).
+    const FAR: (f32, f32) = (7.5, 1.5);
+    const NEAR: (f32, f32) = (-0.5, -3.0);
+
+    #[test]
+    fn a_pen_sample_outside_the_target_lands_on_its_edge() {
+        let sample = |x, y| PencilSample {
+            phase: PencilPhase::Hover,
+            kind: PointerKind::Pen,
+            button: StrokeButton::Left,
+            x,
+            y,
+            force: 0.0,
+            altitude: 0.0,
+            azimuth: 0.0,
+            roll: 0.0,
+            hover_z: 0.0,
+            timestamp: 0.0,
+        };
+        let hover = |rig: &mut Rig, (x, y)| {
+            let event = PenEvent {
+                sample: sample(x, y),
+                target: TARGET,
+                right_button_is_barrel: false,
+            };
+            rig.engine.handle(InputEvent::Pen(event), 0);
+        };
+        let mut rig = Rig::new();
+        hover(&mut rig, FAR);
+        hover(&mut rig, NEAR);
+        let positions: Vec<_> = rig
+            .calls()
+            .into_iter()
+            .map(|call| match call {
+                Call::Pen { position, .. } => position,
+                other => panic!("not a pen frame: {other:?}"),
+            })
+            .collect();
+        // From the virtual origin at x = -1000.
+        assert_eq!(positions, [(2099, 699), (1100, 200)]);
+        // The mouse path is confined the same way.
+        let mut rig = Rig::with(|backend| backend.pen = false);
+        hover(&mut rig, FAR);
+        hover(&mut rig, NEAR);
+        assert_eq!(rig.sent(), [[moved(1099, 699)], [moved(100, 200)]]);
+    }
+
+    #[test]
+    fn a_click_outside_the_target_lands_on_its_edge() {
+        let mut rig = Rig::new();
+        for (x, y) in [FAR, NEAR] {
+            let event = ClickEvent {
+                x,
+                y,
+                button: StrokeButton::Left,
+                phase: KeyPhase::Down,
+                target: TARGET,
+            };
+            rig.engine.handle(InputEvent::Click(event), 0);
+        }
+        let down = button(StrokeButton::Left, true);
+        assert_eq!(
+            rig.sent(),
+            [[moved(1099, 699), down], [moved(100, 200), down]]
+        );
+    }
+
+    #[test]
+    fn touch_contacts_outside_the_target_land_on_its_edge() {
+        let mut rig = Rig::new();
+        let event = TouchEvent {
+            phase: GesturePhase::Began,
+            contacts: [FAR, NEAR],
+            target: TARGET,
+        };
+        rig.engine.handle(InputEvent::Touch(event), 0);
+        assert!(matches!(
+            rig.calls().as_slice(),
+            [Call::Touch(_, [(2099, 699), (1100, 200)])]
+        ));
+    }
+
+    #[test]
+    fn a_zoom_anchor_outside_the_target_lands_on_its_edge() {
+        let mut rig = Rig::new();
+        let event = ZoomEvent {
+            phase: GesturePhase::Changed,
+            delta: 0.5,
+            anchor: Some(FAR),
+            modifiers: 0,
+            target: TARGET,
+        };
+        rig.engine.handle(InputEvent::Zoom(event), 0);
+        assert_eq!(rig.sent(), [[moved(1099, 699), wheel(120)]]);
+    }
+
+    #[test]
+    fn a_pan_drag_starts_and_stays_inside_the_target() {
+        let drag = |rig: &mut Rig, phase, dx, anchor| {
+            let event = PanDragEvent {
+                phase,
+                via: PanDelivery::MiddleDrag,
+                dx,
+                dy: 0.0,
+                anchor,
+                target: TARGET,
+            };
+            rig.engine.handle(InputEvent::PanDrag(event), 0);
+            rig.sent()
+        };
+        let press = button(StrokeButton::Middle, true);
+        let mut rig = Rig::new();
+        assert_eq!(
+            drag(&mut rig, GesturePhase::Began, 0.0, Some(FAR)),
+            [vec![moved(1099, 699)], vec![press]]
+        );
+        // A pan far past the left edge stops at the edge.
+        assert_eq!(
+            drag(&mut rig, GesturePhase::Changed, -50.0, None),
+            [[moved(100, 699)]]
+        );
+        // Without a centroid the drag starts at the pointer, brought inside: the fake pointer is
+        // at (500, 600), and a target elsewhere does not let the drag start outside it.
+        let mut rig = Rig::new();
+        let elsewhere = TargetRect::new(2000, 2000, 10, 10);
+        let event = PanDragEvent {
+            phase: GesturePhase::Began,
+            via: PanDelivery::MiddleDrag,
+            dx: 0.0,
+            dy: 0.0,
+            anchor: None,
+            target: elsewhere,
+        };
+        rig.engine.handle(InputEvent::PanDrag(event), 0);
+        assert_eq!(rig.sent(), [vec![moved(2000, 2000)], vec![press]]);
+    }
+
     // Touch.
 
     fn touch(rig: &mut Rig, phase: GesturePhase, now: u64) {
@@ -1572,7 +1737,7 @@ mod tests {
     #[test]
     fn two_contacts_go_down_are_refreshed_and_lift() {
         let mut rig = Rig::new();
-        let contacts = [(1100, 200), (2100, 700)];
+        let contacts = [(1100, 200), (2099, 699)];
         let held = POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
         touch(&mut rig, GesturePhase::Began, 0);
         assert_eq!(
