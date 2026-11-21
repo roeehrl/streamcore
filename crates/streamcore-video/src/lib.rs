@@ -53,6 +53,8 @@ pub use executor::{
     on_executor,
 };
 pub use sink::{SendTicket, SinkPolicy, SinkState, SinkTransport, VideoOutput};
+#[cfg(feature = "usb")]
+pub use streamcore_usb as usb;
 /// The design's name for [`StreamEncoder`]: Rust backends may implement either.
 pub use traits::StreamEncoder as Encoder;
 pub use traits::*;

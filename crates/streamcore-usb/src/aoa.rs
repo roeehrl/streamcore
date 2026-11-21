@@ -36,7 +36,6 @@ use streamcore_transport::transport::PipeIo;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     sync::{mpsc, oneshot, watch},
-    task::JoinHandle,
 };
 
 /// The link version both sides must share.
@@ -86,6 +85,7 @@ impl Kind {
 /// Which end of the cable this is. The host opens pipes, the device accepts
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ffi", derive(uniffi::Enum))]
 pub enum LinkRole {
     Host,
     Device,
@@ -236,14 +236,24 @@ pub struct AcceptedPipe {
 pub struct AccessoryLink {
     shared: Arc<Shared>,
     accepted: tokio::sync::Mutex<mpsc::Receiver<AcceptedPipe>>,
-    tasks: [JoinHandle<()>; 2],
 }
+
+/// A task of the link, for whoever runs it.
+pub type LinkTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 impl AccessoryLink {
     /// Starts the link on `io`, the accessory's raw byte stream, on the
     /// current runtime. The link hello is exchanged in the background: a peer
     /// with another version or the same role ends the link.
     pub fn start(io: PipeIo, role: LinkRole) -> Self {
+        Self::start_with(io, role, |task| {
+            tokio::spawn(task);
+        })
+    }
+
+    /// [`Self::start`] with the link's two tasks handed to `spawn`. They end
+    /// when the link does.
+    pub fn start_with(io: PipeIo, role: LinkRole, spawn: impl Fn(LinkTask)) -> Self {
         let (mut reader, mut writer) = tokio::io::split(io);
         let (out, mut frames) = mpsc::channel::<Frame>(WRITE_QUEUE);
         let (accept_tx, accept_rx) = mpsc::channel(MAX_DEVICE_PIPES);
@@ -263,7 +273,7 @@ impl AccessoryLink {
             .try_send(Frame::control(Kind::LinkHello, 0, hello));
 
         let write_shared = shared.clone();
-        let write_task = tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let mut closed = write_shared.closed.subscribe();
             loop {
                 let frame = tokio::select! {
@@ -279,20 +289,19 @@ impl AccessoryLink {
             }
             let _ = writer.shutdown().await;
             write_shared.end();
-        });
+        }));
         let read_shared = shared.clone();
-        let read_task = tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let mut closed = read_shared.closed.subscribe();
             tokio::select! {
                 () = read_loop(&mut reader, &read_shared, &accept_tx) => {}
                 _ = closed.wait_for(|closed| *closed) => {}
             }
             read_shared.end();
-        });
+        }));
         Self {
             shared,
             accepted: tokio::sync::Mutex::new(accept_rx),
-            tasks: [write_task, read_task],
         }
     }
 
@@ -363,9 +372,6 @@ impl AccessoryLink {
 impl Drop for AccessoryLink {
     fn drop(&mut self) {
         self.shared.end();
-        for task in &self.tasks {
-            task.abort();
-        }
     }
 }
 

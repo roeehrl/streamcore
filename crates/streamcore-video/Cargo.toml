@@ -17,6 +17,7 @@ streamcore-transport = { path = "../streamcore-transport" }
 uniffi.workspace = true
 thiserror.workspace = true
 async-trait = { workspace = true, optional = true }
+streamcore-usb = { path = "../streamcore-usb", optional = true, features = ["ffi"] }
 
 [dev-dependencies]
 rand.workspace = true
@@ -26,6 +27,9 @@ tokio.workspace = true
 # The binding smoke surface (an async foreign trait round trip, 3.8). Built into the
 # Apple test package; not part of the stream API.
 ffi-probe = ["dep:async-trait"]
+# Links the USB providers' binding surface (`streamcore-usb`, feature `ffi`) into this
+# library, so one native library carries it beside the stream API.
+usb = ["dep:streamcore-usb"]
 bindgen = ["uniffi/cli"]
 
 [[bin]]
