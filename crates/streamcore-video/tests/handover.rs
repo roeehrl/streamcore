@@ -82,7 +82,7 @@ fn a_detached_stream_parks_and_continues_on_the_attached_transport_with_one_keyf
     assert_eq!(s.out.packets().len(), before);
 
     let (out, output) = second_out(&s);
-    let op = s.controller.attach_transport(output);
+    let op = s.controller.attach_transport(output, None);
     s.pump();
     assert_eq!(s.observer.results(op), vec![OpOutcome::Completed]);
     // The latest image goes out at once, as a keyframe.
@@ -132,7 +132,7 @@ fn a_closed_channel_parks_the_stream_instead_of_failing_it() {
     assert_no_loss(&s);
 
     let (out, output) = second_out(&s);
-    s.controller.attach_transport(output);
+    s.controller.attach_transport(output, None);
     s.pump();
     s.encoder().complete_all();
     s.pump();
@@ -156,7 +156,7 @@ fn attaching_while_live_moves_the_stream_without_a_park() {
     let before = s.out.packets().len();
 
     let (out, output) = second_out(&s);
-    let op = s.controller.attach_transport(output);
+    let op = s.controller.attach_transport(output, None);
     s.pump();
     assert_eq!(s.observer.results(op), vec![OpOutcome::Completed]);
     assert!(parks(&s).is_empty());
@@ -212,7 +212,7 @@ fn an_attach_in_time_ends_the_park_for_good() {
     s.pump();
     s.advance_ms(2_500);
     let (out, output) = second_out(&s);
-    s.controller.attach_transport(output);
+    s.controller.attach_transport(output, None);
     s.pump();
     s.encoder().complete_all();
     s.pump();
@@ -233,14 +233,14 @@ fn a_second_handover_works_like_the_first() {
     let s = stream();
     deliver(&s, &s.out);
     let (a, output_a) = second_out(&s);
-    s.controller.attach_transport(output_a);
+    s.controller.attach_transport(output_a, None);
     s.pump();
     deliver(&s, &a);
     a.closed.store(true, Ordering::SeqCst);
     deliver(&s, &a);
     assert_eq!(parks(&s), vec![true]);
     let (b, output_b) = second_out(&s);
-    s.controller.attach_transport(output_b);
+    s.controller.attach_transport(output_b, None);
     s.pump();
     deliver(&s, &b);
     deliver(&s, &b);
@@ -260,7 +260,7 @@ fn a_revoked_stream_refuses_an_attach() {
     s.controller.revoke();
     s.pump();
     let (out, output) = second_out(&s);
-    let op = s.controller.attach_transport(output);
+    let op = s.controller.attach_transport(output, None);
     s.pump();
     assert_eq!(
         s.observer.results(op),
@@ -270,6 +270,42 @@ fn a_revoked_stream_refuses_an_attach() {
     );
     s.frame(s.clock.now_ns());
     assert!(out.packets().is_empty());
+    s.close();
+    s.assert_clean();
+}
+
+#[test]
+fn an_attach_starts_one_keep_warm_hold() {
+    const REFRESH_60: u64 = SECOND / 60;
+    let s = Manual::with(|_, parts| {
+        parts.plan.refresh_interval_ns = Some(REFRESH_60);
+        parts.plan.pacing.keep_warm_ms = 300;
+        parts.plan.pacing.rate_adaptation = true;
+    });
+    s.start_running();
+    deliver(&s, &s.out);
+    s.controller.detach_transport();
+    s.pump();
+    let (out, output) = second_out(&s);
+    out.sync_receipts.store(true, Ordering::SeqCst);
+    s.controller.attach_transport(output, Some(40_000_000));
+    s.pump();
+    // The user is idle and the screen still: repeats follow the keyframe for
+    // the hold, then stop.
+    for _ in 0..300 {
+        s.queue.advance(2 * MS);
+        s.encoder().complete_all();
+        s.pump();
+    }
+    let stats = s.controller.stats();
+    assert!(
+        (10..=20).contains(&stats.keep_warm_repeats),
+        "{} repeats",
+        stats.keep_warm_repeats
+    );
+    let keyframes = out.packets().iter().filter(|p| p.meta.keyframe).count();
+    assert_eq!(keyframes, 1);
+    assert_no_loss(&s);
     s.close();
     s.assert_clean();
 }

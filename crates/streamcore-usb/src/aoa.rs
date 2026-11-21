@@ -635,7 +635,14 @@ impl AsyncWrite for LinkPipe {
         }
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // A frame still on its way to the cable's queue goes before the close.
+        if let Some((sending, _)) = self.sending.as_mut() {
+            if sending.as_mut().poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            self.sending = None;
+        }
         self.shared.close_session(self.id);
         Poll::Ready(Ok(()))
     }
