@@ -41,19 +41,21 @@ The secure channel takes each product's lane rule as a `multiplex::LanePolicy`
 (`channel::connect_secure_with` / `listen_secure_with`); `connect_secure` /
 `listen_secure` use the binary kinds alone.
 
-## Legacy identifiers
+## Wire names
 
-StreamCore began inside MyCNC, and some wire constants still carry MyCNC's name.
-They stay, because changing them would break every device already paired:
+The names on the wire are StreamCore's own:
 
 | Constant | Where | Value |
 |---|---|---|
-| Session ALPN | `streamcore-transport/src/identity.rs` (`SESSION_ALPN`) | `mycnc/2` |
-| Peer certificate name | `identity.rs` (`PEER_DNS_NAME`) | `peer.mycnc.invalid` |
-| OPAQUE pairing contexts | `streamcore-transport/src/pairing.rs` | `mycnc-pairing-pin-v1`, `mycnc-pairing-persisted-v1`, `mycnc-pairing-v1:host:client:` |
+| Session ALPN | `streamcore-transport/src/identity.rs` (`SESSION_ALPN`) | `streamcore/2` |
+| Peer certificate name | `identity.rs` (`PEER_DNS_NAME`) | `peer.streamcore.invalid` |
+| OPAQUE pairing contexts | `streamcore-transport/src/pairing.rs` | `streamcore-pairing-pin-v1`, `streamcore-pairing-persisted-v1`, `streamcore-pairing-v1:host:client:` |
 
-Renaming any of them is a protocol change that needs a new transport major and a
-migration for paired devices.
+They replaced the names the code was extracted with, before any release. An
+identity or a pinned peer certificate made under the old names does not work
+with this version: loading one fails with `IdentityError::LegacyIdentity`, and
+the devices pair again with new identities. Changing any of these names again
+is a protocol change that breaks every paired device.
 
 ## Building and testing
 

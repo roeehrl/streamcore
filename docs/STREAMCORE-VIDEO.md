@@ -13,8 +13,8 @@ StreamCore later and adopts the same control hello then. Each consumer keeps its
 plan, devices and field evidence in its own repository. The **host app** captures and encodes, the
 **client app** decodes and presents, and a **consumer** is a product built on StreamCore.
 
-**Names.** The legacy wire constants (ALPN `mycnc/2`, `peer.mycnc.invalid`, `mycnc-pairing-*`;
-[README](../README.md#legacy-identifiers)) do not change. The runtime thread is `streamcore-network`
+**Names.** The wire constants are ALPN `streamcore/2`, `peer.streamcore.invalid` and
+`streamcore-pairing-*` ([README](../README.md#wire-names)). The runtime thread is `streamcore-network`
 (`crates/streamcore-transport/src/runtime.rs:55`). **Transport Hello** is `protocol::Hello`
 (`{major, capabilities, required}`, major 2, `crates/streamcore-transport/src/protocol.rs:27-31`),
 exchanged inside `dial` and accept. **Control hello** is a consumer's first application message and
@@ -86,7 +86,7 @@ client.
 
 ### 2.1 Contract versions
 
-Transport Hello major 2, ALPN `mycnc/2` (`crates/streamcore-transport/src/protocol.rs:8`,
+Transport Hello major 2, ALPN `streamcore/2` (`crates/streamcore-transport/src/protocol.rs:8`,
 `identity.rs:14-15`); media `frames.v3`, a 29-byte LE video header with a 32 MiB cap
 (`crates/streamcore-media/src/media.rs:3-5`); each consumer's control protocol version is a required
 exact transport Hello capability that the consumer bumps. This design moves frames.v3 → frames.v4
@@ -1297,7 +1297,7 @@ sample of a 10 s window and tracks drift; one-way numbers carry ±RTT/2. Ships a
 
 ## 10. Contract changes
 
-The session ALPN (legacy value `mycnc/2`), the transport major and the legacy constants do not
+The session ALPN (`streamcore/2`), the transport major and the other wire names do not
 change. Each bump below is a hard capability break: host and client ship together.
 
 | Change | Mechanism | Owner |
