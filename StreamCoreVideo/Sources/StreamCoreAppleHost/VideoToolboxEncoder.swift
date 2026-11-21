@@ -61,7 +61,8 @@ public final class VideoToolboxEncoderFactory: EncoderFactory, @unchecked Sendab
     private let sessionFactory: SessionFactory
     private let authorize: @Sendable () -> Bool
     private let lock = NSLock()
-    private var made: [VideoToolboxStreamEncoder] = []
+    private struct Made { weak var encoder: VideoToolboxStreamEncoder? }
+    private var made: [Made] = []
 
     /// `authorize` runs on the output thread before each output reaches Rust: false drops
     /// the output (the product's authority over the source lapsed; the caller revokes the
@@ -74,8 +75,9 @@ public final class VideoToolboxEncoderFactory: EncoderFactory, @unchecked Sendab
         self.sessionFactory = sessionFactory
     }
 
-    /// Every session this factory created, oldest first (tests).
-    public var sessions: [VideoToolboxStreamEncoder] { lock.withLock { made } }
+    /// The sessions this factory created that are still alive, oldest first. Held weakly:
+    /// a host re-creates sessions for the life of the factory (resize, rotation, colour).
+    public var sessions: [VideoToolboxStreamEncoder] { lock.withLock { made.compactMap(\.encoder) } }
 
     /// What VideoToolbox on this Mac does, from a probe session per codec (cached for the
     /// process): LTR and temporal layers are `confirmed` only when the session took the
@@ -91,7 +93,10 @@ public final class VideoToolboxEncoderFactory: EncoderFactory, @unchecked Sendab
         // Per-frame submits go through StreamCore's C ABI; the stream holds `encoder`.
         StreamCoreNative.attachEncoder(sink: spec.sink.nativeKey(), encoder: encoder,
                                        submit: VideoToolboxStreamEncoder.nativeSubmit)
-        lock.withLock { made.append(encoder) }
+        lock.withLock {
+            made.removeAll { $0.encoder == nil }
+            made.append(Made(encoder: encoder))
+        }
         return encoder
     }
 }

@@ -10,8 +10,8 @@ let package = Package(
     platforms: [.macOS("15.0"), .iOS("18.0")],
     products: [
         .library(name: "StreamCoreVideo", targets: ["StreamCoreVideo"]),
-        // The Apple host media code (design 4.1): the surface store, the VideoToolbox
-        // encoder and its probe.
+        // The Apple host media code (design 4.1): capture, compositors, the surface store,
+        // the VideoToolbox encoder and its probe.
         .library(name: "StreamCoreAppleHost", targets: ["StreamCoreAppleHost"]),
     ],
     targets: [
