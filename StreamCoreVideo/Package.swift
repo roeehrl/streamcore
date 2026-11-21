@@ -28,6 +28,9 @@ let package = Package(
         .target(name: "StreamCoreAppleHost", dependencies: ["StreamCoreVideo"]),
         .testTarget(name: "StreamCoreAppleHostTests", dependencies: ["StreamCoreAppleHost"]),
         .target(name: "StreamCoreAppleClient", dependencies: ["StreamCoreVideo"]),
+        // A macOS command-line probe for the accessory path (design 8.4): switches a cabled
+        // Android device into accessory mode and serves a secure echo channel over it.
+        .executableTarget(name: "AccessoryProbe", dependencies: ["StreamCoreAppleHost"]),
         .testTarget(name: "StreamCoreAppleClientTests", dependencies: ["StreamCoreAppleClient", "StreamCoreAppleHost"]),
     ]
 )

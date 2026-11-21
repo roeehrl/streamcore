@@ -112,7 +112,7 @@ async fn a_device_dials_the_host_over_an_accessory_pipe_and_an_unplug_ends_it() 
     )
     .await
     .unwrap();
-    let pipe = host_link.open(UsbService::Session).await.unwrap();
+    let pipe = host_link.open_pipe(UsbService::Session).await.unwrap();
     let admission = listener.accept_pipe(pipe.clone()).unwrap();
     assert!(listener.accept_pipe(pipe).is_err(), "a handle is used once");
     let accepting = listener.clone();
@@ -154,7 +154,7 @@ async fn a_device_dials_the_host_over_an_accessory_pipe_and_an_unplug_ends_it() 
     .await
     .expect("the links ended");
     assert!(matches!(
-        host_link.open(UsbService::Session).await,
+        host_link.open_pipe(UsbService::Session).await,
         Err(UsbLinkError::Closed)
     ));
     assert!(device_link.accept().await.is_none());
@@ -168,7 +168,7 @@ async fn only_the_host_end_opens_pipes() {
     let _host = UsbAccessoryLink::start(host_end, LinkRole::Host, "tablet-1".into());
     let device = UsbAccessoryLink::start(device_end, LinkRole::Device, "host".into());
     assert!(matches!(
-        device.open(UsbService::Pairing).await,
+        device.open_pipe(UsbService::Pairing).await,
         Err(UsbLinkError::Role)
     ));
 }

@@ -7,7 +7,22 @@
 //!
 //! Every frame has a 16-byte header: magic (2), kind (1), flags (1), sequence
 //! (4), session (4), payload length (4), big-endian. The first frame each
-//! side sends is `linkHello` with the link version and its role. A session's
+//! side sends is `linkHello` with the link version, its role, a random number
+//! for this run of the link, and the peer's number when it knows it.
+//!
+//! The cable keeps bytes an earlier run left behind, and either side can
+//! restart without the other seeing the cable drop. So:
+//! - a link is up only after a hello of its own version, from the other
+//!   role, that names this run's number: a hello an earlier run left on the
+//!   cable cannot know it. Everything read before that is discarded, and a
+//!   peer of another version never brings the link up;
+//! - each run of the peer is answered once with a hello naming its number,
+//!   so a peer whose copy of the first hello went to an earlier run of its
+//!   side still gets one;
+//! - a hello naming this run from a new run of the peer means the peer
+//!   restarted: its pipes end here and the link carries on with the new run.
+//!
+//! A session's
 //! `open` or `opened` has sequence 0 and its data frames count up from 1 in
 //! each direction: a gap or a duplicate closes that session. A bad header
 //! means the framing is lost, which ends the link and every pipe on it.
@@ -50,7 +65,10 @@ const MAGIC: [u8; 2] = [0x53, 0x4C];
 const PIPE_QUEUE: usize = 64;
 /// Frames queued for the cable.
 const WRITE_QUEUE: usize = 64;
-/// How long the host waits for the device to answer an `open`.
+const HELLO_LEN: usize = 19;
+/// Frames of an earlier run a link discards before the peer's hello.
+const MAX_STALE_FRAMES: usize = 4096;
+/// How long the host waits for the device's hello and its answer to an `open`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +154,37 @@ impl Frame {
     }
 }
 
+/// A number for one run of a link: random enough to tell runs apart, never 0.
+fn link_nonce() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(0);
+    hasher.finish() | 1
+}
+
+fn hello_frame(role: LinkRole, nonce: u64, echo: u64) -> Frame {
+    let mut payload = LINK_VERSION.to_be_bytes().to_vec();
+    payload.push(role.wire());
+    payload.extend(nonce.to_be_bytes());
+    payload.extend(echo.to_be_bytes());
+    Frame::control(Kind::LinkHello, 0, payload)
+}
+
+/// A valid hello from `from`: its number and the one it echoes.
+fn parse_hello(frame: &Frame, from: LinkRole) -> Option<(u64, u64)> {
+    let payload = frame.payload.as_slice();
+    if frame.session != 0
+        || payload.len() != HELLO_LEN
+        || payload[..2] != LINK_VERSION.to_be_bytes()
+        || payload[2] != from.wire()
+    {
+        return None;
+    }
+    let nonce = u64::from_be_bytes(payload[3..11].try_into().ok()?);
+    let echo = u64::from_be_bytes(payload[11..19].try_into().ok()?);
+    (nonce != 0).then_some((nonce, echo))
+}
+
 fn service_wire(service: UsbService) -> u8 {
     match service {
         UsbService::Session => 1,
@@ -198,6 +247,10 @@ struct Shared {
     next_session: AtomicU32,
     closed: watch::Sender<bool>,
     dead: AtomicBool,
+    /// This run of the link, never 0.
+    nonce: u64,
+    /// The peer's hello arrived.
+    up: watch::Sender<bool>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -264,13 +317,11 @@ impl AccessoryLink {
             next_session: AtomicU32::new(1),
             closed: watch::Sender::new(false),
             dead: AtomicBool::new(false),
+            nonce: link_nonce(),
+            up: watch::Sender::new(false),
         });
-        let mut hello = LINK_VERSION.to_be_bytes().to_vec();
-        hello.push(role.wire());
         // The queue is empty: this cannot fail.
-        let _ = shared
-            .out
-            .try_send(Frame::control(Kind::LinkHello, 0, hello));
+        let _ = shared.out.try_send(hello_frame(role, shared.nonce, 0));
 
         let write_shared = shared.clone();
         spawn(Box::pin(async move {
@@ -311,6 +362,19 @@ impl AccessoryLink {
         if shared.role != LinkRole::Host {
             return Err(UsbError::Protocol);
         }
+        let deadline = tokio::time::Instant::now() + OPEN_TIMEOUT;
+        // Nothing is sent to a peer that is not there yet: it would only pile
+        // up on the cable.
+        let mut up = shared.up.subscribe();
+        let mut closed = shared.closed.subscribe();
+        tokio::select! {
+            ready = tokio::time::timeout_at(deadline, up.wait_for(|up| *up)) => {
+                if ready.is_err() {
+                    return Err(UsbError::Timeout);
+                }
+            }
+            _ = closed.wait_for(|closed| *closed) => return Err(link_gone()),
+        }
         let id = shared.next_session.fetch_add(1, Ordering::SeqCst);
         if id == 0 || id == u32::MAX {
             // The id space of this link is used up: only a new link helps.
@@ -339,7 +403,7 @@ impl AccessoryLink {
         if shared.out.send(open).await.is_err() {
             return Err(link_gone());
         }
-        match tokio::time::timeout(OPEN_TIMEOUT, answer).await {
+        match tokio::time::timeout_at(deadline, answer).await {
             Ok(Ok(true)) => Ok(Box::new(pipe)),
             Ok(Ok(false)) => Err(UsbError::Refused("the device refused the pipe".into())),
             Ok(Err(_)) => Err(link_gone()),
@@ -384,21 +448,57 @@ async fn read_loop(
     shared: &Arc<Shared>,
     accept: &mpsc::Sender<AcceptedPipe>,
 ) {
-    // The first frame is the peer's hello.
-    match read_frame(reader).await {
-        Ok(Some(frame))
-            if frame.kind == Kind::LinkHello
-                && frame.session == 0
-                && frame.payload.len() == 3
-                && frame.payload[..2] == LINK_VERSION.to_be_bytes()
-                && frame.payload[2] == shared.role.peer().wire() => {}
-        _ => return,
-    }
+    let mut peer: Option<u64> = None;
+    let mut told: Option<u64> = None;
+    let mut stale = 0usize;
     while let Ok(Some(frame)) = read_frame(reader).await {
         let id = frame.session;
+        if frame.kind == Kind::LinkHello {
+            let Some((nonce, echo)) = parse_hello(&frame, shared.role.peer()) else {
+                // Another version or the same role. From an established peer
+                // that ends the link; before that it may be an earlier run's
+                // (of another version, even), so the link just stays down.
+                if peer.is_some() {
+                    return;
+                }
+                stale += 1;
+                if stale > MAX_STALE_FRAMES {
+                    return;
+                }
+                continue;
+            };
+            // Every run of the peer is told this run's number once, so a peer
+            // whose copy of our first hello went to an earlier run of its
+            // side still learns it.
+            if told != Some(nonce) {
+                told = Some(nonce);
+                let answer = hello_frame(shared.role, shared.nonce, nonce);
+                if shared.out.send(answer).await.is_err() {
+                    return;
+                }
+            }
+            // Only a hello that names this run is the peer as it is now: one
+            // an earlier run left on the cable cannot know the number.
+            if echo == shared.nonce && peer != Some(nonce) {
+                if peer.is_some() {
+                    // The peer restarted: its end of every pipe is gone.
+                    lock(&shared.sessions).clear();
+                }
+                peer = Some(nonce);
+                shared.up.send_replace(true);
+            }
+            continue;
+        }
+        if peer.is_none() {
+            // Left on the cable by an earlier run.
+            stale += 1;
+            if stale > MAX_STALE_FRAMES {
+                return;
+            }
+            continue;
+        }
         match frame.kind {
-            // A second hello means the peer restarted under us.
-            Kind::LinkHello => return,
+            Kind::LinkHello => {}
             Kind::Pad => {}
             Kind::Ping => {
                 if shared
@@ -673,10 +773,33 @@ mod tests {
         (AccessoryLink::start(Box::new(a), LinkRole::Host), b)
     }
 
-    fn hello(role: LinkRole) -> Frame {
-        let mut payload = LINK_VERSION.to_be_bytes().to_vec();
-        payload.push(role.wire());
-        Frame::control(Kind::LinkHello, 0, payload)
+    const DEVICE_NONCE: u64 = 77;
+
+    /// The device's side of the hello exchange, by hand: reads the host's
+    /// hello and answers naming its number.
+    async fn greet(wire: &mut DuplexStream) -> u64 {
+        let hello = expect(wire, Kind::LinkHello).await;
+        let (host, _) = parse_hello(&hello, LinkRole::Host).unwrap();
+        let answer = hello_frame(LinkRole::Device, DEVICE_NONCE, host);
+        wire.write_all(&answer.encode()).await.unwrap();
+        // The host tells this run of the device its number once.
+        let told = expect(wire, Kind::LinkHello).await;
+        assert_eq!(
+            parse_hello(&told, LinkRole::Host),
+            Some((host, DEVICE_NONCE))
+        );
+        host
+    }
+
+    /// [`greet`] when the host's hello was read already: a fresh hello gets
+    /// the host's number in its answer.
+    async fn greet_after(wire: &mut DuplexStream, _host: &AccessoryLink) {
+        let fresh = hello_frame(LinkRole::Device, DEVICE_NONCE, 0);
+        wire.write_all(&fresh.encode()).await.unwrap();
+        let again = expect(wire, Kind::LinkHello).await;
+        let (host, _) = parse_hello(&again, LinkRole::Host).unwrap();
+        let known = hello_frame(LinkRole::Device, DEVICE_NONCE, host);
+        wire.write_all(&known.encode()).await.unwrap();
     }
 
     async fn expect(wire: &mut DuplexStream, kind: Kind) -> Frame {
@@ -780,27 +903,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn another_link_version_or_the_same_role_ends_the_link() {
-        for payload in [vec![0, 2, 2], vec![0, 1, 1], vec![0, 1]] {
+    async fn another_link_version_or_the_same_role_never_brings_the_link_up() {
+        tokio::time::pause();
+        let mut other_version = hello_frame(LinkRole::Device, 5, 0).payload;
+        other_version[1] = 2;
+        let same_role = hello_frame(LinkRole::Host, 5, 0).payload;
+        for payload in [other_version, same_role, vec![0, 1, 2]] {
             let (host, mut wire) = host_and_wire();
             expect(&mut wire, Kind::LinkHello).await;
+            let bad = Frame::control(Kind::LinkHello, 0, payload.clone());
+            wire.write_all(&bad.encode()).await.unwrap();
+            assert!(matches!(
+                host.open(UsbService::Session).await,
+                Err(UsbError::Timeout)
+            ));
+            // The same from a peer that was there ends the link.
+            greet_after(&mut wire, &host).await;
             let bad = Frame::control(Kind::LinkHello, 0, payload);
             wire.write_all(&bad.encode()).await.unwrap();
             host.closed().await;
-            assert!(matches!(
-                host.open(UsbService::Session).await,
-                Err(UsbError::Io(_))
-            ));
         }
     }
 
     #[tokio::test]
     async fn a_bad_header_ends_the_link_and_every_pipe() {
         let (host, mut wire) = host_and_wire();
-        expect(&mut wire, Kind::LinkHello).await;
-        wire.write_all(&hello(LinkRole::Device).encode())
-            .await
-            .unwrap();
+        greet(&mut wire).await;
         let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
             let open = expect(&mut wire, Kind::Open).await;
             let opened = Frame::control(Kind::Opened, open.session, Vec::new());
@@ -818,10 +946,7 @@ mod tests {
     async fn a_gap_or_a_duplicate_closes_that_pipe_only() {
         for second in [3u32, 1] {
             let (host, mut wire) = host_and_wire();
-            expect(&mut wire, Kind::LinkHello).await;
-            wire.write_all(&hello(LinkRole::Device).encode())
-                .await
-                .unwrap();
+            greet(&mut wire).await;
             let mut pipes = Vec::new();
             let mut ids = Vec::new();
             for _ in 0..2 {
@@ -866,10 +991,7 @@ mod tests {
     async fn a_device_that_does_not_answer_an_open_times_out() {
         tokio::time::pause();
         let (host, mut wire) = host_and_wire();
-        expect(&mut wire, Kind::LinkHello).await;
-        wire.write_all(&hello(LinkRole::Device).encode())
-            .await
-            .unwrap();
+        greet(&mut wire).await;
         assert!(matches!(
             host.open(UsbService::Session).await,
             Err(UsbError::Timeout)
@@ -879,10 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn a_ping_is_answered_and_padding_is_ignored() {
         let (_host, mut wire) = host_and_wire();
-        expect(&mut wire, Kind::LinkHello).await;
-        wire.write_all(&hello(LinkRole::Device).encode())
-            .await
-            .unwrap();
+        greet(&mut wire).await;
         wire.write_all(&Frame::control(Kind::Pad, 0, vec![0; 100]).encode())
             .await
             .unwrap();
@@ -890,6 +1009,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(expect(&mut wire, Kind::Pong).await.payload, vec![7, 8]);
+    }
+
+    #[tokio::test]
+    async fn what_an_earlier_run_left_on_the_cable_is_discarded() {
+        let (host, mut wire) = host_and_wire();
+        // Before the device's hello: an old run's frames, even valid ones.
+        for stale in [
+            Frame::control(Kind::Opened, 1, Vec::new()),
+            Frame::control(Kind::Close, 1, Vec::new()),
+            Frame {
+                kind: Kind::Data,
+                sequence: 9,
+                session: 1,
+                payload: vec![1, 2, 3],
+            },
+        ] {
+            wire.write_all(&stale.encode()).await.unwrap();
+        }
+        greet(&mut wire).await;
+        let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
+            assert_eq!(open.session, 1, "the stale frames opened nothing");
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        assert!(pipe.is_ok());
+        assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_missed_the_hello_gets_another() {
+        let (host, mut wire) = host_and_wire();
+        // An earlier run of the device read the host's hello.
+        let first = expect(&mut wire, Kind::LinkHello).await;
+        let (host_nonce, echo) = parse_hello(&first, LinkRole::Host).unwrap();
+        assert_eq!(echo, 0);
+        // The new run does not know the host's number.
+        let fresh = hello_frame(LinkRole::Device, DEVICE_NONCE, 0);
+        wire.write_all(&fresh.encode()).await.unwrap();
+        let again = expect(&mut wire, Kind::LinkHello).await;
+        assert_eq!(
+            parse_hello(&again, LinkRole::Host),
+            Some((host_nonce, DEVICE_NONCE))
+        );
+        // Knowing it, the device's repeat gets no further answer, and the
+        // link is up.
+        let known = hello_frame(LinkRole::Device, DEVICE_NONCE, host_nonce);
+        wire.write_all(&known.encode()).await.unwrap();
+        let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        assert!(pipe.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_restarted_ends_its_pipes_and_the_link_carries_on() {
+        let (host, mut wire) = host_and_wire();
+        let host_nonce = greet(&mut wire).await;
+        let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        let mut pipe = pipe.unwrap();
+        // A new run of the device, which learned the host's number.
+        let restarted = hello_frame(LinkRole::Device, DEVICE_NONCE + 2, host_nonce);
+        wire.write_all(&restarted.encode()).await.unwrap();
+        let mut rest = Vec::new();
+        assert_eq!(pipe.read_to_end(&mut rest).await.unwrap(), 0);
+        expect(&mut wire, Kind::LinkHello).await;
+        // The link is still there for the new run.
+        let (again, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        assert!(again.is_ok());
+        assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_hello_an_earlier_run_left_behind_brings_nothing_up() {
+        tokio::time::pause();
+        let (host, mut wire) = host_and_wire();
+        expect(&mut wire, Kind::LinkHello).await;
+        // It names a number of some earlier run of the host.
+        let stale = hello_frame(LinkRole::Device, 9, 12345);
+        wire.write_all(&stale.encode()).await.unwrap();
+        let open = Frame::control(Kind::Opened, 1, Vec::new());
+        wire.write_all(&open.encode()).await.unwrap();
+        assert!(matches!(
+            host.open(UsbService::Session).await,
+            Err(UsbError::Timeout)
+        ));
+        assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_opened_before_the_peer_is_there() {
+        tokio::time::pause();
+        let (host, mut wire) = host_and_wire();
+        expect(&mut wire, Kind::LinkHello).await;
+        assert!(matches!(
+            host.open(UsbService::Session).await,
+            Err(UsbError::Timeout)
+        ));
+        // Nothing was written for it.
+        let quiet = tokio::time::timeout(Duration::from_millis(50), read_frame(&mut wire)).await;
+        assert!(quiet.is_err());
+        assert!(!host.is_closed());
     }
 
     #[tokio::test]

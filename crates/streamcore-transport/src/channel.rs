@@ -664,7 +664,10 @@ impl SecureListener {
 }
 
 /// Listens with StreamCore's binary lanes only. Applications whose control
-/// messages pick a lane listen with [`listen_secure_with`].
+/// messages pick a lane listen with [`listen_secure_with`]. Exported to
+/// UniFFI, like [`connect_secure`], for a native host that needs no lane
+/// policy of its own.
+#[uniffi::export]
 pub async fn listen_secure(
     address: String,
     identity: Arc<PeerIdentity>,

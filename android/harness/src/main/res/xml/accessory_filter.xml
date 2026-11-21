@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The identity the macOS accessory probe announces (StreamCoreVideo/Sources/AccessoryProbe). -->
+<resources>
+    <usb-accessory manufacturer="StreamCore" model="Harness" version="1" />
+</resources>
