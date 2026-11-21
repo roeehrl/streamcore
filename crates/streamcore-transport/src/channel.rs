@@ -11,8 +11,8 @@ use crate::{
     },
     protocol::{self, Hello},
     transport::{
-        self, DialPath, Medium, PeerLocator, PipeIo, Session, SessionListener, TransportError,
-        TransportKind,
+        self, DialPath, Medium, PeerLocator, PipeHandle, PipeIo, Session, SessionListener,
+        TransportError, TransportKind,
     },
 };
 use std::{
@@ -520,8 +520,10 @@ impl SecureListener {
     /// Hands over a pipe a USB provider opened to a device. The listener is the
     /// TLS server on it, with the same identity, pins, admission bounds, trust
     /// fence and lane rule as a TCP connection; the channel arrives through
-    /// [`Self::accept`].
-    pub fn accept_stream(&self, pipe: UsbPipe) -> Result<(), ChannelError> {
+    /// [`Self::accept`]. The pipe may be handed over before the device dials;
+    /// the handle reports how it ended up (see
+    /// [`SessionListener::accept_stream`]).
+    pub fn accept_stream(&self, pipe: UsbPipe) -> Result<PipeHandle, ChannelError> {
         let UsbPipe { io, medium, device } = pipe;
         let listener = self
             .state

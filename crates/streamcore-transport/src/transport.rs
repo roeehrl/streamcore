@@ -2,14 +2,14 @@
 //! fully authenticated, negotiated connection; it never races application input.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     net::SocketAddr,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::identity::{
@@ -70,6 +70,94 @@ pub type PipeIo = Box<dyn PipeStream>;
 /// A USB device as the admission bound counts it: a provider's label is only
 /// unique within its medium.
 type UsbDevice = (Medium, String);
+
+/// How long a handed-over pipe may wait for the device's first byte.
+const PIPE_IDLE_LIMIT: Duration = Duration::from_secs(60);
+/// Idle pipes a listener holds in all.
+const MAX_IDLE_PIPES: usize = 32;
+
+/// How a pipe handed to [`SessionListener::accept_stream`] ended up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeOutcome {
+    /// A session was negotiated on it and queued for `accept`.
+    Accepted,
+    /// The device never sent a byte within the idle limit. Normal.
+    IdleTimeout,
+    /// The pipe closed before the device sent a byte. Normal.
+    ClosedIdle,
+    /// The listener had no room for it (pipes per device, idle pipes, or
+    /// handshakes in flight). Normal.
+    Refused,
+    /// The handshake or the hello failed, or the pipe broke.
+    HandshakeFailed,
+    /// The device's certificate is not one this listener trusts: retrying
+    /// cannot help until trust changes or the device is replugged.
+    Untrusted,
+}
+
+/// Resolves when a handed-over pipe has been accepted or given up.
+pub struct PipeHandle(oneshot::Receiver<PipeOutcome>);
+
+impl PipeHandle {
+    /// The pipe's outcome. A listener that closed first reports
+    /// [`PipeOutcome::Refused`].
+    pub async fn outcome(self) -> PipeOutcome {
+        self.0.await.unwrap_or(PipeOutcome::Refused)
+    }
+}
+
+struct OfferedPipe {
+    io: PipeIo,
+    locator: PeerLocator,
+    outcome: oneshot::Sender<PipeOutcome>,
+}
+
+/// A pipe whose first bytes were read to see that the device dialed: they are
+/// replayed ahead of the rest.
+struct Prefixed {
+    prefix: Vec<u8>,
+    taken: usize,
+    inner: PipeIo,
+}
+
+impl AsyncRead for Prefixed {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.taken < self.prefix.len() {
+            let count = buffer.remaining().min(self.prefix.len() - self.taken);
+            let start = self.taken;
+            buffer.put_slice(&self.prefix[start..start + count]);
+            self.taken += count;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for Prefixed {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(context, data)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(context)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
 
 /// Pending handshakes one USB device may hold at a time: a device that opens
 /// pipes and stalls cannot use up the listener's shared handshake budget.
@@ -205,7 +293,7 @@ pub struct SessionListener {
     trust: Arc<StdMutex<ListenerTrust>>,
     quic: quinn::Endpoint,
     accepted: Mutex<mpsc::Receiver<Result<Session, TransportError>>>,
-    pipes: mpsc::Sender<(PipeIo, PeerLocator)>,
+    pipes: mpsc::Sender<OfferedPipe>,
     accepting: JoinHandle<()>,
 }
 
@@ -268,19 +356,35 @@ impl SessionListener {
     /// Hands over a pipe a provider opened to a device. The listener is the
     /// TLS server on it, with the same identity, pins, admission bounds and
     /// trust generation as a TCP connection, and the session arrives through
-    /// [`Self::accept`]. With the listener's handshake queue full the pipe is
-    /// refused with [`TransportError::Busy`]; a third pending pipe from one
-    /// device is dropped, which closes it.
-    pub fn accept_stream(&self, io: PipeIo, locator: PeerLocator) -> Result<(), TransportError> {
+    /// [`Self::accept`].
+    ///
+    /// The pipe may be handed over before the device dials: it waits idle for
+    /// the device's first byte (60 s by default, `TransportTuning`), outside
+    /// the handshake budget, and the handshake deadline starts at that byte.
+    /// The returned handle reports how the pipe ended up, so a provider knows
+    /// whether to open another. With the listener's pipe queue full the pipe is
+    /// refused with [`TransportError::Busy`]; a third pipe from one device is
+    /// [`PipeOutcome::Refused`].
+    pub fn accept_stream(
+        &self,
+        io: PipeIo,
+        locator: PeerLocator,
+    ) -> Result<PipeHandle, TransportError> {
         if !matches!(locator, PeerLocator::Usb { .. }) {
             return Err(TransportError::InvalidPaths);
         }
+        let (outcome, handle) = oneshot::channel();
         self.pipes
-            .try_send((io, locator))
+            .try_send(OfferedPipe {
+                io,
+                locator,
+                outcome,
+            })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(_) => TransportError::Busy,
                 mpsc::error::TrySendError::Closed(_) => TransportError::Closed,
-            })
+            })?;
+        Ok(PipeHandle(handle))
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
@@ -381,35 +485,100 @@ enum Incoming {
     Pipe(PipeIo, PeerLocator),
 }
 
+/// A pipe waiting for the device's first byte, or a handshake in flight.
+struct PipeTicket {
+    device: UsbDevice,
+    outcome: oneshot::Sender<PipeOutcome>,
+}
+
+impl PipeTicket {
+    fn finish(self, per_device: &mut HashMap<UsbDevice, usize>, outcome: PipeOutcome) {
+        if let Some(count) = per_device.get_mut(&self.device) {
+            *count -= 1;
+            if *count == 0 {
+                per_device.remove(&self.device);
+            }
+        }
+        // Nobody may be waiting for the outcome.
+        let _ = self.outcome.send(outcome);
+    }
+}
+
+/// How a handshake that failed on a pipe is reported: a peer certificate this
+/// listener does not trust is told apart, because retrying cannot help.
+fn failed_outcome(error: &TransportError) -> PipeOutcome {
+    let untrusted = match error {
+        TransportError::Io(error) => error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .is_some_and(|tls| {
+                matches!(
+                    tls,
+                    rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented
+                )
+            }),
+        _ => false,
+    };
+    if untrusted {
+        PipeOutcome::Untrusted
+    } else {
+        PipeOutcome::HandshakeFailed
+    }
+}
+
+/// Waits for the device's first bytes on an idle pipe.
+async fn first_bytes(mut io: PipeIo, limit: Duration) -> Result<PipeIo, PipeOutcome> {
+    let mut prefix = vec![0u8; 1024];
+    match tokio::time::timeout(limit, io.read(&mut prefix)).await {
+        Err(_) => Err(PipeOutcome::IdleTimeout),
+        Ok(Ok(0)) => Err(PipeOutcome::ClosedIdle),
+        Ok(Err(_)) => Err(PipeOutcome::HandshakeFailed),
+        Ok(Ok(read)) => {
+            prefix.truncate(read);
+            Ok(Box::new(Prefixed {
+                prefix,
+                taken: 0,
+                inner: io,
+            }))
+        }
+    }
+}
+
 // An unauthenticated peer that stalls must not hold up another user's pairing
 // or reconnect. Bound both in-flight handshakes and completed results. Dropping
 // the driver aborts every pending handshake through JoinSet ownership.
 async fn accept_connections(
     tcp: TcpListener,
     quic: quinn::Endpoint,
-    mut pipes: mpsc::Receiver<(PipeIo, PeerLocator)>,
+    mut pipes: mpsc::Receiver<OfferedPipe>,
     trust: Arc<StdMutex<ListenerTrust>>,
     hello: Hello,
     tuning: TransportTuning,
     sender: mpsc::Sender<Result<Session, TransportError>>,
 ) {
-    let mut pending: JoinSet<(Option<UsbDevice>, Result<Session, TransportError>)> = JoinSet::new();
-    // Pending handshakes per USB device.
-    let mut per_device: std::collections::HashMap<UsbDevice, usize> = Default::default();
+    let mut pending: JoinSet<(Option<PipeTicket>, Result<Session, TransportError>)> =
+        JoinSet::new();
+    // Pipes that have not carried a byte yet. They are outside the handshake
+    // budget: a provider opens them ahead of the device dialing.
+    let mut idle: JoinSet<(PipeTicket, PeerLocator, Result<PipeIo, PipeOutcome>)> = JoinSet::new();
+    // Idle pipes and handshakes per USB device.
+    let mut per_device: HashMap<UsbDevice, usize> = HashMap::new();
+    let idle_limit = tuning.pipe_idle_limit_ms.map_or(PIPE_IDLE_LIMIT, |ms| {
+        Duration::from_millis(ms.max(1).into())
+    });
     loop {
-        let incoming = tokio::select! {
+        let (incoming, ticket) = tokio::select! {
             _ = sender.closed() => break,
             completed = pending.join_next(), if !pending.is_empty() => {
                 if let Some(completed) = completed {
-                    let (device, result) =
+                    let (ticket, result) =
                         completed.unwrap_or((None, Err(TransportError::Connection)));
-                    if let Some(device) = device
-                        && let Some(count) = per_device.get_mut(&device)
-                    {
-                        *count -= 1;
-                        if *count == 0 {
-                            per_device.remove(&device);
-                        }
+                    if let Some(ticket) = ticket {
+                        let outcome = match &result {
+                            Ok(_) => PipeOutcome::Accepted,
+                            Err(error) => failed_outcome(error),
+                        };
+                        ticket.finish(&mut per_device, outcome);
                     }
                     // A full result queue closes the excess session immediately.
                     // It cannot turn an absent native consumer into unbounded memory.
@@ -417,21 +586,53 @@ async fn accept_connections(
                 }
                 continue;
             }
-            pipe = pipes.recv(), if pending.len() < MAX_PENDING_HANDSHAKES => {
-                match pipe {
-                    Some((io, locator)) => Incoming::Pipe(io, locator),
-                    None => break,
+            offered = pipes.recv() => {
+                let Some(OfferedPipe { io, locator, outcome }) = offered else { break };
+                let PeerLocator::Usb { medium, device } = &locator else { continue };
+                let device = (*medium, device.clone());
+                let count = per_device.entry(device.clone()).or_default();
+                if *count >= MAX_PENDING_PER_DEVICE || idle.len() >= MAX_IDLE_PIPES {
+                    if *count == 0 {
+                        per_device.remove(&device);
+                    }
+                    // Dropping the pipe closes it.
+                    let _ = outcome.send(PipeOutcome::Refused);
+                    continue;
+                }
+                *count += 1;
+                let ticket = PipeTicket { device, outcome };
+                idle.spawn(async move {
+                    let first = first_bytes(io, idle_limit).await;
+                    (ticket, locator, first)
+                });
+                continue;
+            }
+            spoke = idle.join_next(), if !idle.is_empty() => {
+                let Some(Ok((ticket, locator, first))) = spoke else { continue };
+                match first {
+                    // The device dialed: the handshake deadline starts now.
+                    Ok(io) if pending.len() < MAX_PENDING_HANDSHAKES => {
+                        (Incoming::Pipe(io, locator), Some(ticket))
+                    }
+                    Ok(_) => {
+                        ticket.finish(&mut per_device, PipeOutcome::Refused);
+                        continue;
+                    }
+                    Err(outcome) => {
+                        ticket.finish(&mut per_device, outcome);
+                        continue;
+                    }
                 }
             }
             stream = tcp.accept(), if pending.len() < MAX_PENDING_HANDSHAKES => {
                 match stream {
-                    Ok((stream, _)) => Incoming::Tcp(stream),
+                    Ok((stream, _)) => (Incoming::Tcp(stream), None),
                     Err(error) => { let _ = sender.try_send(Err(error.into())); break; }
                 }
             }
             connection = quic.accept(), if pending.len() < MAX_PENDING_HANDSHAKES => {
                 match connection {
-                    Some(connection) => Incoming::Quic(Box::new(connection)),
+                    Some(connection) => (Incoming::Quic(Box::new(connection)), None),
                     None => break,
                 }
             }
@@ -443,19 +644,6 @@ async fn accept_connections(
             ),
             Err(_) => break,
         };
-        let device = match &incoming {
-            Incoming::Pipe(_, PeerLocator::Usb { medium, device }) => {
-                let key = (*medium, device.clone());
-                let count = per_device.entry(key.clone()).or_default();
-                if *count >= MAX_PENDING_PER_DEVICE {
-                    // Dropping the pipe closes it.
-                    continue;
-                }
-                *count += 1;
-                Some(key)
-            }
-            _ => None,
-        };
         let hello = hello.clone();
         pending.spawn(async move {
             let session =
@@ -465,7 +653,7 @@ async fn accept_connections(
                         session.accepted_generation = Some(generation);
                         session
                     });
-            (device, session)
+            (ticket, session)
         });
     }
 }
