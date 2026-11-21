@@ -8,6 +8,7 @@
 //! machine: show it locally, never send or log it where it leaves the machine.
 
 pub mod adb;
+pub mod aoa;
 pub mod device;
 pub mod keeper;
 mod plist;

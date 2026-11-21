@@ -993,9 +993,12 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
   fallback port list the host also probes.
 - **AOA** (Android; macOS via IOUSBHost over `ByteDuplex`, Linux via `nusb`; not Windows): a link
   layer over the bulk endpoints (16-byte header: magic, kind, flags, sequence, session, length;
-  kinds `linkHello` (first frame, carries the link version), `open`, `opened`, `data`, `close`,
-  `ping`/`pong`, `pad`). Any gap, duplicate or desync closes that session and its channel. Only the
-  consumer a device is paired with may switch it; a cross-consumer lock stops two hosts fighting.
+  kinds `linkHello` (first frame, carries the link version and the sender's role), `open`,
+  `opened`, `data`, `close`, `ping`/`pong`, `pad`). The host opens a session per pipe; the device
+  holds at most 4. A gap or duplicate closes that session and its channel; a bad header loses the
+  framing and ends the link with every session on it (`streamcore_usb::aoa::AccessoryLink`). Only
+  the consumer a device is paired with may switch it; a cross-consumer lock stops two hosts
+  fighting.
 - **usbmux** (iOS/iPadOS): a Rust client for the header + plist protocol (`/var/run/usbmuxd`, or
   `127.0.0.1:27015` on Windows). **USB-C network interface** (Mac ↔ iPad/iPhone): an IP link with
   interface-scoped `UsbNet` candidates, QUIC off until qualified.
