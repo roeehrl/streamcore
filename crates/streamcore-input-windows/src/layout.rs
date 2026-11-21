@@ -292,14 +292,21 @@ fn positional(hid: u16, modifiers: u8, layout: &dyn KeyLayout) -> Option<Shortcu
     })
 }
 
+/// A key by its virtual key, with the layout's scan code for it.
+///
+/// Home, End, the arrows, Page Up and Down, Insert and Delete exist twice: on the numeric keypad
+/// and in the cluster beside it, told apart only by the extended flag. For their virtual keys
+/// Windows answers with the keypad key's scan code and no E0 prefix, so the flag cannot be taken
+/// from the layout's answer alone: without it the key is the keypad's, and with Num Lock on
+/// Windows lifts a held Shift around a keypad navigation key, so Shift+Home moved the caret and
+/// selected nothing. A key named by these virtual keys always means the cluster key, so it is
+/// always extended.
 fn stroke(vk: u16, layout: &dyn KeyLayout, force_extended: bool) -> KeyStroke {
     let scan = layout.scan_from_vk(vk);
     KeyStroke {
         vk,
         scan: scan & 0xFF,
-        extended: force_extended
-            || scan & 0xFF00 == 0xE000
-            || (scan == 0 && keys::is_extended_vk(vk)),
+        extended: force_extended || scan & 0xFF00 == 0xE000 || keys::is_extended_vk(vk),
     }
 }
 
@@ -462,9 +469,21 @@ pub(crate) mod testing {
                 (keys::VK_RETURN, 0x1C),
                 (keys::VK_TAB, 0x0F),
                 (keys::VK_BACK, 0x0E),
-                (keys::VK_LEFT, 0xE04B),
                 (keys::VK_F1 + 3, 0x3E),
                 (keys::VK_NUMPAD0 + 5, 0x4C),
+                // As Windows answers for the navigation keys: the scan code of the keypad key
+                // that doubles as each, with no E0 prefix.
+                (keys::VK_HOME, 0x47),
+                (keys::VK_UP, 0x48),
+                (keys::VK_PRIOR, 0x49),
+                (keys::VK_LEFT, 0x4B),
+                (keys::VK_RIGHT, 0x4D),
+                (keys::VK_END, 0x4F),
+                (keys::VK_DOWN, 0x50),
+                (keys::VK_NEXT, 0x51),
+                (keys::VK_INSERT, 0x52),
+                (keys::VK_DELETE, 0x53),
+                (keys::VK_DIVIDE, 0x35),
             ]);
             Self {
                 name,
@@ -795,8 +814,8 @@ mod tests {
         );
         assert_eq!(key_plan(enter), (keys::VK_RETURN, 0x1C, true, 0));
         // A key the layout gives no scan code for is extended when a real keyboard sends it so.
-        let delete = plan_shortcut(&KeySpec::named(NamedKey::Delete), 0, &us, KeyPhase::Tap);
-        assert_eq!(key_plan(delete), (keys::VK_DELETE, 0, true, 0));
+        let menu = plan_shortcut(&KeySpec::named(NamedKey::Menu), 0, &us, KeyPhase::Tap);
+        assert_eq!(key_plan(menu), (keys::VK_APPS, 0, true, 0));
         let equals = plan_shortcut(
             &KeySpec::named(NamedKey::KeypadEquals),
             0,
@@ -814,6 +833,40 @@ mod tests {
         );
         let newline = plan_shortcut(&KeySpec::char("\n"), CONTROL, &us, KeyPhase::Tap);
         assert_eq!(key_plan(newline), (keys::VK_RETURN, 0x1C, false, CONTROL));
+    }
+
+    #[test]
+    fn navigation_keys_are_the_cluster_keys_whatever_the_layout_answers() {
+        // The layout answers with the keypad's scan codes, unprefixed. Sent without the extended
+        // flag these are keypad keys, and Windows drops a held Shift around them with Num Lock
+        // on.
+        let us = FakeLayout::us();
+        for (named, vk, scan) in [
+            (NamedKey::Home, keys::VK_HOME, 0x47),
+            (NamedKey::End, keys::VK_END, 0x4F),
+            (NamedKey::Left, keys::VK_LEFT, 0x4B),
+            (NamedKey::Right, keys::VK_RIGHT, 0x4D),
+            (NamedKey::Up, keys::VK_UP, 0x48),
+            (NamedKey::Down, keys::VK_DOWN, 0x50),
+            (NamedKey::PageUp, keys::VK_PRIOR, 0x49),
+            (NamedKey::PageDown, keys::VK_NEXT, 0x51),
+            (NamedKey::Insert, keys::VK_INSERT, 0x52),
+            (NamedKey::Delete, keys::VK_DELETE, 0x53),
+            (NamedKey::KeypadDivide, keys::VK_DIVIDE, 0x35),
+        ] {
+            for modifiers in [0, SHIFT, SHIFT | CONTROL] {
+                let plan = plan_shortcut(&KeySpec::named(named), modifiers, &us, KeyPhase::Tap);
+                assert_eq!(key_plan(plan), (vk, scan, true, modifiers), "{named:?}");
+            }
+        }
+        // The keypad's own keys are not extended.
+        let five = plan_shortcut(
+            &KeySpec::named(NamedKey::Keypad5),
+            SHIFT,
+            &us,
+            KeyPhase::Tap,
+        );
+        assert_eq!(key_plan(five), (keys::VK_NUMPAD0 + 5, 0x4C, false, SHIFT));
     }
 
     #[test]

@@ -1670,6 +1670,73 @@ mod tests {
         assert_eq!(rig.sent()[2], [key(0x41, 0x1E, true)]);
     }
 
+    /// The navigation keys, as (named key, HID usage, virtual key, scan code).
+    const NAVIGATION: [(NamedKey, u16, u16, u16); 10] = [
+        (NamedKey::Home, 0x4A, keys::VK_HOME, 0x47),
+        (NamedKey::End, 0x4D, keys::VK_END, 0x4F),
+        (NamedKey::Left, 0x50, keys::VK_LEFT, 0x4B),
+        (NamedKey::Right, 0x4F, keys::VK_RIGHT, 0x4D),
+        (NamedKey::Up, 0x52, keys::VK_UP, 0x48),
+        (NamedKey::Down, 0x51, keys::VK_DOWN, 0x50),
+        (NamedKey::PageUp, 0x4B, keys::VK_PRIOR, 0x49),
+        (NamedKey::PageDown, 0x4E, keys::VK_NEXT, 0x51),
+        (NamedKey::Insert, 0x49, keys::VK_INSERT, 0x52),
+        (NamedKey::Delete, 0x4C, keys::VK_DELETE, 0x53),
+    ];
+
+    fn extended(vk: u16, scan: u16, up: bool) -> SendOp {
+        SendOp::Key {
+            vk,
+            scan,
+            extended: true,
+            scan_only: false,
+            up,
+        }
+    }
+
+    #[test]
+    fn shift_with_a_navigation_shortcut_sends_the_extended_key() {
+        // Not extended, these are the keypad's keys, and Windows lifts Shift around those with
+        // Num Lock on: Shift+Home moved the caret and selected nothing.
+        for (named, _, vk, scan) in NAVIGATION {
+            let mut rig = Rig::new();
+            rig.shortcut(KeySpec::named(named), SHIFT, KeyPhase::Tap, 0);
+            rig.engine.tick(10);
+            assert_eq!(
+                rig.sent(),
+                [
+                    vec![shift(false), extended(vk, scan, false)],
+                    vec![extended(vk, scan, true), shift(true)],
+                ],
+                "{named:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shift_with_a_navigation_key_position_sends_the_extended_key() {
+        for (named, hid, vk, scan) in NAVIGATION {
+            let mut rig = Rig::new();
+            rig.key(hid, true, SHIFT, 0);
+            rig.key(hid, false, SHIFT, 0);
+            let tap = HostKey {
+                hid_usage: hid,
+                modifiers: SHIFT,
+            };
+            rig.engine.handle(InputEvent::KeyTap(tap), 0);
+            let (down, up) = (extended(vk, scan, false), extended(vk, scan, true));
+            assert_eq!(
+                rig.sent(),
+                [
+                    vec![shift(false), down],
+                    vec![up, shift(true)],
+                    vec![shift(false), down, up, shift(true)],
+                ],
+                "{named:?}"
+            );
+        }
+    }
+
     #[test]
     fn layout_dependent_positions_and_special_scan_codes() {
         let mut rig = Rig::new();
