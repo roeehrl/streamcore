@@ -22,8 +22,8 @@ use crate::identity::validate_certificate;
 const PAIRING_LIFETIME: Duration = Duration::from_secs(120);
 const ATTEMPT_LIMIT: u32 = 5;
 const MAX_MESSAGE: usize = 4096;
-const CREDENTIAL: &[u8] = b"mycnc-pairing-pin-v1";
-const CONFIRMATION: &[u8] = b"mycnc-pairing-persisted-v1";
+const CREDENTIAL: &[u8] = b"streamcore-pairing-pin-v1";
+const CONFIRMATION: &[u8] = b"streamcore-pairing-persisted-v1";
 
 struct PairingSuite;
 impl CipherSuite for PairingSuite {
@@ -333,7 +333,7 @@ fn bounded(message: &[u8]) -> Result<(), PairingError> {
 }
 
 fn context(host: &[u8], client: &[u8]) -> Vec<u8> {
-    let mut context = b"mycnc-pairing-v1:host:client:".to_vec();
+    let mut context = b"streamcore-pairing-v1:host:client:".to_vec();
     context.extend_from_slice(&Sha256::digest(host));
     context.extend_from_slice(&Sha256::digest(client));
     context

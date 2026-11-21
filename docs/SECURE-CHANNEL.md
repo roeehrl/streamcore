@@ -91,7 +91,7 @@ wiring are implemented; signed app credential and live VM qualification remain o
 
 ## Session transport
 
-Both transports require pinned mutual TLS 1.3 and ALPN `mycnc/2`. TLS tickets,
+Both transports require pinned mutual TLS 1.3 and ALPN `streamcore/2`. TLS tickets,
 resumption and early data are disabled so every new channel proves the current pin.
 QUIC and TCP share a port. Callers may race up to 16 numeric address/transport paths
 with bounded stagger delays. Only a fully authenticated, negotiated path wins;

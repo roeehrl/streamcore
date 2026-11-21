@@ -570,7 +570,7 @@ async fn mismatched_alpn_is_rejected_before_protocol_negotiation() {
     assert!(
         tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(
-                rustls::pki_types::ServerName::try_from("peer.mycnc.invalid").unwrap(),
+                rustls::pki_types::ServerName::try_from("peer.streamcore.invalid").unwrap(),
                 socket,
             )
             .await
@@ -601,11 +601,11 @@ async fn a_client_without_a_certificate_cannot_open_a_session() {
         .unwrap()
         .with_root_certificates(roots)
         .with_no_client_auth();
-        config.alpn_protocols = vec![b"mycnc/2".to_vec()];
+        config.alpn_protocols = vec![b"streamcore/2".to_vec()];
         let socket = tokio::net::TcpStream::connect(address).await.unwrap();
         let connection = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(
-                rustls::pki_types::ServerName::try_from("peer.mycnc.invalid").unwrap(),
+                rustls::pki_types::ServerName::try_from("peer.streamcore.invalid").unwrap(),
                 socket,
             )
             .await;
@@ -675,4 +675,75 @@ async fn tuned_transports_still_exchange_large_frames() {
                 .unwrap();
         }
     }
+}
+
+/// An identity or a pinned certificate made under another certificate name
+/// (the names the code was first extracted with) is refused where it is loaded,
+/// with an error that says to pair again, not left to fail in a handshake.
+#[test]
+fn a_certificate_under_another_name_is_refused_as_a_legacy_identity() {
+    use streamcore_transport::identity::{IdentityError, validate_peer_certificate};
+    // A well-formed self-signed certificate, exactly as `generate` makes one,
+    // but under the old name.
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["peer.mycnc.invalid".into()]).unwrap();
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let old_certificate = params.self_signed(&key).unwrap().der().to_vec();
+    let stored = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "certificate": old_certificate,
+        "private_key": key.serialize_der(),
+    }))
+    .unwrap();
+
+    // One's own stored identity.
+    assert!(matches!(
+        PeerIdentity::restore(stored),
+        Err(IdentityError::LegacyIdentity)
+    ));
+    // A peer's pinned certificate, checked alone or as part of a trust set.
+    assert!(matches!(
+        validate_peer_certificate(old_certificate.clone()),
+        Err(IdentityError::LegacyIdentity)
+    ));
+    let current = PeerIdentity::generate().unwrap();
+    assert!(matches!(
+        current.client_config(old_certificate.clone()),
+        Err(IdentityError::LegacyIdentity)
+    ));
+    // A listener skips old peers: one stale entry must not stop it listening.
+    // The count tells the consumer how many must pair again.
+    let other = PeerIdentity::generate().unwrap();
+    let trusted = vec![
+        other.certificate(),
+        old_certificate.clone(),
+        old_certificate.clone(),
+    ];
+    assert!(current.server_config(trusted.clone()).is_ok());
+    assert!(current.server_config(vec![old_certificate.clone()]).is_ok());
+    assert_eq!(
+        streamcore_transport::identity::legacy_certificate_count(trusted),
+        2
+    );
+    // A malformed entry still fails the trust set, and is not counted as old.
+    assert!(
+        current
+            .server_config(vec![other.certificate(), vec![1, 2, 3]])
+            .is_err()
+    );
+    assert_eq!(
+        streamcore_transport::identity::legacy_certificate_count(vec![vec![1, 2, 3]]),
+        0
+    );
+    // A current identity round-trips, and garbage is still just invalid.
+    let exported = current.export_for_secure_storage().unwrap();
+    assert!(PeerIdentity::restore(exported).is_ok());
+    assert!(matches!(
+        validate_peer_certificate(vec![1, 2, 3]),
+        Err(IdentityError::InvalidIdentity)
+    ));
 }

@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-pub const SESSION_ALPN: &[u8] = b"mycnc/2";
-pub const PEER_DNS_NAME: &str = "peer.mycnc.invalid";
+pub const SESSION_ALPN: &[u8] = b"streamcore/2";
+/// The name every peer certificate carries. It identifies nothing (the whole
+/// self-signed certificate is pinned); it only has to be the same on both ends.
+pub const PEER_DNS_NAME: &str = "peer.streamcore.invalid";
 const MAX_IDENTITY_BYTES: usize = 32_768;
 const MAX_CERTIFICATE_BYTES: usize = 8_192;
 const MAX_TRUSTED_PEERS: usize = 256;
@@ -25,6 +27,14 @@ pub enum IdentityError {
     InvalidTrust,
     #[error("cryptographic operation failed")]
     Crypto,
+    /// The certificate does not carry [`PEER_DNS_NAME`]: it was made before the
+    /// wire names changed. It can never complete a handshake with this version,
+    /// so this is reported up front. An identity of one's own is replaced with
+    /// a new one ([`PeerIdentity::generate`]); a peer's certificate is removed.
+    /// Either way the two devices pair again. A listener's trust set is the
+    /// exception: [`PeerIdentity::server_config`] skips such peers.
+    #[error("the certificate predates the current wire names: pair again")]
+    LegacyIdentity,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,7 +166,20 @@ impl PeerIdentity {
         if peers.len() > MAX_TRUSTED_PEERS {
             return Err(IdentityError::InvalidTrust);
         }
-        let certs: Vec<CertificateDer<'static>> = peers.into_iter().map(Into::into).collect();
+        // A peer certificate from before the wire names changed can never
+        // complete a handshake, so leaving it out changes no trust decision. It
+        // is skipped, not failed on: one stale entry must not stop a host from
+        // listening. `legacy_certificate_count` tells a consumer how many of its
+        // peers must pair again. A malformed certificate still fails.
+        let mut certs: Vec<CertificateDer<'static>> = Vec::with_capacity(peers.len());
+        for peer in peers {
+            let certificate = CertificateDer::from(peer);
+            match validate_certificate(&certificate) {
+                Ok(()) => certs.push(certificate),
+                Err(IdentityError::LegacyIdentity) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier: Arc<dyn ClientCertVerifier> = if certs.is_empty() {
             // First launch can listen before pairing. Empty trust is mandatory
@@ -196,6 +219,23 @@ pub fn certificate_fingerprint(certificate: &[u8]) -> String {
     text
 }
 
+/// How many of `certificates` were made before the wire names changed: peers a
+/// listener skips ([`PeerIdentity::server_config`]) and that must pair again.
+/// Malformed entries are not counted.
+#[uniffi::export]
+pub fn legacy_certificate_count(certificates: Vec<Vec<u8>>) -> u32 {
+    let legacy = certificates
+        .into_iter()
+        .filter(|certificate| {
+            matches!(
+                validate_certificate(&CertificateDer::from(certificate.clone())),
+                Err(IdentityError::LegacyIdentity)
+            )
+        })
+        .count();
+    u32::try_from(legacy).unwrap_or(u32::MAX)
+}
+
 #[uniffi::export]
 pub fn validate_peer_certificate(certificate: Vec<u8>) -> Result<String, IdentityError> {
     validate_certificate(&certificate.clone().into())?;
@@ -208,7 +248,14 @@ pub fn validate_certificate(certificate: &CertificateDer<'_>) -> Result<(), Iden
     }
     rustls::RootCertStore::empty()
         .add(certificate.clone())
-        .map_err(|_| IdentityError::InvalidIdentity)
+        .map_err(|_| IdentityError::InvalidIdentity)?;
+    // A well-formed certificate under another name is one from before the wire
+    // names changed. Said here, where it is loaded, instead of as a handshake
+    // that fails for no visible reason.
+    let parsed = rustls::server::ParsedCertificate::try_from(certificate)
+        .map_err(|_| IdentityError::InvalidIdentity)?;
+    let name = ServerName::try_from(PEER_DNS_NAME).map_err(|_| IdentityError::Crypto)?;
+    rustls::client::verify_server_name(&parsed, &name).map_err(|_| IdentityError::LegacyIdentity)
 }
 
 fn roots_for(
