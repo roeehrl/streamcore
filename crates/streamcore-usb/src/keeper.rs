@@ -28,6 +28,8 @@ pub enum OfferError {
     Busy,
     /// The sink has stopped for good.
     Closed,
+    /// The sink refused the pipe for a reason that will not pass by itself.
+    Failed,
 }
 
 /// Where a kept pipe goes: a listener that runs the pinned handshake on it.
@@ -45,7 +47,8 @@ impl PipeSink for SecureListener {
             })
             .map_err(|error| match error {
                 ChannelError::Closed => OfferError::Closed,
-                _ => OfferError::Busy,
+                ChannelError::Busy => OfferError::Busy,
+                _ => OfferError::Failed,
             })?;
         Ok(Box::pin(handle.outcome()))
     }
@@ -59,6 +62,8 @@ pub struct KeeperPolicy {
     /// Abnormal ends, with no pipe used in between, before only a replug
     /// reopens.
     pub max_abnormal: u32,
+    /// The pause after the listener had no room for a pipe.
+    pub crowded_pause: Duration,
 }
 
 impl Default for KeeperPolicy {
@@ -66,6 +71,7 @@ impl Default for KeeperPolicy {
         Self {
             reopen_after: Duration::from_secs(2),
             max_abnormal: 3,
+            crowded_pause: Duration::from_secs(10),
         }
     }
 }
@@ -78,6 +84,9 @@ enum Next {
     Used,
     /// Open another after the pause.
     Reopen,
+    /// The listener had no room: open another after a longer pause, so a
+    /// device that keeps finding no room does not ask every two seconds.
+    Crowded,
     /// Count it, then open another after the pause unless that was too many.
     Abnormal,
     /// No more pipes to this device and service until it is replugged.
@@ -87,7 +96,8 @@ enum Next {
 fn after_outcome(outcome: PipeOutcome) -> Next {
     match outcome {
         PipeOutcome::Accepted => Next::Used,
-        PipeOutcome::IdleTimeout | PipeOutcome::ClosedIdle | PipeOutcome::Refused => Next::Reopen,
+        PipeOutcome::IdleTimeout | PipeOutcome::ClosedIdle => Next::Reopen,
+        PipeOutcome::Refused => Next::Crowded,
         PipeOutcome::HandshakeFailed => Next::Abnormal,
         PipeOutcome::Untrusted => Next::Stop,
     }
@@ -119,8 +129,9 @@ async fn keep_one(
             Err(error) => after_open_error(&error),
             Ok(pipe) => match sink.offer(pipe, &device) {
                 Ok(outcome) => after_outcome(outcome.await),
-                Err(OfferError::Busy) => Next::Reopen,
+                Err(OfferError::Busy) => Next::Crowded,
                 Err(OfferError::Closed) => Next::Stop,
+                Err(OfferError::Failed) => Next::Abnormal,
             },
         };
         match next {
@@ -132,9 +143,14 @@ async fn keep_one(
                     return;
                 }
             }
-            Next::Reopen => {}
+            Next::Reopen | Next::Crowded => {}
         }
-        tokio::time::sleep(policy.reopen_after).await;
+        let pause = if next == Next::Crowded {
+            policy.crowded_pause
+        } else {
+            policy.reopen_after
+        };
+        tokio::time::sleep(pause).await;
     }
 }
 
@@ -355,6 +371,21 @@ mod tests {
         pass(Duration::from_secs(60)).await;
         // The six scripted ends, then three failures in a row.
         assert_eq!(rig.opens(), 9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_with_no_room_is_asked_again_only_after_a_longer_pause() {
+        let rig = rig(vec![PipeOutcome::Refused], false);
+        rig.attach("a").await;
+        pass(Duration::from_millis(10)).await;
+        assert_eq!(rig.opens(), 1);
+        pass(Duration::from_secs(9)).await;
+        assert_eq!(rig.opens(), 1, "not every two seconds");
+        pass(Duration::from_secs(2)).await;
+        assert_eq!(rig.opens(), 2);
+        // It is not a fault: it never runs out.
+        pass(Duration::from_secs(100)).await;
+        assert!(rig.opens() >= 10);
     }
 
     #[tokio::test(start_paused = true)]
