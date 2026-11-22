@@ -124,9 +124,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             scope.launch {
                 val adbPort = intent?.getIntExtra("usbport", 0)?.takeIf { it > 0 }
                 val kotlinStream = intent?.getBooleanExtra("usbkotlin", false) == true
-                AccessoryProbe.run(this@MainActivity, usb, adbPort, kotlinStream) { text ->
-                    Log.i(TAG, text)
-                    main.post { status(text) }
+                // `--ei usbrepeat N`: run it N times in this process, each on a link of its
+                // own, to check that an ended link lets the accessory go.
+                repeat(intent?.getIntExtra("usbrepeat", 1)?.coerceIn(1, 10) ?: 1) { round ->
+                    AccessoryProbe.run(this@MainActivity, usb, adbPort, kotlinStream) { text ->
+                        Log.i(TAG, "[${round + 1}] $text")
+                        main.post { status(text) }
+                    }
                 }
             }
         }

@@ -172,3 +172,33 @@ async fn only_the_host_end_opens_pipes() {
         Err(UsbLinkError::Role)
     ));
 }
+
+/// A descriptor's read cannot be woken from another thread. Ending the link
+/// must still release the descriptor while the cable stays in: the peer's
+/// answer to the parting hello is what the blocked read returns with.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ending_a_link_on_a_descriptor_releases_it_without_an_unplug() {
+    use std::os::fd::IntoRawFd;
+    use streamcore_usb::aoa::AccessoryLink;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    theirs.set_nonblocking(true).unwrap();
+    let peer = AccessoryLink::start(
+        Box::new(tokio::net::UnixStream::from_std(theirs).unwrap()),
+        LinkRole::Host,
+    );
+    let device =
+        UsbAccessoryLink::start_descriptor(ours.into_raw_fd(), LinkRole::Device, "host".into())
+            .unwrap();
+    // Both ends up: a pipe opens.
+    let pipe = peer.open(UsbService::Session).await.unwrap();
+    assert!(device.accept().await.is_some());
+    drop(pipe);
+
+    device.end();
+    // The peer sees the stream end only once the descriptor is closed, which
+    // needs the reading thread to return from its read.
+    tokio::time::timeout(Duration::from_secs(5), peer.closed())
+        .await
+        .expect("the descriptor was released");
+}

@@ -23,6 +23,10 @@
 //! - a hello naming this run from a new run of the peer means the peer
 //!   restarted: its pipes end here and the link carries on with the new run.
 //!
+//! A link that ends without the cable going sends one last hello under a
+//! number of its own. The peer's answer to it is what lets a platform read
+//! that cannot be woken return, so the stream is released.
+//!
 //! A session's
 //! `open` or `opened` has sequence 0 and its data frames count up from 1 in
 //! each direction: a gap or a duplicate closes that session. A bad header
@@ -388,6 +392,7 @@ impl AccessoryLink {
         let write_shared = shared.clone();
         spawn(Box::pin(async move {
             let mut closed = write_shared.closed.subscribe();
+            let mut broken = false;
             loop {
                 let frame = tokio::select! {
                     frame = frames.recv() => frame,
@@ -397,8 +402,18 @@ impl AccessoryLink {
                 // One write per frame: header and payload leave together.
                 if writer.write_all(&frame.encode()).await.is_err() || writer.flush().await.is_err()
                 {
+                    broken = true;
                     break;
                 }
+            }
+            if !broken {
+                // A parting hello from a run that will never exist. Its only
+                // purpose is to be answered: a peer answers each new run once,
+                // whatever state it is in, and that answer ends a platform
+                // read that nothing else can wake (a descriptor's), so the
+                // stream is let go without waiting for the cable.
+                let parting = hello_frame(role, link_nonce(), 0);
+                let _ = writer.write_all(&parting.encode()).await;
             }
             let _ = writer.shutdown().await;
             write_shared.end();
@@ -1227,6 +1242,33 @@ mod tests {
         // Nothing was written for it.
         let quiet = tokio::time::timeout(Duration::from_millis(50), read_frame(&mut wire)).await;
         assert!(quiet.is_err());
+        assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_link_that_is_closed_asks_for_one_last_answer() {
+        let (host, mut wire) = host_and_wire();
+        let host_nonce = greet(&mut wire).await;
+        host.close();
+        let parting = expect(&mut wire, Kind::LinkHello).await;
+        let (nonce, echo) = parse_hello(&parting, LinkRole::Host).unwrap();
+        assert!(nonce != host_nonce && echo == 0);
+        // Nothing follows it.
+        assert!(read_frame(&mut wire).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_peer_answers_a_parting_hello_and_keeps_its_link() {
+        let (host, mut wire) = host_and_wire();
+        let host_nonce = greet(&mut wire).await;
+        // The device's run ends: a hello under another number, naming none.
+        let parting = hello_frame(LinkRole::Device, DEVICE_NONCE + 9, 0);
+        wire.write_all(&parting.encode()).await.unwrap();
+        let answer = expect(&mut wire, Kind::LinkHello).await;
+        assert_eq!(
+            parse_hello(&answer, LinkRole::Host),
+            Some((host_nonce, DEVICE_NONCE + 9))
+        );
         assert!(!host.is_closed());
     }
 
