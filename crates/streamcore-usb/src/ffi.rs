@@ -26,6 +26,9 @@ pub enum UsbLinkError {
     /// This end of the link may not do that.
     #[error("not possible in this role")]
     Role,
+    /// Not an open descriptor.
+    #[error("not a valid descriptor")]
+    Descriptor,
 }
 
 impl From<UsbError> for UsbLinkError {
@@ -109,6 +112,26 @@ impl UsbAccessoryLink {
     /// Kotlin objects already have one.)
     pub fn end(&self) {
         self.link.close();
+    }
+}
+
+// Its own block: the export macro cannot leave one method of a block out on
+// a platform without descriptors.
+#[cfg(unix)]
+#[uniffi::export]
+impl UsbAccessoryLink {
+    /// [`Self::start`] on an open descriptor (an Android accessory's, from
+    /// `ParcelFileDescriptor.detachFd()`), which Rust takes over, reads and
+    /// writes itself and closes: no transfer crosses the binding.
+    #[uniffi::constructor]
+    pub fn start_descriptor(
+        descriptor: i32,
+        role: LinkRole,
+        device: String,
+    ) -> Result<Arc<Self>, UsbLinkError> {
+        let io = streamcore_transport::duplex::DescriptorDuplex::adopt(descriptor)
+            .ok_or(UsbLinkError::Descriptor)?;
+        Ok(Self::start(io, role, device))
     }
 }
 

@@ -127,7 +127,7 @@ object AccessoryProbe {
      * Over the accessory, or with [adbPort] over a pipe the host opens through adb to that
      * loopback port.
      */
-    suspend fun run(context: Context, line: String, adbPort: Int?, log: (String) -> Unit) {
+    suspend fun run(context: Context, line: String, adbPort: Int?, kotlinStream: Boolean, log: (String) -> Unit) {
         val parts = line.trim().split('.')
         if (parts.size != 2) return log("usb: not a probe line")
         val identity = PeerIdentity.restore(Base64.decode(parts[0], Base64.DEFAULT))
@@ -140,7 +140,14 @@ object AccessoryProbe {
                 withTimeout(30_000) { listener.accept() }
             } else {
                 val accessory = openAccessory(context, log) ?: return
-                link = UsbAccessoryLink.start(AccessoryDuplex(accessory), LinkRole.DEVICE, "host")
+                // Rust reads the descriptor itself; `kotlinStream` keeps every transfer a call
+                // into Kotlin instead, to compare.
+                link = if (kotlinStream) {
+                    UsbAccessoryLink.start(AccessoryDuplex(accessory), LinkRole.DEVICE, "host")
+                } else {
+                    UsbAccessoryLink.startDescriptor(accessory.detachFd(), LinkRole.DEVICE, "host")
+                }
+                log("usb: the stream is read by ${if (kotlinStream) "Kotlin" else "Rust"}")
                 log("usb: waiting for the host's pipe")
                 (withTimeout(20_000) { link.accept() } ?: return log("usb: the link ended")).pipe
             }

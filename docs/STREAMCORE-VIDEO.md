@@ -1026,10 +1026,14 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
     StreamCoreAppleHost; no root needed) and the harness's `AccessoryDuplex` on Android. The
     `AccessoryProbe` executable with the harness's `--es usb` runs a pinned channel over a real
     cable: every message size from 1 to 2,100 bytes echoed and 51 Mbit/s each way at once on the
-    first run. Its round trip was p50 6 to 7 ms where adb on the same tablet measured 1.7 ms
-    (`AccessoryProbe --adb`) and usbmux to an iPad 0.7 ms, so the accessory path adds about 4 ms
-    per round trip there. Open: the suspects are the per-transfer callbacks into Kotlin and the
-    accessory driver; reading the descriptor from Rust is the next thing to try.
+    first run.
+  - **Android reads the descriptor from Rust.** With every transfer a `ByteDuplex` call into
+    Kotlin the round trip was p50 5 to 7 ms on that tablet; with Rust reading and writing the
+    accessory's descriptor itself (`DescriptorDuplex`, `UsbAccessoryLink::start_descriptor`,
+    from `ParcelFileDescriptor.detachFd()`) it is p50 0.7 ms, p95 1.8 ms on the same run, against
+    1.7 ms over adb there (`AccessoryProbe --adb`). A callback into Kotlin per transfer costs
+    about 2 ms each way, so the Kotlin stream stays only as the comparison
+    (`--ez usbkotlin true`).
 - **usbmux** (iOS/iPadOS): a Rust client for the header + plist protocol (`/var/run/usbmuxd`, or
   `127.0.0.1:27015` on Windows). Measured Mac to iPad with `AccessoryProbe --usbmux` and a test
   app on the device (`UsbHostPipes`, `UsbDeviceListener`): round trip p50 0.7 ms, p95 2.5 ms,
