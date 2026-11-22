@@ -27,3 +27,7 @@ workspace = true
 [[test]]
 name = "aoa_link"
 required-features = ["ffi"]
+
+[[test]]
+name = "ffi_relay"
+required-features = ["ffi"]

@@ -961,8 +961,11 @@ pub trait ByteDuplex: Send + Sync {                                    // a plat
   return.
 - Native apps reach pipes through `UsbPipeHandle` (used once), `SecureListener::accept_pipe` (its
   `PipeAdmission::outcome()` is the pipe's `PipeOutcome`) and `connect_secure_pipe`. Producers of
-  handles live in `streamcore-usb` behind its `ffi` feature (`UsbAccessoryLink` first;
-  `streamcore-video`'s `usb` feature links them into the one native library).
+  handles live in `streamcore-usb` behind its `ffi` feature, and `streamcore-video`'s `usb`
+  feature links them into the one native library: `UsbAccessoryLink` (accessory connections),
+  `UsbDeviceListener` (a device's loopback listener for relayed pipes) and `UsbHostPipes` (a
+  host's kept pipes through usbmux or adb, handed to a `SecureListener`; no handle crosses the
+  binding for those). Pairing over a pipe is not built yet.
 
 - A `Pipe` path runs the TLS client handshake on the pipe, then the TLS/TCP path. **Pipe paths are
   excluded from `connect_path`'s retry loop**: one attempt, then the path fails.
@@ -1010,7 +1013,8 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
   - **Start and restart.** The cable keeps bytes an earlier run left behind, and either side can
     restart without the other seeing the cable drop. `linkHello` carries the version, the role, a
     random number for this run of the link and the peer's number when known. A link is up only
-    after a hello that names its own number; everything read before is discarded; each run of the
+    after a hello that names its own number; until then it searches the stream byte by byte for
+    hellos and discards everything else, whole frames or parts of one; each run of the
     peer is answered once with a hello naming it; and a hello naming this run from a new run of
     the peer ends that peer's pipes here while the link carries on. The host opens nothing before
     the link is up.

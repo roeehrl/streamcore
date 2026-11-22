@@ -121,3 +121,193 @@ impl UsbAccessoryLink {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// Relayed pipes: a host keeps them open through adb or the device
+// multiplexer, and a device listens for them on its loopback interface.
+
+/// Why a provider or a listener could not do what was asked.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum UsbProviderError {
+    /// The provider's local service is not running or not installed.
+    #[error("the USB service is not available")]
+    ServiceMissing,
+    /// A port list, a name or an address the provider cannot use, or a
+    /// service that broke its protocol.
+    #[error("not valid for this provider")]
+    Invalid,
+    #[error("the USB service refused")]
+    Refused,
+    #[error("the USB service did not answer in time")]
+    Timeout,
+    #[error("USB I/O failed")]
+    Io,
+    /// The network runtime is not available.
+    #[error("the runtime is unavailable")]
+    Runtime,
+}
+
+impl From<UsbError> for UsbProviderError {
+    fn from(error: UsbError) -> Self {
+        match error {
+            UsbError::ServiceMissing => Self::ServiceMissing,
+            UsbError::Protocol => Self::Invalid,
+            // The service's reason may name the device: it stays here.
+            UsbError::Refused(_) => Self::Refused,
+            UsbError::Timeout => Self::Timeout,
+            UsbError::Io(_) => Self::Io,
+        }
+    }
+}
+
+/// Runs `future` on the transport's runtime (sockets and timers need it) and
+/// returns its output.
+async fn on_runtime<T: Send + 'static>(
+    future: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, UsbProviderError> {
+    let (done, result) = oneshot::channel();
+    if !streamcore_transport::spawn(async move {
+        let _ = done.send(future.await);
+    }) {
+        return Err(UsbProviderError::Runtime);
+    }
+    result.await.map_err(|_| UsbProviderError::Runtime)
+}
+
+/// The device side of relayed pipes ([`crate::device::DeviceListener`]): the
+/// host's provider connects to a port on this device's loopback interface,
+/// and the device dials the host over each pipe it accepts.
+#[derive(uniffi::Object)]
+pub struct UsbDeviceListener {
+    listener: Arc<crate::device::DeviceListener>,
+    port: u16,
+}
+
+#[uniffi::export]
+impl UsbDeviceListener {
+    /// Listens on the first free port of `ports` (the host's provider probes
+    /// the same list in the same order). `medium` is what carries the host's
+    /// pipes to this device: `UsbMux` or `UsbAdb`.
+    #[uniffi::constructor]
+    pub async fn bind(ports: Vec<u16>, medium: Medium) -> Result<Arc<Self>, UsbProviderError> {
+        on_runtime(async move {
+            let listener = crate::device::DeviceListener::bind(&ports, medium).await?;
+            let port = listener.port()?;
+            Ok(Arc::new(Self {
+                listener: Arc::new(listener),
+                port,
+            }))
+        })
+        .await?
+    }
+
+    /// The port this listener got.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The next pipe, for `connect_secure_pipe`. While the listener's places
+    /// are all held by live pipes, this waits.
+    pub async fn accept(&self) -> Result<Arc<UsbPipeHandle>, UsbProviderError> {
+        let listener = self.listener.clone();
+        let pipe = on_runtime(async move { listener.accept().await }).await??;
+        Ok(UsbPipeHandle::new(pipe))
+    }
+}
+
+/// A host's kept pipes ([`crate::keeper::keep_pipes`]): one per cabled device,
+/// opened when the device appears, handed to the listener (which holds it
+/// idle until the device dials) and reopened when it ends. Their channels
+/// arrive through the listener's `accept`. Dropping this, or `stop`, ends the
+/// keeping; pipes the listener already holds are the listener's.
+#[derive(uniffi::Object)]
+pub struct UsbHostPipes {
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl UsbHostPipes {
+    /// Keeps pipes from any provider (for Rust callers and tests).
+    pub fn keep(
+        provider: Arc<dyn crate::UsbPipeProvider>,
+        listener: Arc<streamcore_transport::channel::SecureListener>,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let started = streamcore_transport::spawn(async move {
+            let keeping = crate::keeper::keep_pipes(
+                provider,
+                listener,
+                None,
+                crate::keeper::KeeperPolicy::default(),
+            );
+            tokio::select! {
+                () = keeping => {}
+                _ = stopped.wait_for(|stopped| *stopped) => {}
+            }
+        });
+        if !started {
+            return Err(UsbProviderError::Runtime);
+        }
+        Ok(Arc::new(Self { stop }))
+    }
+}
+
+#[uniffi::export]
+impl UsbHostPipes {
+    /// Pipes through the Apple mobile device multiplexer at its usual
+    /// address, to `session_port` on each cabled device. `program` is the
+    /// client name the service logs (letters, digits, `.`, `_`, `-`).
+    #[uniffi::constructor]
+    pub fn usbmux(
+        listener: Arc<streamcore_transport::channel::SecureListener>,
+        program: String,
+        session_port: u16,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        use crate::usbmux::{MuxAddress, MuxPorts, MuxProvider, MuxService};
+        if session_port == 0 {
+            return Err(UsbProviderError::Invalid);
+        }
+        let service = MuxService::new(MuxAddress::platform_default(), &program)?;
+        let ports = MuxPorts {
+            session: session_port,
+            // No pairing sink is kept, so this port is never opened.
+            pairing: session_port,
+        };
+        Self::keep(Arc::new(MuxProvider::new(service, ports)), listener)
+    }
+
+    /// Pipes through a running Android debug bridge server at its usual
+    /// address, to `session_port` on each cabled device. No server is started
+    /// or stopped.
+    #[uniffi::constructor]
+    pub fn adb(
+        listener: Arc<streamcore_transport::channel::SecureListener>,
+        session_port: u16,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        use crate::adb::{AdbEndpoints, AdbProvider, AdbServer, AdbTarget, DEFAULT_SERVER};
+        if session_port == 0 {
+            return Err(UsbProviderError::Invalid);
+        }
+        let address = DEFAULT_SERVER
+            .parse()
+            .map_err(|_| UsbProviderError::Invalid)?;
+        let endpoints = AdbEndpoints {
+            session: AdbTarget::Tcp(session_port),
+            pairing: AdbTarget::Tcp(session_port),
+        };
+        Self::keep(
+            Arc::new(AdbProvider::new(AdbServer::new(address)?, endpoints)),
+            listener,
+        )
+    }
+
+    /// Stops keeping pipes.
+    pub fn stop(&self) {
+        self.stop.send_replace(true);
+    }
+}
+
+impl Drop for UsbHostPipes {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
+}
