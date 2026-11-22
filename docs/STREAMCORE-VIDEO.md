@@ -1002,12 +1002,27 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
   fallback port list the host also probes.
 - **AOA** (Android; macOS via IOUSBHost over `ByteDuplex`, Linux via `nusb`; not Windows): a link
   layer over the bulk endpoints (16-byte header: magic, kind, flags, sequence, session, length;
-  kinds `linkHello` (first frame, carries the link version and the sender's role), `open`,
-  `opened`, `data`, `close`, `ping`/`pong`, `pad`). The host opens a session per pipe; the device
-  holds at most 4. A gap or duplicate closes that session and its channel; a bad header loses the
-  framing and ends the link with every session on it (`streamcore_usb::aoa::AccessoryLink`). Only
-  the consumer a device is paired with may switch it; a cross-consumer lock stops two hosts
-  fighting.
+  kinds `linkHello`, `open`, `opened`, `data`, `close`, `ping`/`pong`, `pad`). The host opens a
+  session per pipe; the device holds at most 4. A gap or duplicate closes that session and its
+  channel; a bad header loses the framing and ends the link with every session on it
+  (`streamcore_usb::aoa::AccessoryLink`). Only the consumer a device is paired with may switch
+  it; a cross-consumer lock stops two hosts fighting.
+  - **Start and restart.** The cable keeps bytes an earlier run left behind, and either side can
+    restart without the other seeing the cable drop. `linkHello` carries the version, the role, a
+    random number for this run of the link and the peer's number when known. A link is up only
+    after a hello that names its own number; everything read before is discarded; each run of the
+    peer is answered once with a hello naming it; and a hello naming this run from a new run of
+    the peer ends that peer's pipes here while the link carries on. The host opens nothing before
+    the link is up.
+  - **Transfers** (measured on a tablet): Android hands an app one transfer per read into a
+    16 KiB buffer, so the host sends at most 16 KiB per transfer, followed by a zero-length packet
+    when a shorter transfer is a whole number of packets; a read of zero bytes is not the end of
+    the stream on either side.
+  - **Adapters:** macOS `AndroidAccessory` and `AccessoryStream` (IOUSBHost, in
+    StreamCoreAppleHost; no root needed) and the harness's `AccessoryDuplex` on Android. The
+    `AccessoryProbe` executable with the harness's `--es usb` runs a pinned channel over a real
+    cable: every message size from 1 to 2,100 bytes echoed and 51 Mbit/s each way at once on the
+    first run (round trip p50 6.7 ms with the Mac heavily loaded: not a gate figure).
 - **usbmux** (iOS/iPadOS): a Rust client for the header + plist protocol (`/var/run/usbmuxd`, or
   `127.0.0.1:27015` on Windows). **USB-C network interface** (Mac ↔ iPad/iPhone): an IP link with
   interface-scoped `UsbNet` candidates, QUIC off until qualified.

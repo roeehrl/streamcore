@@ -72,8 +72,8 @@ impl UsbAccessoryLink {
     }
 
     /// Host: opens a pipe to `service` on the device, for
-    /// `SecureListener::accept_pipe`.
-    pub async fn open(&self, service: UsbService) -> Result<Arc<UsbPipeHandle>, UsbLinkError> {
+    /// `SecureListener::accept_pipe`. (Not named `open`: a Swift keyword.)
+    pub async fn open_pipe(&self, service: UsbService) -> Result<Arc<UsbPipeHandle>, UsbLinkError> {
         let (answer, result) = oneshot::channel();
         let link = self.link.clone();
         // The open's deadline needs the runtime's timer.

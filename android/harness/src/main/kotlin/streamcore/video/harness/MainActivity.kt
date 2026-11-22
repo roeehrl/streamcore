@@ -117,6 +117,15 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // under `depth + 1` before the jitter slack.
         queueBound = intent?.getIntExtra("qbound", 0)?.takeIf { it > 0 }
         queueBound?.let { Log.i(TAG, "queue bound floor $it") }
+        // The accessory probe (`--es usb <line>`, see AccessoryProbe).
+        intent?.getStringExtra("usb")?.let { usb ->
+            scope.launch {
+                AccessoryProbe.run(this@MainActivity, usb) { text ->
+                    Log.i(TAG, text)
+                    main.post { status(text) }
+                }
+            }
+        }
         main.post(::refreshStats)
     }
 

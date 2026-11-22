@@ -21,7 +21,8 @@ INSTALLED="$(rustup target list --installed --toolchain "$CORE_VERSION")"
 for TARGET in "${APPLE_TARGETS[@]}"; do
     grep -qx "$TARGET" <<<"$INSTALLED" || rustup target add --toolchain "$CORE_VERSION" "$TARGET"
 done
-FEATURES=ffi-probe
+# `usb`: the accessory link's binding surface (streamcore-usb, feature `ffi`).
+FEATURES=ffi-probe,usb
 
 # Bindings come from the host library's metadata (UniFFI library mode); one Swift file per crate.
 cargo build --package streamcore-video --features "$FEATURES,bindgen" --locked
@@ -31,7 +32,8 @@ rm -rf "$BINDINGS" "$GENERATED" && mkdir -p "$BINDINGS" "$GENERATED"
 cargo run --package streamcore-video --features "$FEATURES,bindgen" --locked --bin streamcore-video-bindgen -- \
     generate --library "$CORE_ROOT/target/debug/libstreamcore_video.dylib" \
     --language swift --no-format --out-dir "$BINDINGS"
-cp "$BINDINGS/streamcore_video.swift" "$BINDINGS/streamcore_media.swift" "$BINDINGS/streamcore_transport.swift" "$GENERATED/"
+cp "$BINDINGS/streamcore_video.swift" "$BINDINGS/streamcore_media.swift" "$BINDINGS/streamcore_transport.swift" \
+    "$BINDINGS/streamcore_usb.swift" "$GENERATED/"
 
 for TARGET in "${APPLE_TARGETS[@]}"; do
     cargo build --package streamcore-video --features "$FEATURES" --lib --release --locked --target "$TARGET"
@@ -39,12 +41,15 @@ done
 STAGE="$(mktemp -d "$CORE_ROOT/target/streamcore-video-apple.XXXXXX")"
 mkdir -p "$STAGE/macos" "$STAGE/simulator" "$STAGE/headers"
 cp "$BINDINGS/streamcore_videoFFI.h" "$BINDINGS/streamcore_mediaFFI.h" "$BINDINGS/streamcore_transportFFI.h" \
+    "$BINDINGS/streamcore_usbFFI.h" \
     crates/streamcore-video/include/streamcore_video_native.h "$STAGE/headers/"
 # One module map declaring the C modules the generated Swift files import; the video
 # module also declares the per-frame C ABI (streamcore_video_native.h).
 cat "$BINDINGS/streamcore_mediaFFI.modulemap" > "$STAGE/headers/module.modulemap"
 printf '\n' >> "$STAGE/headers/module.modulemap"
 cat "$BINDINGS/streamcore_transportFFI.modulemap" >> "$STAGE/headers/module.modulemap"
+printf '\n' >> "$STAGE/headers/module.modulemap"
+cat "$BINDINGS/streamcore_usbFFI.modulemap" >> "$STAGE/headers/module.modulemap"
 printf '\n' >> "$STAGE/headers/module.modulemap"
 sed 's|^\( *\)header "streamcore_videoFFI.h"|&\
 \1header "streamcore_video_native.h"|' "$BINDINGS/streamcore_videoFFI.modulemap" >> "$STAGE/headers/module.modulemap"
