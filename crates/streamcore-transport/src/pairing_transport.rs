@@ -1,9 +1,11 @@
 //! The public-certificate/OPAQUE bootstrap socket accepts no application commands.
 //! A trusted pin is released only after proof verification and native persistence.
 use crate::{
+    duplex::UsbPipeHandle,
     identity::{PeerIdentity, certificate_fingerprint},
     pairing::{PairingClient, PairingWindow},
     runtime,
+    transport::{PipeHandle, PipeIo, PipeOutcome},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
     task::JoinSet,
@@ -70,7 +72,7 @@ enum Message {
     Failed,
 }
 
-async fn read(stream: &mut TcpStream) -> Result<Message, PairingNetworkError> {
+async fn read(stream: &mut (impl AsyncRead + Unpin)) -> Result<Message, PairingNetworkError> {
     let size = stream
         .read_u32()
         .await
@@ -86,7 +88,10 @@ async fn read(stream: &mut TcpStream) -> Result<Message, PairingNetworkError> {
     serde_json::from_slice(&bytes).map_err(|_| PairingNetworkError::InvalidMessage)
 }
 
-async fn write(stream: &mut TcpStream, message: &Message) -> Result<(), PairingNetworkError> {
+async fn write(
+    stream: &mut (impl AsyncWrite + Unpin),
+    message: &Message,
+) -> Result<(), PairingNetworkError> {
     let bytes = serde_json::to_vec(message).map_err(|_| PairingNetworkError::InvalidMessage)?;
     if bytes.len() > MAX_BYTES {
         return Err(PairingNetworkError::InvalidMessage);
@@ -97,6 +102,11 @@ async fn write(stream: &mut TcpStream, message: &Message) -> Result<(), PairingN
         .map_err(|_| PairingNetworkError::Network)?;
     stream
         .write_all(&bytes)
+        .await
+        .map_err(|_| PairingNetworkError::Network)?;
+    // A pipe may buffer; a socket's flush is nothing.
+    stream
+        .flush()
         .await
         .map_err(|_| PairingNetworkError::Network)?;
     Ok(())
@@ -149,12 +159,25 @@ impl PendingPairing {
     }
 }
 
+/// A pipe a USB provider opened to a device, and where its outcome goes.
+struct OfferedPipe {
+    io: PipeIo,
+    outcome: oneshot::Sender<PipeOutcome>,
+}
+
+/// Pipes waiting for a place among the service's exchanges.
+const MAX_OFFERED_PIPES: usize = 4;
+/// Exchanges on pipes at once, idle ones included.
+const MAX_PIPE_EXCHANGES: usize = 2;
+
 #[derive(uniffi::Object)]
 pub struct PairingService {
     window: Arc<PairingWindow>,
     address: String,
     closed: watch::Sender<bool>,
     pending: Arc<AsyncMutex<mpsc::Receiver<Arc<PendingPairing>>>>,
+    /// Pipes offered by a USB provider, for the serve loop.
+    pipes: mpsc::Sender<OfferedPipe>,
     task: tokio::task::AbortHandle,
     completion: Arc<AsyncMutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -203,6 +226,60 @@ impl PairingService {
                 pending = async { receiver.lock().await.recv().await } => pending.ok_or(PairingNetworkError::Closed),
             }
         }).await.map_err(|_| PairingNetworkError::Unavailable)?
+    }
+}
+
+impl PairingService {
+    /// Runs one pairing exchange on a pipe a USB provider opened to a device,
+    /// while this service's window is open: the same exchange as on its
+    /// socket, with the same attempts and the same persistence contract. A
+    /// kept pipe may sit idle until the user pairs, so the exchange's time
+    /// limit starts at the device's request; the window's lifetime bounds
+    /// the wait. The handle reports how the pipe ended up:
+    /// - `Accepted`: a pairing was verified on it (it still has to be
+    ///   persisted, through [`Self::next_verified`]);
+    /// - `ClosedIdle`: the device left without a request, which spends no
+    ///   attempt;
+    /// - `HandshakeFailed`: a bad message or a failed proof;
+    /// - `Refused`: the window closed, or the service had no room.
+    pub fn accept_stream(&self, io: PipeIo) -> Result<PipeHandle, PairingNetworkError> {
+        if *self.closed.borrow() {
+            return Err(PairingNetworkError::Closed);
+        }
+        let (outcome, handle) = PipeHandle::pair();
+        self.pipes
+            .try_send(OfferedPipe { io, outcome })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => PairingNetworkError::Unavailable,
+                mpsc::error::TrySendError::Closed(_) => PairingNetworkError::Closed,
+            })?;
+        Ok(handle)
+    }
+
+    /// Whether the window has closed (used, expired or cancelled).
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Resolves when the window has closed.
+    pub async fn closed(&self) {
+        let mut closed = self.closed.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
+    }
+}
+
+#[uniffi::export]
+impl PairingService {
+    /// [`Self::accept_stream`] for a native host. A pipe handle is used once.
+    /// `Closed` when the window is closed, `Unavailable` when the service has
+    /// no room for another pipe now.
+    pub fn accept_pipe(
+        &self,
+        pipe: Arc<UsbPipeHandle>,
+    ) -> Result<Arc<crate::channel::PipeAdmission>, PairingNetworkError> {
+        let pipe = pipe.take().ok_or(PairingNetworkError::InvalidMessage)?;
+        let handle = self.accept_stream(pipe.io)?;
+        Ok(crate::channel::PipeAdmission::new(handle))
     }
 }
 
@@ -256,18 +333,20 @@ async fn open_service(
             .to_string();
         let closed = watch::channel(false).0;
         let (sender, receiver) = mpsc::channel(1);
+        let (pipes, offered) = mpsc::channel(MAX_OFFERED_PIPES);
         let guard = CloseWindow {
             window: window.clone(),
             closed: closed.clone(),
         };
         let task = tokio::spawn(async move {
-            let _ = tokio::time::timeout(lifetime, serve(listener, &guard, sender)).await;
+            let _ = tokio::time::timeout(lifetime, serve(listener, offered, &guard, sender)).await;
         });
         Ok(Arc::new(PairingService {
             window,
             address,
             closed,
             pending: Arc::new(AsyncMutex::new(receiver)),
+            pipes,
             task: task.abort_handle(),
             completion: Arc::new(AsyncMutex::new(Some(task))),
         }))
@@ -278,57 +357,120 @@ async fn open_service(
 
 async fn serve(
     listener: TcpListener,
+    mut pipes: mpsc::Receiver<OfferedPipe>,
     guard: &CloseWindow,
     sender: mpsc::Sender<Arc<PendingPairing>>,
 ) {
     let mut tasks = JoinSet::new();
+    // Counted apart from the socket's exchanges: a pipe may idle for the
+    // window's whole life, and cabled devices must not take every place from
+    // someone pairing over the network.
+    let mut pipe_tasks = JoinSet::new();
     loop {
         tokio::select! {
+            Some(offered) = pipes.recv(), if pipe_tasks.len() < MAX_PIPE_EXCHANGES => {
+                let window = guard.window.clone();
+                let closed = guard.closed.clone();
+                let sender = sender.clone();
+                pipe_tasks.spawn(async move {
+                    let OfferedPipe { io, outcome } = offered;
+                    let _ = outcome.send(accept_pairing_on_pipe(io, window, closed, sender).await);
+                });
+            }
             accepted = listener.accept(), if tasks.len() < MAX_CONNECTIONS => {
                 let Ok((stream, _)) = accepted else { break };
                 let window = guard.window.clone();
                 let closed = guard.closed.clone();
                 let sender = sender.clone();
                 tasks.spawn(async move {
-                    let _ = tokio::time::timeout(EXCHANGE_TIMEOUT, accept_pairing(stream, window, closed, sender)).await;
+                    let _ = accept_pairing(stream, window, closed, sender).await;
                 });
             }
             _ = tasks.join_next(), if !tasks.is_empty() => {},
+            _ = pipe_tasks.join_next(), if !pipe_tasks.is_empty() => {},
         }
     }
 }
 
+/// One exchange on a socket, within [`EXCHANGE_TIMEOUT`] in all.
 async fn accept_pairing(
     mut stream: TcpStream,
     window: Arc<PairingWindow>,
     closed: watch::Sender<bool>,
     sender: mpsc::Sender<Arc<PendingPairing>>,
 ) -> Result<(), PairingNetworkError> {
+    tokio::time::timeout(EXCHANGE_TIMEOUT, async {
+        let (certificate, request) = hello_and_request(&mut stream, &window).await?;
+        finish_pairing(&mut stream, window, closed, sender, certificate, request).await
+    })
+    .await
+    .map_err(|_| PairingNetworkError::Timeout)?
+}
+
+/// One exchange on a pipe, and how the pipe ended up. No limit until the
+/// device's request: a kept pipe idles until the user pairs, and the window's
+/// lifetime ends that. From the request on, [`EXCHANGE_TIMEOUT`].
+async fn accept_pairing_on_pipe(
+    mut io: PipeIo,
+    window: Arc<PairingWindow>,
+    closed: watch::Sender<bool>,
+    sender: mpsc::Sender<Arc<PendingPairing>>,
+) -> PipeOutcome {
+    let (certificate, request) = match hello_and_request(&mut io, &window).await {
+        Ok(request) => request,
+        // Left after the public hello: no attempt spent.
+        Err(PairingNetworkError::Network) => return PipeOutcome::ClosedIdle,
+        Err(_) => return PipeOutcome::HandshakeFailed,
+    };
+    // An attempt is spent from here on, however the pipe ends.
+    let finish = finish_pairing(&mut io, window, closed, sender, certificate, request);
+    match tokio::time::timeout(EXCHANGE_TIMEOUT, finish).await {
+        Ok(Ok(())) => PipeOutcome::Accepted,
+        Ok(Err(PairingNetworkError::Closed)) => PipeOutcome::Refused,
+        _ => PipeOutcome::HandshakeFailed,
+    }
+}
+
+/// The public hello, then the device's request.
+async fn hello_and_request(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    window: &PairingWindow,
+) -> Result<(Vec<u8>, Vec<u8>), PairingNetworkError> {
     // Only public data goes over this bootstrap socket. The PIN authenticates
     // the certificate hashes inside OPAQUE, including any invitation pin.
     let certificate = window.host_certificate();
     write(
-        &mut stream,
+        stream,
         &Message::Hello {
             major: 1,
             certificate,
         },
     )
     .await?;
-    let request = read(&mut stream).await;
-    let (certificate, request) = match request {
+    match read(stream).await {
         Ok(Message::Request {
             certificate,
             request,
-        }) => (certificate, request),
+        }) => Ok((certificate, request)),
         // Path races and cancelled clients can disconnect after reading the
         // public hello without submitting a PIN proof. They spend no attempt.
-        Err(PairingNetworkError::Network) => return Err(PairingNetworkError::Network),
+        Err(PairingNetworkError::Network) => Err(PairingNetworkError::Network),
         _ => {
             let _ = window.begin(vec![], vec![]);
-            return Err(PairingNetworkError::InvalidMessage);
+            Err(PairingNetworkError::InvalidMessage)
         }
-    };
+    }
+}
+
+/// From the request to the persisted confirmation.
+async fn finish_pairing(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    window: Arc<PairingWindow>,
+    closed: watch::Sender<bool>,
+    sender: mpsc::Sender<Arc<PendingPairing>>,
+    certificate: Vec<u8>,
+    request: Vec<u8>,
+) -> Result<(), PairingNetworkError> {
     let challenge = window
         .begin(certificate, request)
         .map_err(|_| PairingNetworkError::Authentication)?;
@@ -393,34 +535,8 @@ pub async fn pair_with_host(
     runtime::run(async move {
         cancellation
             .run(tokio::time::timeout(EXCHANGE_TIMEOUT, async move {
-                let (mut stream, certificate) =
-                    pairing_path(addresses, invitation_fingerprint).await?;
-                let pair = Arc::new(
-                    PairingClient::new(code.to_string(), certificate, identity.certificate())
-                        .map_err(|_| PairingNetworkError::Authentication)?,
-                );
-                write(
-                    &mut stream,
-                    &Message::Request {
-                        certificate: identity.certificate(),
-                        request: pair.request(),
-                    },
-                )
-                .await?;
-                let Message::Challenge { attempt, response } = read(&mut stream).await? else {
-                    return Err(PairingNetworkError::Authentication);
-                };
-                let completing = pair.clone();
-                let proof = tokio::task::spawn_blocking(move || completing.finish(response))
-                    .await
-                    .map_err(|_| PairingNetworkError::Unavailable)?
-                    .map_err(|_| PairingNetworkError::Authentication)?;
-                write(&mut stream, &Message::Finish { attempt, proof }).await?;
-                let Message::Persisted { confirmation } = read(&mut stream).await? else {
-                    return Err(PairingNetworkError::Persistence);
-                };
-                pair.confirm_persisted(confirmation)
-                    .map_err(|_| PairingNetworkError::Authentication)
+                let (stream, certificate) = pairing_path(addresses, invitation_fingerprint).await?;
+                exchange(stream, certificate, identity, code).await
             }))
             .await
             .ok_or(PairingNetworkError::Closed)?
@@ -428,6 +544,100 @@ pub async fn pair_with_host(
     })
     .await
     .map_err(|_| PairingNetworkError::Unavailable)?
+}
+
+/// The client's side of the exchange, on a stream whose public hello was
+/// read and accepted.
+async fn exchange(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    certificate: Vec<u8>,
+    identity: Arc<PeerIdentity>,
+    code: zeroize::Zeroizing<String>,
+) -> Result<Vec<u8>, PairingNetworkError> {
+    let pair = Arc::new(
+        PairingClient::new(code.to_string(), certificate, identity.certificate())
+            .map_err(|_| PairingNetworkError::Authentication)?,
+    );
+    write(
+        &mut stream,
+        &Message::Request {
+            certificate: identity.certificate(),
+            request: pair.request(),
+        },
+    )
+    .await?;
+    let Message::Challenge { attempt, response } = read(&mut stream).await? else {
+        return Err(PairingNetworkError::Authentication);
+    };
+    let completing = pair.clone();
+    let proof = tokio::task::spawn_blocking(move || completing.finish(response))
+        .await
+        .map_err(|_| PairingNetworkError::Unavailable)?
+        .map_err(|_| PairingNetworkError::Authentication)?;
+    write(&mut stream, &Message::Finish { attempt, proof }).await?;
+    let Message::Persisted { confirmation } = read(&mut stream).await? else {
+        return Err(PairingNetworkError::Persistence);
+    };
+    pair.confirm_persisted(confirmation)
+        .map_err(|_| PairingNetworkError::Authentication)
+}
+
+/// [`pair_with_host`] over one pipe a device accepted from the host's USB
+/// provider. The same exchange, code and fingerprint check as on the
+/// network: a cable is not authentication. One pipe, no race, and a failure
+/// never sends the code anywhere else.
+pub async fn pair_with_host_stream(
+    mut io: PipeIo,
+    identity: Arc<PeerIdentity>,
+    code: String,
+    invitation_fingerprint: Option<String>,
+    cancellation: Arc<crate::OperationCancellation>,
+) -> Result<Vec<u8>, PairingNetworkError> {
+    let code = zeroize::Zeroizing::new(code);
+    runtime::run(async move {
+        cancellation
+            .run(tokio::time::timeout(EXCHANGE_TIMEOUT, async move {
+                let Message::Hello {
+                    major: 1,
+                    certificate,
+                } = read(&mut io).await?
+                else {
+                    return Err(PairingNetworkError::InvalidMessage);
+                };
+                if invitation_fingerprint
+                    .is_some_and(|pin| pin != certificate_fingerprint(&certificate))
+                {
+                    return Err(PairingNetworkError::WrongHost);
+                }
+                exchange(io, certificate, identity, code).await
+            }))
+            .await
+            .ok_or(PairingNetworkError::Closed)?
+            .map_err(|_| PairingNetworkError::Timeout)?
+    })
+    .await
+    .map_err(|_| PairingNetworkError::Unavailable)?
+}
+
+/// [`pair_with_host_stream`] for a native client. A pipe handle is used
+/// once.
+#[uniffi::export]
+pub async fn pair_with_host_pipe(
+    pipe: Arc<UsbPipeHandle>,
+    identity: Arc<PeerIdentity>,
+    code: String,
+    invitation_fingerprint: Option<String>,
+    cancellation: Arc<crate::OperationCancellation>,
+) -> Result<Vec<u8>, PairingNetworkError> {
+    let pipe = pipe.take().ok_or(PairingNetworkError::InvalidMessage)?;
+    pair_with_host_stream(
+        pipe.io,
+        identity,
+        code,
+        invitation_fingerprint,
+        cancellation,
+    )
+    .await
 }
 
 async fn pairing_path(

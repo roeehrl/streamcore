@@ -54,6 +54,20 @@ impl PipeSink for SecureListener {
     }
 }
 
+/// A pairing window takes pipes while it is open: the same exchange as on its
+/// socket. Once it has closed it takes none, so no pairing pipe outlives it.
+impl PipeSink for streamcore_transport::pairing_transport::PairingService {
+    fn offer(&self, pipe: PipeIo, _device: &UsbDevice) -> Result<PendingOutcome, OfferError> {
+        use streamcore_transport::pairing_transport::PairingNetworkError;
+        let handle = self.accept_stream(pipe).map_err(|error| match error {
+            PairingNetworkError::Closed => OfferError::Closed,
+            PairingNetworkError::Unavailable => OfferError::Busy,
+            _ => OfferError::Failed,
+        })?;
+        Ok(Box::pin(handle.outcome()))
+    }
+}
+
 /// When pipes are reopened and given up.
 #[derive(Clone, Copy, Debug)]
 pub struct KeeperPolicy {

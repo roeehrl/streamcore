@@ -1059,6 +1059,25 @@ most once per device per 10 minutes, shares one global failed-attempt budget, bi
 triggering medium and shows the PIN only on the host. Negative tests: replug storm, fake adbd, fake
 usbmux, squatted device port, malicious host over AOA.
 
+**Pairing over a pipe.** Only the carrier changes: the same messages, OPAQUE contexts, attempts
+and "persist before confirm" contract as on the pairing socket, with no TLS, since it carries
+only public data and the PAKE. A `PairingService` takes pipes while its window is open
+(`accept_stream`, `accept_pipe` for native hosts) and none after; pairing still needs a window
+the host opened and the code typed on the device.
+- A kept pipe may idle until the user pairs, so the exchange's time limit starts at the
+  device's request; the window's lifetime bounds the idle wait.
+- Exchanges on pipes are counted apart from the socket's (2 at once, 4 queued), so cabled
+  devices cannot take every place from someone pairing over the network.
+- A device that leaves after the public hello spends no attempt (`ClosedIdle`); from the
+  request on, an attempt is spent however the pipe ends (`HandshakeFailed`).
+- The client pairs on one pipe (`pair_with_host_stream`, `pair_with_host_pipe`): no race, the
+  fingerprint check on the hello as on the network, and a failure never sends the code
+  elsewhere.
+- Keepers: `PairingService` is a `PipeSink`. `UsbHostPipes::usbmux_pairing` and `adb_pairing`
+  keep pairing pipes only, and stop by themselves when the window closes, so no pairing pipe
+  exists outside one. On an accessory link the host opens a pairing pipe and hands it to the
+  service.
+
 ### 8.6 Hot-plug, liveness and queueing
 
 Host events come from IOKit, usbmux `Listen`, adb `track-devices-l`, `CM_Register_Notification` and

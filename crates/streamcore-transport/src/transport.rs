@@ -99,6 +99,12 @@ pub enum PipeOutcome {
 pub struct PipeHandle(oneshot::Receiver<PipeOutcome>);
 
 impl PipeHandle {
+    /// A handle and the sender that resolves it.
+    pub(crate) fn pair() -> (oneshot::Sender<PipeOutcome>, Self) {
+        let (resolve, outcome) = oneshot::channel();
+        (resolve, Self(outcome))
+    }
+
     /// The pipe's outcome. A listener that closed first reports
     /// [`PipeOutcome::Refused`].
     pub async fn outcome(self) -> PipeOutcome {

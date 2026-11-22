@@ -130,3 +130,66 @@ async fn bad_ports_are_refused() {
         Err(UsbProviderError::Invalid)
     ));
 }
+
+/// A pairing keeper exists only inside its window: it hands the device's
+/// pairing listener a pipe while the window is open and stops by itself when
+/// the window closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_pipes_are_kept_only_while_the_window_is_open() {
+    use streamcore_transport::pairing_transport::{listen_pairing, pair_with_host_pipe};
+    let host = Arc::new(PeerIdentity::generate().unwrap());
+    let client = Arc::new(PeerIdentity::generate().unwrap());
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let on_device = UsbDeviceListener::bind(vec![port], Medium::UsbMux)
+        .await
+        .unwrap();
+    let window = listen_pairing("127.0.0.1:0".into(), host.clone())
+        .await
+        .unwrap();
+    let code = window.display_code().unwrap();
+    let provider = Arc::new(OneDevice {
+        port,
+        events: Mutex::new(vec![UsbEvent::Attached(device())]),
+    });
+    let _kept = UsbHostPipes::keep_pairing(provider.clone(), window.clone()).unwrap();
+
+    let pipe = on_device.accept().await.unwrap();
+    let pairing = pair_with_host_pipe(
+        pipe,
+        client.clone(),
+        code,
+        None,
+        OperationCancellation::new(),
+    );
+    let persisting = async {
+        let pending = window.next_verified().await.unwrap();
+        pending.confirm_persisted().await.unwrap();
+        pending.peer_certificate()
+    };
+    let (host_certificate, client_certificate) = tokio::join!(pairing, persisting);
+    assert_eq!(host_certificate.unwrap(), host.certificate());
+    assert_eq!(client_certificate, client.certificate());
+
+    // The window closes: the keeper stops, so nothing new reaches the device.
+    window.close_and_wait().await.unwrap();
+    // A pipe opened before the close may still arrive; none after it.
+    let mut quiet = false;
+    for _ in 0..3 {
+        let wait = std::time::Duration::from_millis(2_500);
+        if tokio::time::timeout(wait, on_device.accept())
+            .await
+            .is_err()
+        {
+            quiet = true;
+            break;
+        }
+    }
+    assert!(quiet, "pairing pipes kept coming after the window closed");
+    // And no keeper starts on a closed window.
+    assert!(matches!(
+        UsbHostPipes::keep_pairing(provider, window),
+        Err(UsbProviderError::Refused)
+    ));
+}

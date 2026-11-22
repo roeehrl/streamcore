@@ -274,6 +274,57 @@ impl UsbHostPipes {
     }
 }
 
+/// A provider seen through its pairing service only: whatever is asked for,
+/// the pipe goes to the device's pairing listener.
+struct PairingOnly(Arc<dyn crate::UsbPipeProvider>);
+
+#[async_trait::async_trait]
+impl crate::UsbPipeProvider for PairingOnly {
+    async fn next_event(&self) -> Option<crate::UsbEvent> {
+        self.0.next_event().await
+    }
+    async fn open(
+        &self,
+        device: &crate::UsbDevice,
+        _service: UsbService,
+    ) -> Result<streamcore_transport::transport::PipeIo, UsbError> {
+        self.0.open(device, UsbService::Pairing).await
+    }
+}
+
+impl UsbHostPipes {
+    /// Keeps pairing pipes from any provider while `service`'s window is
+    /// open (for Rust callers and tests): one per cabled device, to its
+    /// pairing listener. It ends when the window closes or on `stop`.
+    pub fn keep_pairing(
+        provider: Arc<dyn crate::UsbPipeProvider>,
+        service: Arc<streamcore_transport::pairing_transport::PairingService>,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        if service.is_closed() {
+            return Err(UsbProviderError::Refused);
+        }
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let window = service.clone();
+        let started = streamcore_transport::spawn(async move {
+            let keeping = crate::keeper::keep_pipes(
+                Arc::new(PairingOnly(provider)),
+                service,
+                None,
+                crate::keeper::KeeperPolicy::default(),
+            );
+            tokio::select! {
+                () = keeping => {}
+                _ = stopped.wait_for(|stopped| *stopped) => {}
+                () = window.closed() => {}
+            }
+        });
+        if !started {
+            return Err(UsbProviderError::Runtime);
+        }
+        Ok(Arc::new(Self { stop }))
+    }
+}
+
 #[uniffi::export]
 impl UsbHostPipes {
     /// Pipes through the Apple mobile device multiplexer at its usual
@@ -320,6 +371,53 @@ impl UsbHostPipes {
         Self::keep(
             Arc::new(AdbProvider::new(AdbServer::new(address)?, endpoints)),
             listener,
+        )
+    }
+
+    /// Pairing pipes through the device multiplexer, to `pairing_port` on
+    /// each cabled device, for as long as `service`'s window is open: the
+    /// keeping stops by itself when the window closes, so no pairing pipe
+    /// exists outside one.
+    #[uniffi::constructor]
+    pub fn usbmux_pairing(
+        service: Arc<streamcore_transport::pairing_transport::PairingService>,
+        program: String,
+        pairing_port: u16,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        use crate::usbmux::{MuxAddress, MuxPorts, MuxProvider, MuxService};
+        if pairing_port == 0 {
+            return Err(UsbProviderError::Invalid);
+        }
+        let mux = MuxService::new(MuxAddress::platform_default(), &program)?;
+        let ports = MuxPorts {
+            session: pairing_port,
+            pairing: pairing_port,
+        };
+        Self::keep_pairing(Arc::new(MuxProvider::new(mux, ports)), service)
+    }
+
+    /// Pairing pipes through a running Android debug bridge server, to
+    /// `pairing_port` on each cabled device, for as long as `service`'s
+    /// window is open.
+    #[uniffi::constructor]
+    pub fn adb_pairing(
+        service: Arc<streamcore_transport::pairing_transport::PairingService>,
+        pairing_port: u16,
+    ) -> Result<Arc<Self>, UsbProviderError> {
+        use crate::adb::{AdbEndpoints, AdbProvider, AdbServer, AdbTarget, DEFAULT_SERVER};
+        if pairing_port == 0 {
+            return Err(UsbProviderError::Invalid);
+        }
+        let address = DEFAULT_SERVER
+            .parse()
+            .map_err(|_| UsbProviderError::Invalid)?;
+        let endpoints = AdbEndpoints {
+            session: AdbTarget::Tcp(pairing_port),
+            pairing: AdbTarget::Tcp(pairing_port),
+        };
+        Self::keep_pairing(
+            Arc::new(AdbProvider::new(AdbServer::new(address)?, endpoints)),
+            service,
         )
     }
 
