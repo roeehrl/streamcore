@@ -334,10 +334,12 @@ public final class AppleHostRun: @unchecked Sendable {
 
     /// Sends on `output` from now on, parked or not (8.8): video queued for the old transport
     /// is dropped, not counted as lost, and the next frame is a keyframe in the same wire
-    /// generation, so the client keeps its decoder. `mediumCapBps` is the new medium's cap
-    /// when known. The result arrives as an `opResult` job for the returned token.
+    /// generation, so the client keeps its decoder. `mediumCapBps` replaces the plan's
+    /// medium cap for rate adaptation and the sink's capacity hint: nil means no cap, not
+    /// "keep the old one", so every move states what the new medium allows. The result
+    /// arrives as an `opResult` job for the returned token.
     @discardableResult
-    public func attachTransport(_ output: VideoOutput, mediumCapBps: UInt64? = nil) -> OpToken {
+    public func attachTransport(_ output: VideoOutput, mediumCapBps: UInt64?) -> OpToken {
         controller.attachTransport(output: output, mediumCapBps: mediumCapBps)
     }
 
