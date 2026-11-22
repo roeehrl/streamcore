@@ -230,39 +230,64 @@ async fn read_frame(io: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Fram
     }))
 }
 
-/// The next thing in the stream that has the shape of a hello, wherever it
-/// starts; `None` at the end of the stream or after [`MAX_STALE_BYTES`].
-/// Whether it is the peer's is for the caller to judge.
-async fn find_hello(io: &mut (impl AsyncRead + Unpin), skipped: &mut usize) -> Option<Frame> {
-    const LEN: usize = HEADER_LEN + HELLO_LEN;
-    let mut window = [0u8; LEN];
-    io.read_exact(&mut window).await.ok()?;
-    loop {
-        let shaped = window[..2] == MAGIC
-            && window[2] == Kind::LinkHello as u8
-            && window[3] == 0
-            && window[8..12] == [0; 4]
-            && window[12..16] == (HELLO_LEN as u32).to_be_bytes();
-        if shaped {
-            // Counted, so a stream of hellos that never brings the link up
-            // is bounded too.
-            *skipped += LEN;
-            if *skipped > MAX_STALE_BYTES {
-                return None;
+/// The search for the peer's hello in a stream with no frame boundary to
+/// trust. It keeps its place: after a match the caller rejects, the next
+/// search goes on one byte further, so a real hello that starts inside a
+/// chance match is still found.
+struct HelloSearch {
+    window: [u8; HELLO_FRAME_LEN],
+    filled: bool,
+    skipped: usize,
+}
+
+const HELLO_FRAME_LEN: usize = HEADER_LEN + HELLO_LEN;
+
+impl HelloSearch {
+    fn new() -> Self {
+        Self {
+            window: [0; HELLO_FRAME_LEN],
+            filled: false,
+            skipped: 0,
+        }
+    }
+
+    /// The next thing with the shape of a hello, wherever it starts; `None`
+    /// at the end of the stream or after [`MAX_STALE_BYTES`]. Whether it is
+    /// the peer's is for the caller to judge.
+    async fn next(&mut self, io: &mut (impl AsyncRead + Unpin)) -> Option<Frame> {
+        loop {
+            if self.filled {
+                self.skipped += 1;
+                if self.skipped > MAX_STALE_BYTES {
+                    return None;
+                }
+                self.window.copy_within(1.., 0);
+                self.window[HELLO_FRAME_LEN - 1] = io.read_u8().await.ok()?;
+            } else {
+                io.read_exact(&mut self.window).await.ok()?;
+                self.filled = true;
             }
-            return Some(Frame {
-                kind: Kind::LinkHello,
-                sequence: u32::from_be_bytes([window[4], window[5], window[6], window[7]]),
-                session: 0,
-                payload: window[HEADER_LEN..].to_vec(),
-            });
+            let window = &self.window;
+            let shaped = window[..2] == MAGIC
+                && window[2] == Kind::LinkHello as u8
+                && window[3] == 0
+                && window[8..12] == [0; 4]
+                && window[12..16] == (HELLO_LEN as u32).to_be_bytes();
+            if shaped {
+                return Some(Frame {
+                    kind: Kind::LinkHello,
+                    sequence: u32::from_be_bytes([window[4], window[5], window[6], window[7]]),
+                    session: 0,
+                    payload: window[HEADER_LEN..].to_vec(),
+                });
+            }
         }
-        *skipped += 1;
-        if *skipped > MAX_STALE_BYTES {
-            return None;
-        }
-        window.copy_within(1.., 0);
-        window[LEN - 1] = io.read_u8().await.ok()?;
+    }
+
+    /// The match just returned was the peer's hello: what follows it is
+    /// framed, so the search's window is spent.
+    fn accept(&mut self) {
+        self.filled = false;
     }
 }
 
@@ -487,14 +512,14 @@ async fn read_loop(
 ) {
     let mut peer: Option<u64> = None;
     let mut told: Option<u64> = None;
-    let mut stale = 0usize;
+    let mut search = HelloSearch::new();
     let mut reader = tokio::io::BufReader::with_capacity(HEADER_LEN + MAX_PAYLOAD, reader);
     loop {
         // Until the peer is known, the stream is searched for a hello byte by
         // byte: an earlier run may have left any part of a frame behind, so
         // there is no frame boundary to trust.
         let frame = if peer.is_none() {
-            find_hello(&mut reader, &mut stale).await
+            search.next(&mut reader).await
         } else {
             read_frame(&mut reader).await.ok().flatten()
         };
@@ -528,6 +553,7 @@ async fn read_loop(
                     lock(&shared.sessions).clear();
                 }
                 peer = Some(nonce);
+                search.accept();
                 shared.up.send_replace(true);
             }
             continue;
@@ -1095,6 +1121,28 @@ mod tests {
         });
         assert!(pipe.is_ok());
         assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn a_hello_that_starts_inside_a_chance_match_is_still_found() {
+        let (host, mut wire) = host_and_wire();
+        let first = expect(&mut wire, Kind::LinkHello).await;
+        let (host_nonce, _) = parse_hello(&first, LinkRole::Host).unwrap();
+        // Old bytes with the shape of a hello (of another version), cut off
+        // where the real hello begins.
+        let mut chance = hello_frame(LinkRole::Device, 3, 0).encode();
+        chance[HEADER_LEN + 1] = 9;
+        chance.truncate(20);
+        wire.write_all(&chance).await.unwrap();
+        let real = hello_frame(LinkRole::Device, DEVICE_NONCE, host_nonce);
+        wire.write_all(&real.encode()).await.unwrap();
+        expect(&mut wire, Kind::LinkHello).await;
+        let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        assert!(pipe.is_ok());
     }
 
     #[tokio::test]
