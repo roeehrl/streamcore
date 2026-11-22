@@ -14,8 +14,9 @@
 //! restart without the other seeing the cable drop. So:
 //! - a link is up only after a hello of its own version, from the other
 //!   role, that names this run's number: a hello an earlier run left on the
-//!   cable cannot know it. Everything read before that is discarded, and a
-//!   peer of another version never brings the link up;
+//!   cable cannot know it. Until then the stream is searched byte by byte
+//!   for hellos and everything else is discarded, whole frames or parts of
+//!   one, and a peer of another version never brings the link up;
 //! - each run of the peer is answered once with a hello naming its number,
 //!   so a peer whose copy of the first hello went to an earlier run of its
 //!   side still gets one;
@@ -66,8 +67,8 @@ const PIPE_QUEUE: usize = 64;
 /// Frames queued for the cable.
 const WRITE_QUEUE: usize = 64;
 const HELLO_LEN: usize = 19;
-/// Frames of an earlier run a link discards before the peer's hello.
-const MAX_STALE_FRAMES: usize = 4096;
+/// Bytes of an earlier run a link searches through for the peer's hello.
+const MAX_STALE_BYTES: usize = 8 * 1024 * 1024;
 /// How long the host waits for the device's hello and its answer to an `open`.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -227,6 +228,42 @@ async fn read_frame(io: &mut (impl AsyncRead + Unpin)) -> io::Result<Option<Fram
         session: word(8),
         payload,
     }))
+}
+
+/// The next thing in the stream that has the shape of a hello, wherever it
+/// starts; `None` at the end of the stream or after [`MAX_STALE_BYTES`].
+/// Whether it is the peer's is for the caller to judge.
+async fn find_hello(io: &mut (impl AsyncRead + Unpin), skipped: &mut usize) -> Option<Frame> {
+    const LEN: usize = HEADER_LEN + HELLO_LEN;
+    let mut window = [0u8; LEN];
+    io.read_exact(&mut window).await.ok()?;
+    loop {
+        let shaped = window[..2] == MAGIC
+            && window[2] == Kind::LinkHello as u8
+            && window[3] == 0
+            && window[8..12] == [0; 4]
+            && window[12..16] == (HELLO_LEN as u32).to_be_bytes();
+        if shaped {
+            // Counted, so a stream of hellos that never brings the link up
+            // is bounded too.
+            *skipped += LEN;
+            if *skipped > MAX_STALE_BYTES {
+                return None;
+            }
+            return Some(Frame {
+                kind: Kind::LinkHello,
+                sequence: u32::from_be_bytes([window[4], window[5], window[6], window[7]]),
+                session: 0,
+                payload: window[HEADER_LEN..].to_vec(),
+            });
+        }
+        *skipped += 1;
+        if *skipped > MAX_STALE_BYTES {
+            return None;
+        }
+        window.copy_within(1.., 0);
+        window[LEN - 1] = io.read_u8().await.ok()?;
+    }
 }
 
 struct Session {
@@ -451,7 +488,17 @@ async fn read_loop(
     let mut peer: Option<u64> = None;
     let mut told: Option<u64> = None;
     let mut stale = 0usize;
-    while let Ok(Some(frame)) = read_frame(reader).await {
+    let mut reader = tokio::io::BufReader::with_capacity(HEADER_LEN + MAX_PAYLOAD, reader);
+    loop {
+        // Until the peer is known, the stream is searched for a hello byte by
+        // byte: an earlier run may have left any part of a frame behind, so
+        // there is no frame boundary to trust.
+        let frame = if peer.is_none() {
+            find_hello(&mut reader, &mut stale).await
+        } else {
+            read_frame(&mut reader).await.ok().flatten()
+        };
+        let Some(frame) = frame else { return };
         let id = frame.session;
         if frame.kind == Kind::LinkHello {
             let Some((nonce, echo)) = parse_hello(&frame, shared.role.peer()) else {
@@ -459,10 +506,6 @@ async fn read_loop(
                 // that ends the link; before that it may be an earlier run's
                 // (of another version, even), so the link just stays down.
                 if peer.is_some() {
-                    return;
-                }
-                stale += 1;
-                if stale > MAX_STALE_FRAMES {
                     return;
                 }
                 continue;
@@ -486,14 +529,6 @@ async fn read_loop(
                 }
                 peer = Some(nonce);
                 shared.up.send_replace(true);
-            }
-            continue;
-        }
-        if peer.is_none() {
-            // Left on the cable by an earlier run.
-            stale += 1;
-            if stale > MAX_STALE_FRAMES {
-                return;
             }
             continue;
         }
@@ -1031,6 +1066,30 @@ mod tests {
         let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
             let open = expect(&mut wire, Kind::Open).await;
             assert_eq!(open.session, 1, "the stale frames opened nothing");
+            let opened = Frame::control(Kind::Opened, open.session, Vec::new());
+            wire.write_all(&opened.encode()).await.unwrap();
+        });
+        assert!(pipe.is_ok());
+        assert!(!host.is_closed());
+    }
+
+    #[tokio::test]
+    async fn part_of_a_frame_left_on_the_cable_is_searched_past() {
+        let (host, mut wire) = host_and_wire();
+        // An earlier run died in the middle of a write: the tail of a data
+        // frame, then bytes that begin like a frame and are not one.
+        let whole = Frame {
+            kind: Kind::Data,
+            sequence: 4,
+            session: 2,
+            payload: vec![0x53; 900],
+        }
+        .encode();
+        wire.write_all(&whole[7..]).await.unwrap();
+        wire.write_all(&[0x53, 0x4C, 1, 0, 0, 0]).await.unwrap();
+        greet(&mut wire).await;
+        let (pipe, ()) = tokio::join!(host.open(UsbService::Session), async {
+            let open = expect(&mut wire, Kind::Open).await;
             let opened = Frame::control(Kind::Opened, open.session, Vec::new());
             wire.write_all(&opened.encode()).await.unwrap();
         });
