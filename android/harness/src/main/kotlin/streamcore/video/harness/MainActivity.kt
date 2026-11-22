@@ -117,12 +117,14 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // under `depth + 1` before the jitter slack.
         queueBound = intent?.getIntExtra("qbound", 0)?.takeIf { it > 0 }
         queueBound?.let { Log.i(TAG, "queue bound floor $it") }
-        // The cable probe (`--es usb <line>`, with `--ei usbport <port>` over adb; see
+        // The cable probe (`--es usb <line>`, with `--ei usbport <port>` over adb or
+        // `--ez usbkotlin true` to read the accessory in Kotlin; see
         // AccessoryProbe).
         intent?.getStringExtra("usb")?.let { usb ->
             scope.launch {
                 val adbPort = intent?.getIntExtra("usbport", 0)?.takeIf { it > 0 }
-                AccessoryProbe.run(this@MainActivity, usb, adbPort) { text ->
+                val kotlinStream = intent?.getBooleanExtra("usbkotlin", false) == true
+                AccessoryProbe.run(this@MainActivity, usb, adbPort, kotlinStream) { text ->
                     Log.i(TAG, text)
                     main.post { status(text) }
                 }

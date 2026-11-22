@@ -71,6 +71,87 @@ pub trait ByteDuplex: Send + Sync {
     fn shutdown(&self);
 }
 
+/// A platform stream that is an open descriptor (an Android accessory's):
+/// Rust reads and writes it itself, so no transfer crosses the binding.
+#[cfg(unix)]
+pub struct DescriptorDuplex {
+    file: std::fs::File,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(unix)]
+impl DescriptorDuplex {
+    /// Takes over `descriptor`: it is closed when the last user of the
+    /// stream lets go. The caller must own it and hand it over (on Android,
+    /// `ParcelFileDescriptor.detachFd()`), and it must be open for reading
+    /// and writing.
+    pub fn adopt(descriptor: i32) -> Option<Arc<Self>> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        if descriptor < 0 {
+            return None;
+        }
+        #[allow(unsafe_code)]
+        // SAFETY: the caller hands over an open descriptor it owns and will
+        // not use or close again (the contract above), so this is its only
+        // owner from here on.
+        let owned = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        Some(Arc::new(Self {
+            file: owned.into(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+impl ByteDuplex for DescriptorDuplex {
+    fn read(&self, max: u32) -> Result<Vec<u8>, DuplexError> {
+        use std::io::Read;
+        let mut buffer = vec![0u8; (max as usize).min(DUPLEX_CHUNK)];
+        loop {
+            if self.is_closed() {
+                return Err(DuplexError::Closed);
+            }
+            match (&self.file).read(&mut buffer) {
+                // The end of the stream. (Android's accessory driver waits
+                // again on a zero-length transfer itself, so none shows here.)
+                Ok(0) => return Ok(Vec::new()),
+                Ok(read) => {
+                    buffer.truncate(read);
+                    return Ok(buffer);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // Unplugged, or shut down under the read.
+                Err(_) => return Err(DuplexError::Closed),
+            }
+        }
+    }
+
+    fn write(&self, data: Vec<u8>) -> Result<(), DuplexError> {
+        use std::io::Write;
+        if self.is_closed() {
+            return Err(DuplexError::Closed);
+        }
+        (&self.file).write_all(&data).map_err(|_| {
+            if self.is_closed() {
+                DuplexError::Closed
+            } else {
+                DuplexError::Failed
+            }
+        })
+    }
+
+    /// Later calls fail. A read already blocked in the kernel returns when
+    /// the device next sends or the cable goes: a descriptor of this kind
+    /// cannot be woken from another thread.
+    fn shutdown(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// A pipe ready for the secure transport, with what carries it and the
 /// provider's label for the device (local display only, never identity). It
 /// is used once: by [`crate::channel::SecureListener::accept_pipe`] on a host
@@ -462,6 +543,34 @@ mod tests {
         let mut pipe = pipe_from_duplex(fake.clone());
         fake.feed(&vec![0u8; DUPLEX_CHUNK + 1]);
         assert!(pipe.read(&mut [0u8; 8]).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_descriptor_is_read_and_written_from_rust() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let duplex = DescriptorDuplex::adopt(ours.into_raw_fd()).unwrap();
+        let mut pipe = pipe_from_duplex(duplex);
+        theirs.write_all(b"to the pipe").unwrap();
+        let mut got = [0u8; 11];
+        pipe.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"to the pipe");
+        pipe.write_all(b"from the pipe").await.unwrap();
+        let mut got = [0u8; 13];
+        tokio::task::spawn_blocking(move || {
+            theirs.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"from the pipe");
+            // The other end going away ends the stream.
+            drop(theirs);
+        })
+        .await
+        .unwrap();
+        let mut rest = Vec::new();
+        let _ = pipe.read_to_end(&mut rest).await;
+        assert!(rest.is_empty());
+        assert!(DescriptorDuplex::adopt(-1).is_none());
     }
 
     #[tokio::test]
