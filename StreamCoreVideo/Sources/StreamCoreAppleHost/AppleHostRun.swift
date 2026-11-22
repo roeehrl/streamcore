@@ -42,17 +42,20 @@ public struct HostRunConfig: Sendable {
     /// (`SCStreamConfiguration.sourceRect`, no restart); without, a region update is
     /// refused.
     public var contentSize: CGSize?
+    /// How long the stream waits parked for another transport (8.8) before it fails with
+    /// `stream.transport`, in nanoseconds; nil keeps StreamCore's default (3 s).
+    public var parkNs: UInt64?
 
     public init(streamID: UInt32, target: CaptureTarget, mode: StreamMode, codec: Codec, width: Int, height: Int,
                 fps: Int, bitrateBps: UInt64, extensions: [FrameExtension] = [], ltr: Bool = false,
                 temporalLayers: Bool = false, pacing: PacingPolicy, onSourceGone: OnSourceGone = .fail,
                 colorMapping: ColorMapping = ColorMapping(allowP3: true, srgbTransferAsBt709: false),
-                refreshDisplay: CGDirectDisplayID? = nil, contentSize: CGSize? = nil) {
+                refreshDisplay: CGDirectDisplayID? = nil, contentSize: CGSize? = nil, parkNs: UInt64? = nil) {
         self.streamID = streamID; self.target = target; self.mode = mode; self.codec = codec
         self.width = width; self.height = height; self.fps = fps; self.bitrateBps = bitrateBps
         self.extensions = extensions; self.ltr = ltr; self.temporalLayers = temporalLayers
         self.pacing = pacing; self.onSourceGone = onSourceGone; self.colorMapping = colorMapping
-        self.refreshDisplay = refreshDisplay; self.contentSize = contentSize
+        self.refreshDisplay = refreshDisplay; self.contentSize = contentSize; self.parkNs = parkNs
     }
 }
 
@@ -251,7 +254,11 @@ public final class AppleHostRun: @unchecked Sendable {
             streamId: config.streamID, spec: spec, plan: plan, port: port, queue: serialQueue,
             capture: capture, converter: nil, encoders: factory, output: output,
             observer: StreamObserverQueue(queue: queue) { job in box.run?.handle(job) },
-            timings: nil)
+            timings: config.parkNs.map { park in
+                var timings = defaultStreamTimings()
+                timings.parkNs = park
+                return timings
+            })
         if let canvas, let compositor {
             controller = try StreamController.newCanvas(parts: parts,
                                                         canvas: CanvasParts(layout: canvas.arrangement, compositor: compositor))
@@ -318,6 +325,21 @@ public final class AppleHostRun: @unchecked Sendable {
 
     /// Stops admission and sending at once (a leaf call, any thread).
     public func revoke() { controller.revoke() }
+
+    /// The stream's transport is going away (8.8): the stream parks, keeping capture, its
+    /// encoder session and the latest image, until `attachTransport` or `HostRunConfig.parkNs`
+    /// (then it fails with `stream.transport`). A channel that closes parks the stream by
+    /// itself once a send fails; this says so at once. A `transportParked` job follows.
+    public func detachTransport() { controller.detachTransport() }
+
+    /// Sends on `output` from now on, parked or not (8.8): video queued for the old transport
+    /// is dropped, not counted as lost, and the next frame is a keyframe in the same wire
+    /// generation, so the client keeps its decoder. `mediumCapBps` is the new medium's cap
+    /// when known. The result arrives as an `opResult` job for the returned token.
+    @discardableResult
+    public func attachTransport(_ output: VideoOutput, mediumCapBps: UInt64? = nil) -> OpToken {
+        controller.attachTransport(output: output, mediumCapBps: mediumCapBps)
+    }
 
     /// StreamCore's counters as trace notes (`sc_…`), with the FFI overhead when metered.
     public func statsNotes() -> [(key: String, value: String)] {
