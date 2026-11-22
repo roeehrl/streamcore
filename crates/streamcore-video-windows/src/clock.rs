@@ -32,6 +32,20 @@ pub fn interval_from_rational(num: u32, den: u32) -> Option<u64> {
     u64::try_from(ns).ok().filter(|ns| *ns > 0)
 }
 
+/// The minimum update interval to ask the capture session for, given the stream's own minimum
+/// (`1 s / fps`) and the display's refresh interval. Frames arrive on refreshes, so a minimum
+/// that is a whole number of refreshes (60 fps on 180 Hz: three) is a race: a frame a hair
+/// early is refused and the next comes a whole refresh late (54.9 fps measured for 60). Half a
+/// refresh less lets the frame on the intended refresh through every time, and the stream's
+/// refresh-aligned admission sets the cadence. With no refresh known, or one slower than the
+/// minimum, the minimum stays as it is.
+pub fn capture_min_interval_ns(min_interval_ns: u64, refresh_ns: Option<u64>) -> u64 {
+    match refresh_ns {
+        Some(refresh) if refresh > 0 && refresh <= min_interval_ns => min_interval_ns - refresh / 2,
+        _ => min_interval_ns,
+    }
+}
+
 /// Nanoseconds to milliseconds as a float, for reports.
 pub fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
@@ -55,6 +69,29 @@ pub fn throttling_with(current: (u32, u32), bit: u32, restore: Option<(u32, u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_capture_minimum_leaves_room_before_the_intended_refresh() {
+        const HZ_60: u64 = 16_666_667;
+        // 60 fps on 180 Hz: three refreshes exactly, so half a refresh less.
+        let hz_180 = interval_from_rational(180, 1).unwrap();
+        let asked = capture_min_interval_ns(HZ_60, Some(hz_180));
+        assert!(asked < 3 * hz_180 && asked > 2 * hz_180);
+        // 60 fps on 60 Hz: every refresh passes.
+        assert_eq!(
+            capture_min_interval_ns(HZ_60, Some(HZ_60)),
+            HZ_60 - HZ_60 / 2
+        );
+        // 60 fps on 144 Hz: the frame on the third refresh passes, and the
+        // second is for the stream's own admission to refuse.
+        let hz_144 = interval_from_rational(144, 1).unwrap();
+        let asked = capture_min_interval_ns(HZ_60, Some(hz_144));
+        assert!(asked < 3 * hz_144);
+        // A slower display, or none known: unchanged.
+        assert_eq!(capture_min_interval_ns(HZ_60, Some(33_333_333)), HZ_60);
+        assert_eq!(capture_min_interval_ns(HZ_60, None), HZ_60);
+        assert_eq!(capture_min_interval_ns(HZ_60, Some(0)), HZ_60);
+    }
 
     #[test]
     fn throttling_touches_only_its_bit() {
