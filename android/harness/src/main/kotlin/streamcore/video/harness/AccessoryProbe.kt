@@ -22,8 +22,10 @@ import uniffi.streamcore_transport.PeerIdentity
 import uniffi.streamcore_transport.SecureChannel
 import uniffi.streamcore_transport.SessionOptions
 import uniffi.streamcore_transport.connectSecurePipe
+import uniffi.streamcore_transport.Medium
 import uniffi.streamcore_usb.LinkRole
 import uniffi.streamcore_usb.UsbAccessoryLink
+import uniffi.streamcore_usb.UsbDeviceListener
 
 /**
  * An accessory connection as the blocking stream Rust reads and writes. Android hands an app
@@ -102,9 +104,9 @@ object AccessoryProbe {
         return manager.accessoryList?.firstOrNull()
     }
 
-    suspend fun run(context: Context, line: String, log: (String) -> Unit) {
+    private suspend fun openAccessory(context: Context, log: (String) -> Unit): ParcelFileDescriptor? {
         val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
-        val accessory = accessory(context) ?: return log("usb: no accessory attached")
+        val accessory = accessory(context) ?: return null.also { log("usb: no accessory attached") }
         if (!manager.hasPermission(accessory)) {
             // Started by hand, not by the attach: Android asks the user.
             log("usb: asking for the accessory; allow it on the device")
@@ -116,24 +118,40 @@ object AccessoryProbe {
                 if (manager.hasPermission(accessory)) break
                 delay(500)
             }
-            if (!manager.hasPermission(accessory)) return log("usb: no permission for the accessory")
+            if (!manager.hasPermission(accessory)) return null.also { log("usb: no permission for the accessory") }
         }
-        val descriptor = manager.openAccessory(accessory) ?: return log("usb: the accessory did not open")
+        return manager.openAccessory(accessory) ?: null.also { log("usb: the accessory did not open") }
+    }
+
+    /**
+     * Over the accessory, or with [adbPort] over a pipe the host opens through adb to that
+     * loopback port.
+     */
+    suspend fun run(context: Context, line: String, adbPort: Int?, log: (String) -> Unit) {
         val parts = line.trim().split('.')
         if (parts.size != 2) return log("usb: not a probe line")
         val identity = PeerIdentity.restore(Base64.decode(parts[0], Base64.DEFAULT))
         val host = Base64.decode(parts[1], Base64.DEFAULT)
-        val link = UsbAccessoryLink.start(AccessoryDuplex(descriptor), LinkRole.DEVICE, "host")
+        var link: UsbAccessoryLink? = null
         try {
-            log("usb: waiting for the host's pipe")
-            val accepted = withTimeout(20_000) { link.accept() } ?: return log("usb: the link ended")
+            val pipe = if (adbPort != null) {
+                val listener = UsbDeviceListener.bind(listOf(adbPort.toUShort()), Medium.USB_ADB)
+                log("usb: listening on ${listener.port()}")
+                withTimeout(30_000) { listener.accept() }
+            } else {
+                val accessory = openAccessory(context, log) ?: return
+                link = UsbAccessoryLink.start(AccessoryDuplex(accessory), LinkRole.DEVICE, "host")
+                log("usb: waiting for the host's pipe")
+                (withTimeout(20_000) { link.accept() } ?: return log("usb: the link ended")).pipe
+            }
             val channel = connectSecurePipe(
-                identity, host, accepted.pipe, SessionOptions(listOf(CLOCK), listOf(CLOCK)), OperationCancellation(),
+                identity, host, pipe, SessionOptions(listOf(CLOCK), listOf(CLOCK)), OperationCancellation(),
             )
             log("usb: connected over ${channel.transport()}")
             val probe = channel.probe(16u, 20u, 3000u)
             log("usb: round trip ${probe.answered}/${probe.sent} answered, p50 ${probe.rttP50Us} us, p95 ${probe.rttP95Us} us")
             // Every size: a transfer of whole USB packets must not stall either way.
+            val sweepStarted = System.nanoTime()
             for (size in 1..SWEEP) {
                 val message = ByteArray(size) { if (it == 0) MARK else (it + size).toByte() }
                 channel.send(message)
@@ -144,7 +162,8 @@ object AccessoryProbe {
                 }
                 if (!echo.contentEquals(message)) return log("usb: WRONG echo at size $size")
             }
-            log("usb: sizes 1..$SWEEP echoed")
+            val perEcho = (System.nanoTime() - sweepStarted) / 1e6 / SWEEP
+            log("usb: sizes 1..$SWEEP echoed, ${"%.2f".format(perEcho)} ms per echo")
             val bulk = ByteArray(BULK_BYTES) { if (it == 0) MARK else it.toByte() }
             val started = System.nanoTime()
             val received: Long = coroutineScope {
@@ -164,7 +183,7 @@ object AccessoryProbe {
         } catch (e: Exception) {
             log("usb: failed: $e")
         } finally {
-            link.end()
+            link?.end()
         }
     }
 }

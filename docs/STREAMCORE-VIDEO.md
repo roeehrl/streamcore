@@ -1026,10 +1026,16 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
     StreamCoreAppleHost; no root needed) and the harness's `AccessoryDuplex` on Android. The
     `AccessoryProbe` executable with the harness's `--es usb` runs a pinned channel over a real
     cable: every message size from 1 to 2,100 bytes echoed and 51 Mbit/s each way at once on the
-    first run (round trip p50 6.7 ms with the Mac heavily loaded: not a gate figure).
+    first run. Its round trip was p50 6 to 7 ms where adb on the same tablet measured 1.7 ms
+    (`AccessoryProbe --adb`) and usbmux to an iPad 0.7 ms, so the accessory path adds about 4 ms
+    per round trip there. Open: the suspects are the per-transfer callbacks into Kotlin and the
+    accessory driver; reading the descriptor from Rust is the next thing to try.
 - **usbmux** (iOS/iPadOS): a Rust client for the header + plist protocol (`/var/run/usbmuxd`, or
-  `127.0.0.1:27015` on Windows). **USB-C network interface** (Mac ↔ iPad/iPhone): an IP link with
-  interface-scoped `UsbNet` candidates, QUIC off until qualified.
+  `127.0.0.1:27015` on Windows). Measured Mac to iPad with `AccessoryProbe --usbmux` and a test
+  app on the device (`UsbHostPipes`, `UsbDeviceListener`): round trip p50 0.7 ms, p95 2.5 ms,
+  every message size from 1 to 2,100 bytes echoed at 0.84 ms each, 153 Mbit/s each way at once.
+  **USB-C network interface** (Mac ↔ iPad/iPhone): an IP link with interface-scoped `UsbNet`
+  candidates, QUIC off until qualified.
 
 Matrix: macOS → iPad NCM (usbmux fallback), Android AOA (adb fallback); Windows → iPad usbmux,
 Android adb; Linux → iPad usbmuxd, Android AOA + adb. Each consumer configures its own ports and AOA
