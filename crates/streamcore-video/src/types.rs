@@ -1155,6 +1155,13 @@ pub struct StreamTimings {
     pub park_ns: u64,
 }
 
+/// StreamCore's default time bounds, for a consumer that changes one of them
+/// (a Swift or Kotlin caller cannot use `Default`).
+#[uniffi::export]
+pub fn default_stream_timings() -> StreamTimings {
+    StreamTimings::default()
+}
+
 impl Default for StreamTimings {
     fn default() -> Self {
         Self {

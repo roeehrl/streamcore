@@ -88,10 +88,12 @@ private func configuration() -> SCStreamConfiguration {
     return configuration
 }
 
-private func config(target: CaptureTarget = .display(displayId: 1), codec: Codec = .h264, width: Int = 64, height: Int = 64) -> HostRunConfig {
+private func config(target: CaptureTarget = .display(displayId: 1), codec: Codec = .h264, width: Int = 64, height: Int = 64,
+                    parkNs: UInt64? = nil) -> HostRunConfig {
     HostRunConfig(streamID: 7, target: target, mode: .control, codec: codec, width: width, height: height, fps: 60,
                   bitrateBps: 2_000_000,
-                  pacing: PacingPolicy(refreshAligned: false, adaptivePermits: true, immediateRecovery: true))
+                  pacing: PacingPolicy(refreshAligned: false, adaptivePermits: true, immediateRecovery: true),
+                  parkNs: parkNs)
 }
 
 /// The generic host run: one stream from an attached capture to StreamCore's sink, with the
@@ -187,6 +189,41 @@ private func config(target: CaptureTarget = .display(displayId: 1), codec: Codec
         try await Task.sleep(for: .milliseconds(600))
         #expect(h.run.controller.stats().packetsSent == 2)
         #expect(h.run.controller.sinkState().unsentFrames == 0)
+        try await h.close()
+    }
+
+    /// A stream moves to another transport (8.8): detached, it parks and sends nothing;
+    /// attached to a new output, it goes on with the same encoder session.
+    @Test(.timeLimit(.minutes(1))) func aParkedStreamMovesToAnotherTransport() async throws {
+        let h = try Harness(config: config(parkNs: 10_000_000_000))
+        try await h.start()
+        h.offer(try nv12())
+        try await waitUntil { h.run.controller.stats().packetsSent == 2 }
+        h.queue.sync { h.run.detachTransport() }
+        try await waitUntil {
+            h.jobs.withLock { $0.contains { if case .transportParked(closed: false) = $0 { true } else { false } } }
+        }
+        h.offer(try nv12(step: 1))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(h.run.controller.stats().packetsSent == 2, "nothing is sent while parked")
+        let op = h.queue.sync { h.run.attachTransport(discard(), mediumCapBps: nil) }
+        #expect(try await h.result(of: op) == .completed)
+        h.offer(try nv12(step: 2))
+        try await waitUntil { h.run.controller.stats().packetsSent > 2 }
+        let stats = h.run.controller.stats()
+        #expect(stats.transportParks == 1 && stats.transportAttaches == 1)
+        #expect(h.run.factory.sessions.count == 1, "the encoder session is kept")
+        try await h.close()
+    }
+
+    /// A parked stream that gets no transport within `parkNs` fails with `stream.transport`.
+    @Test(.timeLimit(.minutes(1))) func aParkedStreamWithNoTransportFails() async throws {
+        let h = try Harness(config: config(parkNs: 200_000_000))
+        try await h.start()
+        h.queue.sync { h.run.detachTransport() }
+        try await waitUntil {
+            h.jobs.withLock { $0.contains { if case .failed(let code) = $0, code == "stream.transport" { true } else { false } } }
+        }
         try await h.close()
     }
 
