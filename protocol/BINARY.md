@@ -225,6 +225,40 @@ Invalid input cannot reach native injection through the production Swift decoder
   function. Other bits are invalid. Click counts and key codes use the full stated
   unsigned range; native adapters enforce their own platform mapping.
 
+## Input model payloads (`input.v2`)
+
+`input.v2` is an optional transport Hello capability that a consumer may require.
+With it, the same outer kind `0x20` also carries the input model's messages
+(`streamcore-input`, [input/README.md](input/README.md)) behind a fixed header:
+
+```
+[tag u8][stream u32 LE][layout_epoch u32 LE][body]
+```
+
+| Tag | Body | Codec in `streamcore-input` |
+| --- | --- | --- |
+| `0x20` pencil | sample batch, 1 + 39 × n bytes, pen v2 rules (`cancel` is valid) | `encode_pencil_packet` / `decode_pencil_packet` with `pen_v2 = true` |
+| `0x21` gesture | UTF-8 JSON | `encode_gesture` / `decode_gesture` (strict) |
+| `0x22` key | 4 bytes | `encode_key_packet` / `decode_key_packet` |
+| `0x24` text | UTF-8 JSON | `encode_text` / `decode_text` |
+| `0x25` keyShortcut | UTF-8 JSON | `encode_key_shortcut` / `decode_key_shortcut` (strict) |
+
+- The tags are the values of `pad_message_type_code`. They do not collide with the
+  fixed events' tags 1 to 4, which stay valid and unchanged. Tags `0x23` and from
+  `0x26` are unassigned and rejected.
+- `stream` names the stream the input is for. `layout_epoch` is the epoch of the
+  last frame the sender presented (the video `layoutInfo` epoch); it is 0 for a
+  body with no position (key, text, keyShortcut). A receiver maps positions
+  through that epoch's content rectangle and drops positional input whose epoch it
+  no longer keeps.
+- The bodies, their modifier bits and their fixtures (`input/fixtures/wire-messages.json`,
+  `input/fixtures/binary-payloads.json`) are exactly those of the input model.
+  Nothing maps them to the fixed events' modifier bits on the wire.
+- A sender emits these tags only when `input.v2` was negotiated, so a peer that
+  knows only the fixed events never receives a tag it must reject. The transport
+  does not inspect the body of kind `0x20`; the receiving consumer decodes strictly
+  and injects nothing it could not fully validate.
+
 ## Typed ping and pong (`clock.v1`)
 
 With the `clock.v1` capability (`clock::CLOCK_CAPABILITY`), ping `0x02` and pong
