@@ -1174,7 +1174,10 @@ count. With keep-warm on, an attach starts one hold, as input does.
 **Ownership.** StreamCore: `DialTarget::Pipe`, TLS over `ByteDuplex`, `accept_stream`, handshake
 caps, no pipe retry, timestamped ping and `probe()`, USB liveness, `detach_transport` /
 `attach_transport`, `SessionDaemon::attach_expecting` (`attach` is unchanged), and optionally the
-transport owner as a pure state machine the consumer drives. Consumer: the control hello schema
+transport owner as a pure state machine the consumer drives (`TransportOwner` in Rust;
+`SharedTransportOwner` for native clients: the same machine behind a lock, `handle(now_ms,
+event)` returning the actions, with `OwnerEvent`, `OwnerAction`, `OwnerState` and `OwnerPolicy`
+as plain binding types and no callbacks). Consumer: the control hello schema
 (`resume`, the expected generation, the new `continued` field, a hard bump), the per-session object
 and authority rekeying, make-before-break, UI states, provider wiring.
 

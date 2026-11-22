@@ -18,15 +18,15 @@
 //! - a cable that keeps failing is left alone for a while.
 
 /// Which kind of transport a channel is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Route {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerRoute {
     Network,
     /// A relayed pipe over a cable.
     Usb,
 }
 
 /// The rules' numbers. The defaults are the design's.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct OwnerPolicy {
     /// No detach or flap for this long before a cable is dialed.
     pub stability_hold_ms: u64,
@@ -44,7 +44,7 @@ pub struct OwnerPolicy {
     pub trigger_hold_ms: u64,
     /// This many cable losses within `flap_window_ms` keep the session on the
     /// network for `flap_stay_ms`, doubling each time it happens again.
-    pub flap_limit: usize,
+    pub flap_limit: u32,
     pub flap_window_ms: u64,
     pub flap_stay_ms: u64,
     /// A resume that fails is tried again after this pause, doubling up to
@@ -76,8 +76,8 @@ impl Default for OwnerPolicy {
 }
 
 /// How far a switch has got.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerStage {
     /// Waiting out the stability hold (cable only).
     Holding,
     Dialing,
@@ -87,27 +87,27 @@ pub enum Stage {
     AwaitingAnswer,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum State {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerState {
     Idle,
     Connecting,
     Live {
-        route: Route,
+        route: OwnerRoute,
     },
     /// A candidate on `to` is being brought up beside the live transport.
     /// `live_closed`: the live one died after the candidate passed its probe,
     /// so the candidate is the only channel left.
     Switching {
-        from: Route,
-        to: Route,
-        stage: Stage,
+        from: OwnerRoute,
+        to: OwnerRoute,
+        stage: OwnerStage,
         live_closed: bool,
     },
     Resuming,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Timer {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerTimer {
     StabilityHold,
     HelloAnswer,
     /// The pause before the next resume attempt.
@@ -115,8 +115,8 @@ pub enum Timer {
 }
 
 /// What happened. Events about a candidate are ignored when there is none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Event {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerEvent {
     /// The consumer wants a connection.
     ConnectRequested,
     /// The consumer wants none: close everything.
@@ -124,7 +124,7 @@ pub enum Event {
     /// A connect or resume finished: a channel on `route` is live and its
     /// control hello was answered.
     Connected {
-        route: Route,
+        route: OwnerRoute,
     },
     ConnectFailed,
     /// A cable pipe is there to dial: a plug, or a pipe accepted on the
@@ -136,7 +136,9 @@ pub enum Event {
     UsbPipeGone,
     /// The live cable is backlogged or slow (the health rule).
     UsbUnhealthy,
-    TimerFired(Timer),
+    TimerFired {
+        timer: OwnerTimer,
+    },
     /// The candidate's dial finished.
     CandidateDialed,
     CandidateDialFailed,
@@ -157,8 +159,8 @@ pub enum Event {
 }
 
 /// What the consumer does next, in order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerAction {
     /// Dial with no live transport, racing the network routes; with
     /// `usb_first` a cable pipe is one more route, ahead of them.
     Connect {
@@ -166,7 +168,7 @@ pub enum Action {
     },
     /// Dial one candidate on `route`, pinned to the current host: no retry.
     DialCandidate {
-        route: Route,
+        route: OwnerRoute,
     },
     ProbeCandidate {
         count: u8,
@@ -182,27 +184,79 @@ pub enum Action {
     AdoptCandidate,
     CloseCandidate,
     CloseLive,
-    SetTimer(Timer, u64),
-    CancelTimer(Timer),
-    Report(Status),
+    SetTimer {
+        timer: OwnerTimer,
+        after_ms: u64,
+    },
+    CancelTimer {
+        timer: OwnerTimer,
+    },
+    Report {
+        status: OwnerStatus,
+    },
 }
 
 /// What the consumer shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum OwnerStatus {
     Connecting,
-    Live(Route),
-    /// The session moved to `Route` without a break: not an interruption.
-    TransportChanged(Route),
+    Live {
+        route: OwnerRoute,
+    },
+    /// The session moved to this route without a break: not an interruption.
+    TransportChanged {
+        route: OwnerRoute,
+    },
     /// The transport was lost and the session is being resumed: the last
     /// picture stays, input is dropped.
     Resuming,
     Disconnected,
 }
 
+/// The design's numbers ([`OwnerPolicy::default`]), for a binding to start
+/// from.
+#[uniffi::export]
+pub fn default_owner_policy() -> OwnerPolicy {
+    OwnerPolicy::default()
+}
+
+/// A [`TransportOwner`] behind a lock, for native clients: the same pure
+/// state machine, callable from any thread. Calls are short and never block
+/// on anything but each other; nothing here does I/O or calls back.
+#[derive(uniffi::Object)]
+pub struct SharedTransportOwner(std::sync::Mutex<TransportOwner>);
+
+#[uniffi::export]
+impl SharedTransportOwner {
+    #[uniffi::constructor]
+    pub fn new(policy: OwnerPolicy) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self(std::sync::Mutex::new(TransportOwner::new(policy))))
+    }
+
+    /// What happened at `now_ms` (any monotonic clock, the same one every
+    /// time), and what to do next, in order.
+    pub fn handle(&self, now_ms: u64, event: OwnerEvent) -> Vec<OwnerAction> {
+        self.lock().handle(now_ms, event)
+    }
+
+    pub fn state(&self) -> OwnerState {
+        self.lock().state()
+    }
+}
+
+impl SharedTransportOwner {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TransportOwner> {
+        // The machine holds plain data: a caller that panicked mid-call left
+        // nothing half-written that a later call could not handle.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 pub struct TransportOwner {
     policy: OwnerPolicy,
-    state: State,
+    state: OwnerState,
     /// A cable pipe is there and unused.
     pipe_ready: bool,
     /// Cable triggers are ignored until this time.
@@ -219,7 +273,7 @@ impl TransportOwner {
     pub fn new(policy: OwnerPolicy) -> Self {
         Self {
             policy,
-            state: State::Idle,
+            state: OwnerState::Idle,
             pipe_ready: false,
             usb_barred_until: 0,
             usb_losses: Vec::new(),
@@ -228,7 +282,7 @@ impl TransportOwner {
         }
     }
 
-    pub fn state(&self) -> State {
+    pub fn state(&self) -> OwnerState {
         self.state
     }
 
@@ -243,7 +297,7 @@ impl TransportOwner {
         self.usb_losses
             .retain(|at| now_ms.saturating_sub(*at) < window);
         self.usb_losses.push(now_ms);
-        if self.usb_losses.len() >= self.policy.flap_limit {
+        if self.usb_losses.len() >= self.policy.flap_limit as usize {
             self.usb_losses.clear();
             self.usb_barred_until = self
                 .usb_barred_until
@@ -254,32 +308,34 @@ impl TransportOwner {
 
     /// On a live network transport with a cable pipe waiting: start the
     /// make-before-break switch, if the cable is not barred.
-    fn maybe_switch_to_usb(&mut self, now_ms: u64, actions: &mut Vec<Action>) {
+    fn maybe_switch_to_usb(&mut self, now_ms: u64, actions: &mut Vec<OwnerAction>) {
         if self.state
-            == (State::Live {
-                route: Route::Network,
+            == (OwnerState::Live {
+                route: OwnerRoute::Network,
             })
             && self.pipe_ready
             && self.usb_allowed(now_ms)
         {
-            self.state = State::Switching {
-                from: Route::Network,
-                to: Route::Usb,
-                stage: Stage::Holding,
+            self.state = OwnerState::Switching {
+                from: OwnerRoute::Network,
+                to: OwnerRoute::Usb,
+                stage: OwnerStage::Holding,
                 live_closed: false,
             };
-            actions.push(Action::SetTimer(
-                Timer::StabilityHold,
-                self.policy.stability_hold_ms,
-            ));
+            actions.push(OwnerAction::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: self.policy.stability_hold_ms,
+            });
         }
     }
 
-    fn resume(&mut self, actions: &mut Vec<Action>) {
-        self.state = State::Resuming;
+    fn resume(&mut self, actions: &mut Vec<OwnerAction>) {
+        self.state = OwnerState::Resuming;
         self.resume_failures = 0;
-        actions.push(Action::Report(Status::Resuming));
-        actions.push(Action::Connect {
+        actions.push(OwnerAction::Report {
+            status: OwnerStatus::Resuming,
+        });
+        actions.push(OwnerAction::Connect {
             usb_first: self.pipe_ready,
         });
     }
@@ -294,12 +350,12 @@ impl TransportOwner {
     fn candidate_failed(
         &mut self,
         now_ms: u64,
-        from: Route,
-        to: Route,
+        from: OwnerRoute,
+        to: OwnerRoute,
         live_closed: bool,
-        actions: &mut Vec<Action>,
+        actions: &mut Vec<OwnerAction>,
     ) {
-        if to == Route::Usb {
+        if to == OwnerRoute::Usb {
             self.usb_lost(now_ms);
             self.usb_barred_until = self
                 .usb_barred_until
@@ -307,76 +363,90 @@ impl TransportOwner {
         }
         if live_closed {
             // Already reported as resuming when the live transport closed.
-            self.state = State::Resuming;
+            self.state = OwnerState::Resuming;
             self.resume_failures = 0;
-            actions.push(Action::Connect {
+            actions.push(OwnerAction::Connect {
                 usb_first: self.pipe_ready && self.usb_allowed(now_ms),
             });
         } else {
-            self.state = State::Live { route: from };
+            self.state = OwnerState::Live { route: from };
         }
     }
 
     /// Feeds one event at `now_ms` (any monotonic milliseconds) and returns
     /// what to do. Events that do not apply in the current state do nothing.
-    pub fn handle(&mut self, now_ms: u64, event: Event) -> Vec<Action> {
+    pub fn handle(&mut self, now_ms: u64, event: OwnerEvent) -> Vec<OwnerAction> {
         let mut actions = Vec::new();
         // The cable's presence is tracked in every state.
         match event {
-            Event::UsbPipeReady => self.pipe_ready = true,
-            Event::UsbPipeGone => self.pipe_ready = false,
+            OwnerEvent::UsbPipeReady => self.pipe_ready = true,
+            OwnerEvent::UsbPipeGone => self.pipe_ready = false,
             _ => {}
         }
-        if event == Event::Disconnect {
+        if event == OwnerEvent::Disconnect {
             match self.state {
-                State::Idle => {}
-                State::Switching { live_closed, .. } => {
-                    actions.push(Action::CancelTimer(Timer::StabilityHold));
-                    actions.push(Action::CancelTimer(Timer::HelloAnswer));
-                    actions.push(Action::CloseCandidate);
+                OwnerState::Idle => {}
+                OwnerState::Switching { live_closed, .. } => {
+                    actions.push(OwnerAction::CancelTimer {
+                        timer: OwnerTimer::StabilityHold,
+                    });
+                    actions.push(OwnerAction::CancelTimer {
+                        timer: OwnerTimer::HelloAnswer,
+                    });
+                    actions.push(OwnerAction::CloseCandidate);
                     if !live_closed {
-                        actions.push(Action::CloseLive);
+                        actions.push(OwnerAction::CloseLive);
                     }
                 }
-                State::Live { .. } => actions.push(Action::CloseLive),
-                State::Resuming => actions.push(Action::CancelTimer(Timer::ResumeRetry)),
-                State::Connecting => {}
+                OwnerState::Live { .. } => actions.push(OwnerAction::CloseLive),
+                OwnerState::Resuming => actions.push(OwnerAction::CancelTimer {
+                    timer: OwnerTimer::ResumeRetry,
+                }),
+                OwnerState::Connecting => {}
             }
-            if self.state != State::Idle {
-                actions.push(Action::Report(Status::Disconnected));
+            if self.state != OwnerState::Idle {
+                actions.push(OwnerAction::Report {
+                    status: OwnerStatus::Disconnected,
+                });
             }
-            self.state = State::Idle;
+            self.state = OwnerState::Idle;
             return actions;
         }
         match self.state {
-            State::Idle => {
-                if event == Event::ConnectRequested {
-                    self.state = State::Connecting;
-                    actions.push(Action::Report(Status::Connecting));
-                    actions.push(Action::Connect {
+            OwnerState::Idle => {
+                if event == OwnerEvent::ConnectRequested {
+                    self.state = OwnerState::Connecting;
+                    actions.push(OwnerAction::Report {
+                        status: OwnerStatus::Connecting,
+                    });
+                    actions.push(OwnerAction::Connect {
                         usb_first: self.pipe_ready && self.usb_allowed(now_ms),
                     });
                 }
             }
-            State::Connecting | State::Resuming => match event {
-                Event::Connected { route } => {
-                    if route == Route::Usb {
+            OwnerState::Connecting | OwnerState::Resuming => match event {
+                OwnerEvent::Connected { route } => {
+                    if route == OwnerRoute::Usb {
                         // The pipe is now the live transport.
                         self.pipe_ready = false;
                     }
-                    self.state = State::Live { route };
-                    actions.push(Action::Report(Status::Live(route)));
+                    self.state = OwnerState::Live { route };
+                    actions.push(OwnerAction::Report {
+                        status: OwnerStatus::Live { route },
+                    });
                     // A pipe that lost the connect race is still a trigger.
                     self.maybe_switch_to_usb(now_ms, &mut actions);
                 }
                 // A first connect that fails is the consumer's to ask for again.
                 // A resume keeps trying with a growing pause, and the status
                 // stays "resuming" until it gives up.
-                Event::ConnectFailed if self.state == State::Resuming => {
+                OwnerEvent::ConnectFailed if self.state == OwnerState::Resuming => {
                     self.resume_failures += 1;
                     if self.resume_failures >= self.policy.resume_attempts {
-                        self.state = State::Idle;
-                        actions.push(Action::Report(Status::Disconnected));
+                        self.state = OwnerState::Idle;
+                        actions.push(OwnerAction::Report {
+                            status: OwnerStatus::Disconnected,
+                        });
                     } else {
                         let doublings = (self.resume_failures - 1).min(32);
                         let pause = self
@@ -384,52 +454,59 @@ impl TransportOwner {
                             .resume_retry_ms
                             .saturating_mul(1u64 << doublings)
                             .min(self.policy.resume_retry_max_ms);
-                        actions.push(Action::SetTimer(Timer::ResumeRetry, pause));
+                        actions.push(OwnerAction::SetTimer {
+                            timer: OwnerTimer::ResumeRetry,
+                            after_ms: pause,
+                        });
                     }
                 }
-                Event::TimerFired(Timer::ResumeRetry) if self.state == State::Resuming => {
-                    actions.push(Action::Connect {
+                OwnerEvent::TimerFired {
+                    timer: OwnerTimer::ResumeRetry,
+                } if self.state == OwnerState::Resuming => {
+                    actions.push(OwnerAction::Connect {
                         usb_first: self.pipe_ready && self.usb_allowed(now_ms),
                     });
                 }
-                Event::ConnectFailed => {
-                    self.state = State::Idle;
-                    actions.push(Action::Report(Status::Disconnected));
+                OwnerEvent::ConnectFailed => {
+                    self.state = OwnerState::Idle;
+                    actions.push(OwnerAction::Report {
+                        status: OwnerStatus::Disconnected,
+                    });
                 }
                 _ => {}
             },
-            State::Live { route } => match event {
-                Event::UsbPipeReady => self.maybe_switch_to_usb(now_ms, &mut actions),
-                Event::UsbUnhealthy if route == Route::Usb => {
+            OwnerState::Live { route } => match event {
+                OwnerEvent::UsbPipeReady => self.maybe_switch_to_usb(now_ms, &mut actions),
+                OwnerEvent::UsbUnhealthy if route == OwnerRoute::Usb => {
                     self.usb_lost(now_ms);
                     self.usb_barred_until = self
                         .usb_barred_until
                         .max(now_ms.saturating_add(self.policy.trigger_hold_ms));
-                    self.state = State::Switching {
-                        from: Route::Usb,
-                        to: Route::Network,
-                        stage: Stage::Dialing,
+                    self.state = OwnerState::Switching {
+                        from: OwnerRoute::Usb,
+                        to: OwnerRoute::Network,
+                        stage: OwnerStage::Dialing,
                         live_closed: false,
                     };
-                    actions.push(Action::DialCandidate {
-                        route: Route::Network,
+                    actions.push(OwnerAction::DialCandidate {
+                        route: OwnerRoute::Network,
                     });
                 }
-                Event::LiveClosed => {
-                    if route == Route::Usb {
+                OwnerEvent::LiveClosed => {
+                    if route == OwnerRoute::Usb {
                         self.usb_lost(now_ms);
                     }
                     self.resume(&mut actions);
                 }
                 _ => {}
             },
-            State::Switching {
+            OwnerState::Switching {
                 from,
                 to,
                 stage,
                 live_closed,
             } => {
-                let stay = |stage| State::Switching {
+                let stay = |stage| OwnerState::Switching {
                     from,
                     to,
                     stage,
@@ -438,73 +515,87 @@ impl TransportOwner {
                 match (stage, event) {
                     // The live transport died before the candidate proved
                     // itself: cancel the candidate and resume.
-                    (Stage::Holding | Stage::Dialing | Stage::Probing, Event::LiveClosed) => {
-                        actions.push(Action::CancelTimer(Timer::StabilityHold));
-                        if stage != Stage::Holding {
-                            actions.push(Action::CloseCandidate);
+                    (
+                        OwnerStage::Holding | OwnerStage::Dialing | OwnerStage::Probing,
+                        OwnerEvent::LiveClosed,
+                    ) => {
+                        actions.push(OwnerAction::CancelTimer {
+                            timer: OwnerTimer::StabilityHold,
+                        });
+                        if stage != OwnerStage::Holding {
+                            actions.push(OwnerAction::CloseCandidate);
                         }
-                        if from == Route::Usb {
+                        if from == OwnerRoute::Usb {
                             self.usb_lost(now_ms);
                         }
                         self.resume(&mut actions);
                     }
                     // It died after the probe passed: the candidate, with its
                     // hello already sent, is the first route of the resume.
-                    (Stage::AwaitingAnswer, Event::LiveClosed) if !live_closed => {
-                        if from == Route::Usb {
+                    (OwnerStage::AwaitingAnswer, OwnerEvent::LiveClosed) if !live_closed => {
+                        if from == OwnerRoute::Usb {
                             self.usb_lost(now_ms);
                         }
-                        self.state = State::Switching {
+                        self.state = OwnerState::Switching {
                             from,
                             to,
                             stage,
                             live_closed: true,
                         };
-                        actions.push(Action::Report(Status::Resuming));
+                        actions.push(OwnerAction::Report {
+                            status: OwnerStatus::Resuming,
+                        });
                     }
-                    (Stage::Holding, Event::UsbFlapped) => {
-                        actions.push(Action::SetTimer(
-                            Timer::StabilityHold,
-                            self.policy.stability_hold_ms,
-                        ));
+                    (OwnerStage::Holding, OwnerEvent::UsbFlapped) => {
+                        actions.push(OwnerAction::SetTimer {
+                            timer: OwnerTimer::StabilityHold,
+                            after_ms: self.policy.stability_hold_ms,
+                        });
                     }
-                    (Stage::Holding, Event::UsbPipeGone) => {
-                        actions.push(Action::CancelTimer(Timer::StabilityHold));
-                        self.state = State::Live { route: from };
+                    (OwnerStage::Holding, OwnerEvent::UsbPipeGone) => {
+                        actions.push(OwnerAction::CancelTimer {
+                            timer: OwnerTimer::StabilityHold,
+                        });
+                        self.state = OwnerState::Live { route: from };
                     }
-                    (Stage::Holding, Event::TimerFired(Timer::StabilityHold)) => {
-                        self.state = stay(Stage::Dialing);
-                        actions.push(Action::DialCandidate { route: to });
+                    (
+                        OwnerStage::Holding,
+                        OwnerEvent::TimerFired {
+                            timer: OwnerTimer::StabilityHold,
+                        },
+                    ) => {
+                        self.state = stay(OwnerStage::Dialing);
+                        actions.push(OwnerAction::DialCandidate { route: to });
                     }
-                    (Stage::Dialing, Event::CandidateDialed) => {
-                        if to == Route::Usb {
+                    (OwnerStage::Dialing, OwnerEvent::CandidateDialed) => {
+                        if to == OwnerRoute::Usb {
                             // The pipe is in use from here on.
                             self.pipe_ready = false;
-                            self.state = stay(Stage::Probing);
-                            actions.push(Action::ProbeCandidate {
+                            self.state = stay(OwnerStage::Probing);
+                            actions.push(OwnerAction::ProbeCandidate {
                                 count: self.policy.probe_count,
                                 spacing_ms: self.policy.probe_spacing_ms,
                                 deadline_ms: self.policy.probe_deadline_ms,
                             });
                         } else {
-                            self.state = stay(Stage::AwaitingAnswer);
-                            actions.push(Action::SendHelloOnCandidate);
-                            actions.push(Action::SetTimer(
-                                Timer::HelloAnswer,
-                                self.policy.hello_answer_ms,
-                            ));
+                            self.state = stay(OwnerStage::AwaitingAnswer);
+                            actions.push(OwnerAction::SendHelloOnCandidate);
+                            actions.push(OwnerAction::SetTimer {
+                                timer: OwnerTimer::HelloAnswer,
+                                after_ms: self.policy.hello_answer_ms,
+                            });
                         }
                     }
                     // One dial, no retry: nothing more until the next trigger.
-                    (Stage::Dialing, Event::CandidateDialFailed) => {
-                        if to == Route::Usb {
+                    (OwnerStage::Dialing, OwnerEvent::CandidateDialFailed) => {
+                        if to == OwnerRoute::Usb {
                             self.pipe_ready = false;
                         }
                         self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     (
-                        Stage::Probing,
-                        Event::Probed {
+                        OwnerStage::Probing,
+                        OwnerEvent::Probed {
                             answered,
                             rtt_p50_us,
                             elapsed_ms,
@@ -523,50 +614,61 @@ impl TransportOwner {
                             && fast_enough
                             && elapsed_ms <= self.policy.probe_deadline_ms
                         {
-                            self.state = stay(Stage::AwaitingAnswer);
-                            actions.push(Action::SendHelloOnCandidate);
-                            actions.push(Action::SetTimer(
-                                Timer::HelloAnswer,
-                                self.policy.hello_answer_ms,
-                            ));
+                            self.state = stay(OwnerStage::AwaitingAnswer);
+                            actions.push(OwnerAction::SendHelloOnCandidate);
+                            actions.push(OwnerAction::SetTimer {
+                                timer: OwnerTimer::HelloAnswer,
+                                after_ms: self.policy.hello_answer_ms,
+                            });
                         } else {
-                            actions.push(Action::CloseCandidate);
+                            actions.push(OwnerAction::CloseCandidate);
                             self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                         }
                     }
-                    (Stage::AwaitingAnswer, Event::HelloAccepted) => {
-                        actions.push(Action::CancelTimer(Timer::HelloAnswer));
-                        actions.push(Action::AdoptCandidate);
-                        actions.push(Action::Report(if live_closed {
-                            Status::Live(to)
-                        } else {
-                            Status::TransportChanged(to)
-                        }));
-                        self.state = State::Live { route: to };
+                    (OwnerStage::AwaitingAnswer, OwnerEvent::HelloAccepted) => {
+                        actions.push(OwnerAction::CancelTimer {
+                            timer: OwnerTimer::HelloAnswer,
+                        });
+                        actions.push(OwnerAction::AdoptCandidate);
+                        actions.push(OwnerAction::Report {
+                            status: if live_closed {
+                                OwnerStatus::Live { route: to }
+                            } else {
+                                OwnerStatus::TransportChanged { route: to }
+                            },
+                        });
+                        self.state = OwnerState::Live { route: to };
                         // Back on the network with a cable waiting (a health
                         // move): the bar decides whether to try it again.
                         self.maybe_switch_to_usb(now_ms, &mut actions);
                     }
-                    (Stage::AwaitingAnswer, Event::HelloRejected) => {
-                        actions.push(Action::CancelTimer(Timer::HelloAnswer));
-                        actions.push(Action::CloseCandidate);
+                    (OwnerStage::AwaitingAnswer, OwnerEvent::HelloRejected) => {
+                        actions.push(OwnerAction::CancelTimer {
+                            timer: OwnerTimer::HelloAnswer,
+                        });
+                        actions.push(OwnerAction::CloseCandidate);
                         self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     (
-                        Stage::Dialing | Stage::Probing | Stage::AwaitingAnswer,
-                        Event::CandidateClosed,
+                        OwnerStage::Dialing | OwnerStage::Probing | OwnerStage::AwaitingAnswer,
+                        OwnerEvent::CandidateClosed,
                     ) => {
-                        actions.push(Action::CancelTimer(Timer::HelloAnswer));
+                        actions.push(OwnerAction::CancelTimer {
+                            timer: OwnerTimer::HelloAnswer,
+                        });
                         self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     // No answer in time. With the live transport still up,
                     // keep both channels until one answers or closes. With it
                     // gone the candidate is the only channel: give it up and
                     // resume, or the client would wait on it for ever.
-                    (Stage::AwaitingAnswer, Event::TimerFired(Timer::HelloAnswer))
-                        if live_closed =>
-                    {
-                        actions.push(Action::CloseCandidate);
+                    (
+                        OwnerStage::AwaitingAnswer,
+                        OwnerEvent::TimerFired {
+                            timer: OwnerTimer::HelloAnswer,
+                        },
+                    ) if live_closed => {
+                        actions.push(OwnerAction::CloseCandidate);
                         self.candidate_failed(now_ms, from, to, live_closed, &mut actions);
                     }
                     _ => {}
@@ -580,8 +682,8 @@ impl TransportOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use Action as A;
-    use Event as E;
+    use OwnerAction as A;
+    use OwnerEvent as E;
 
     fn owner() -> TransportOwner {
         TransportOwner::new(OwnerPolicy::default())
@@ -594,13 +696,13 @@ mod tests {
         owner.handle(
             0,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         owner
     }
 
-    fn good_probe() -> Event {
+    fn good_probe() -> OwnerEvent {
         E::Probed {
             answered: 5,
             rtt_p50_us: Some(900),
@@ -612,7 +714,12 @@ mod tests {
     /// Drives a network-live owner through hold, dial and probe to the hello.
     fn to_awaiting_answer(owner: &mut TransportOwner, now: u64) {
         owner.handle(now, E::UsbPipeReady);
-        owner.handle(now + 2_000, E::TimerFired(Timer::StabilityHold));
+        owner.handle(
+            now + 2_000,
+            E::TimerFired {
+                timer: OwnerTimer::StabilityHold,
+            },
+        );
         owner.handle(now + 2_010, E::CandidateDialed);
         owner.handle(now + 2_200, good_probe());
     }
@@ -623,7 +730,9 @@ mod tests {
         assert_eq!(
             owner.handle(0, E::ConnectRequested),
             [
-                A::Report(Status::Connecting),
+                A::Report {
+                    status: OwnerStatus::Connecting
+                },
                 A::Connect { usb_first: false }
             ]
         );
@@ -631,24 +740,41 @@ mod tests {
             owner.handle(
                 50,
                 E::Connected {
-                    route: Route::Network
+                    route: OwnerRoute::Network
                 }
             ),
-            [A::Report(Status::Live(Route::Network))]
+            [A::Report {
+                status: OwnerStatus::Live {
+                    route: OwnerRoute::Network
+                }
+            }]
         );
         // The plug starts the hold; nothing is dialed yet.
         assert_eq!(
             owner.handle(1_000, E::UsbPipeReady),
-            [A::SetTimer(Timer::StabilityHold, 2_000)]
+            [A::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: 2_000
+            }]
         );
         // A flap restarts it.
         assert_eq!(
             owner.handle(2_500, E::UsbFlapped),
-            [A::SetTimer(Timer::StabilityHold, 2_000)]
+            [A::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: 2_000
+            }]
         );
         assert_eq!(
-            owner.handle(4_500, E::TimerFired(Timer::StabilityHold)),
-            [A::DialCandidate { route: Route::Usb }]
+            owner.handle(
+                4_500,
+                E::TimerFired {
+                    timer: OwnerTimer::StabilityHold
+                }
+            ),
+            [A::DialCandidate {
+                route: OwnerRoute::Usb
+            }]
         );
         assert_eq!(
             owner.handle(4_510, E::CandidateDialed),
@@ -662,41 +788,70 @@ mod tests {
             owner.handle(4_700, good_probe()),
             [
                 A::SendHelloOnCandidate,
-                A::SetTimer(Timer::HelloAnswer, 5_000)
+                A::SetTimer {
+                    timer: OwnerTimer::HelloAnswer,
+                    after_ms: 5_000
+                }
             ]
         );
         // Only the host's answer swaps the channels: a change, not a break.
         assert_eq!(
             owner.handle(4_720, E::HelloAccepted),
             [
-                A::CancelTimer(Timer::HelloAnswer),
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
                 A::AdoptCandidate,
-                A::Report(Status::TransportChanged(Route::Usb))
+                A::Report {
+                    status: OwnerStatus::TransportChanged {
+                        route: OwnerRoute::Usb
+                    }
+                }
             ]
         );
-        assert_eq!(owner.state(), State::Live { route: Route::Usb });
+        assert_eq!(
+            owner.state(),
+            OwnerState::Live {
+                route: OwnerRoute::Usb
+            }
+        );
     }
 
     #[test]
     fn a_candidate_that_fails_leaves_the_live_transport_untouched() {
-        let live = State::Live {
-            route: Route::Network,
+        let live = OwnerState::Live {
+            route: OwnerRoute::Network,
         };
         // The pipe goes during the hold.
         let mut owner = live_on_network();
         owner.handle(0, E::UsbPipeReady);
         assert_eq!(
             owner.handle(500, E::UsbPipeGone),
-            [A::CancelTimer(Timer::StabilityHold)]
+            [A::CancelTimer {
+                timer: OwnerTimer::StabilityHold
+            }]
         );
         assert_eq!(owner.state(), live);
         // The dial fails: one attempt, nothing more until the next trigger.
         let mut owner = live_on_network();
         owner.handle(0, E::UsbPipeReady);
-        owner.handle(2_000, E::TimerFired(Timer::StabilityHold));
+        owner.handle(
+            2_000,
+            E::TimerFired {
+                timer: OwnerTimer::StabilityHold,
+            },
+        );
         assert_eq!(owner.handle(2_100, E::CandidateDialFailed), []);
         assert_eq!(owner.state(), live);
-        assert_eq!(owner.handle(9_000, E::TimerFired(Timer::StabilityHold)), []);
+        assert_eq!(
+            owner.handle(
+                9_000,
+                E::TimerFired {
+                    timer: OwnerTimer::StabilityHold
+                }
+            ),
+            []
+        );
         // A probe that is too lossy, too slow, or late closes the candidate.
         for probe in [
             E::Probed {
@@ -726,7 +881,12 @@ mod tests {
         ] {
             let mut owner = live_on_network();
             owner.handle(0, E::UsbPipeReady);
-            owner.handle(2_000, E::TimerFired(Timer::StabilityHold));
+            owner.handle(
+                2_000,
+                E::TimerFired {
+                    timer: OwnerTimer::StabilityHold,
+                },
+            );
             owner.handle(2_010, E::CandidateDialed);
             assert_eq!(owner.handle(2_300, probe), [A::CloseCandidate]);
             assert_eq!(owner.state(), live);
@@ -736,7 +896,12 @@ mod tests {
         to_awaiting_answer(&mut owner, 0);
         assert_eq!(
             owner.handle(2_300, E::HelloRejected),
-            [A::CancelTimer(Timer::HelloAnswer), A::CloseCandidate]
+            [
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
+                A::CloseCandidate
+            ]
         );
         assert_eq!(owner.state(), live);
     }
@@ -746,19 +911,32 @@ mod tests {
         let mut owner = live_on_network();
         to_awaiting_answer(&mut owner, 0);
         // Five seconds with no answer: nothing is closed.
-        assert_eq!(owner.handle(7_200, E::TimerFired(Timer::HelloAnswer)), []);
-        assert!(matches!(owner.state(), State::Switching { .. }));
+        assert_eq!(
+            owner.handle(
+                7_200,
+                E::TimerFired {
+                    timer: OwnerTimer::HelloAnswer
+                }
+            ),
+            []
+        );
+        assert!(matches!(owner.state(), OwnerState::Switching { .. }));
         // A late acceptance still swaps.
         let mut accepted = TransportOwner::new(OwnerPolicy::default());
         accepted.handle(0, E::ConnectRequested);
         accepted.handle(
             0,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         to_awaiting_answer(&mut accepted, 0);
-        accepted.handle(7_200, E::TimerFired(Timer::HelloAnswer));
+        accepted.handle(
+            7_200,
+            E::TimerFired {
+                timer: OwnerTimer::HelloAnswer,
+            },
+        );
         assert!(
             accepted
                 .handle(9_000, E::HelloAccepted)
@@ -770,11 +948,13 @@ mod tests {
         assert_eq!(
             owner.handle(8_100, E::CandidateClosed),
             [
-                A::CancelTimer(Timer::HelloAnswer),
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
                 A::Connect { usb_first: false }
             ]
         );
-        assert_eq!(owner.state(), State::Resuming);
+        assert_eq!(owner.state(), OwnerState::Resuming);
     }
 
     #[test]
@@ -782,32 +962,49 @@ mod tests {
         // Before the probe passed: cancel the candidate and resume.
         let mut owner = live_on_network();
         owner.handle(0, E::UsbPipeReady);
-        owner.handle(2_000, E::TimerFired(Timer::StabilityHold));
+        owner.handle(
+            2_000,
+            E::TimerFired {
+                timer: OwnerTimer::StabilityHold,
+            },
+        );
         owner.handle(2_010, E::CandidateDialed);
         assert_eq!(
             owner.handle(2_100, E::LiveClosed),
             [
-                A::CancelTimer(Timer::StabilityHold),
+                A::CancelTimer {
+                    timer: OwnerTimer::StabilityHold
+                },
                 A::CloseCandidate,
-                A::Report(Status::Resuming),
+                A::Report {
+                    status: OwnerStatus::Resuming
+                },
                 A::Connect { usb_first: false }
             ]
         );
-        assert_eq!(owner.state(), State::Resuming);
+        assert_eq!(owner.state(), OwnerState::Resuming);
         // After it passed: the candidate, hello already sent, carries the
         // resume, and its acceptance makes it live.
         let mut owner = live_on_network();
         to_awaiting_answer(&mut owner, 0);
         assert_eq!(
             owner.handle(2_250, E::LiveClosed),
-            [A::Report(Status::Resuming)]
+            [A::Report {
+                status: OwnerStatus::Resuming
+            }]
         );
         assert_eq!(
             owner.handle(2_300, E::HelloAccepted),
             [
-                A::CancelTimer(Timer::HelloAnswer),
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
                 A::AdoptCandidate,
-                A::Report(Status::Live(Route::Usb))
+                A::Report {
+                    status: OwnerStatus::Live {
+                        route: OwnerRoute::Usb
+                    }
+                }
             ]
         );
     }
@@ -818,18 +1015,25 @@ mod tests {
         owner.handle(0, E::ConnectRequested);
         // The cable appears mid-connect: remembered, not acted on.
         assert_eq!(owner.handle(10, E::UsbPipeReady), []);
-        assert_eq!(owner.state(), State::Connecting);
+        assert_eq!(owner.state(), OwnerState::Connecting);
         // The network won the race: the pipe is still a trigger.
         assert_eq!(
             owner.handle(
                 40,
                 E::Connected {
-                    route: Route::Network
+                    route: OwnerRoute::Network
                 }
             ),
             [
-                A::Report(Status::Live(Route::Network)),
-                A::SetTimer(Timer::StabilityHold, 2_000)
+                A::Report {
+                    status: OwnerStatus::Live {
+                        route: OwnerRoute::Network
+                    }
+                },
+                A::SetTimer {
+                    timer: OwnerTimer::StabilityHold,
+                    after_ms: 2_000
+                }
             ]
         );
         // With a pipe ready before connecting, it is the first route.
@@ -841,8 +1045,17 @@ mod tests {
         );
         // Connected over the cable: no switch follows.
         assert_eq!(
-            owner.handle(40, E::Connected { route: Route::Usb }),
-            [A::Report(Status::Live(Route::Usb))]
+            owner.handle(
+                40,
+                E::Connected {
+                    route: OwnerRoute::Usb
+                }
+            ),
+            [A::Report {
+                status: OwnerStatus::Live {
+                    route: OwnerRoute::Usb
+                }
+            }]
         );
     }
 
@@ -851,22 +1064,32 @@ mod tests {
         let mut owner = owner();
         owner.handle(0, E::UsbPipeReady);
         owner.handle(0, E::ConnectRequested);
-        owner.handle(40, E::Connected { route: Route::Usb });
+        owner.handle(
+            40,
+            E::Connected {
+                route: OwnerRoute::Usb,
+            },
+        );
         // Unplugged: resuming, not disconnected.
         assert_eq!(
             owner.handle(5_000, E::LiveClosed),
-            [A::Report(Status::Resuming), A::Connect { usb_first: false }]
+            [
+                A::Report {
+                    status: OwnerStatus::Resuming
+                },
+                A::Connect { usb_first: false }
+            ]
         );
         owner.handle(
             5_100,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         assert_eq!(
             owner.state(),
-            State::Live {
-                route: Route::Network
+            OwnerState::Live {
+                route: OwnerRoute::Network
             }
         );
 
@@ -874,11 +1097,16 @@ mod tests {
         let mut owner = TransportOwner::new(OwnerPolicy::default());
         owner.handle(0, E::UsbPipeReady);
         owner.handle(0, E::ConnectRequested);
-        owner.handle(40, E::Connected { route: Route::Usb });
+        owner.handle(
+            40,
+            E::Connected {
+                route: OwnerRoute::Usb,
+            },
+        );
         assert_eq!(
             owner.handle(10_000, E::UsbUnhealthy),
             [A::DialCandidate {
-                route: Route::Network
+                route: OwnerRoute::Network
             }]
         );
         // A network candidate needs no probe: the hello goes at once.
@@ -886,15 +1114,24 @@ mod tests {
             owner.handle(10_050, E::CandidateDialed),
             [
                 A::SendHelloOnCandidate,
-                A::SetTimer(Timer::HelloAnswer, 5_000)
+                A::SetTimer {
+                    timer: OwnerTimer::HelloAnswer,
+                    after_ms: 5_000
+                }
             ]
         );
         assert_eq!(
             owner.handle(10_080, E::HelloAccepted),
             [
-                A::CancelTimer(Timer::HelloAnswer),
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
                 A::AdoptCandidate,
-                A::Report(Status::TransportChanged(Route::Network))
+                A::Report {
+                    status: OwnerStatus::TransportChanged {
+                        route: OwnerRoute::Network
+                    }
+                }
             ]
         );
         // A pipe that arrives inside the 10 s hold stays idle.
@@ -902,7 +1139,10 @@ mod tests {
         // After it, the next trigger starts a switch again.
         assert_eq!(
             owner.handle(20_100, E::UsbPipeReady),
-            [A::SetTimer(Timer::StabilityHold, 2_000)]
+            [A::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: 2_000
+            }]
         );
     }
 
@@ -914,7 +1154,7 @@ mod tests {
         owner.handle(
             now,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         // Adopt the cable and lose it, three times within a minute.
@@ -922,10 +1162,18 @@ mod tests {
             now += 1_000;
             assert_eq!(
                 owner.handle(now, E::UsbPipeReady),
-                [A::SetTimer(Timer::StabilityHold, 2_000)],
+                [A::SetTimer {
+                    timer: OwnerTimer::StabilityHold,
+                    after_ms: 2_000
+                }],
                 "round {round}"
             );
-            owner.handle(now + 2_000, E::TimerFired(Timer::StabilityHold));
+            owner.handle(
+                now + 2_000,
+                E::TimerFired {
+                    timer: OwnerTimer::StabilityHold,
+                },
+            );
             owner.handle(now + 2_010, E::CandidateDialed);
             owner.handle(now + 2_200, good_probe());
             owner.handle(now + 2_220, E::HelloAccepted);
@@ -934,7 +1182,7 @@ mod tests {
             owner.handle(
                 now + 100,
                 E::Connected {
-                    route: Route::Network,
+                    route: OwnerRoute::Network,
                 },
             );
         }
@@ -944,7 +1192,10 @@ mod tests {
         // Then it is tried again.
         assert_eq!(
             owner.handle(now + 301_000, E::UsbPipeReady),
-            [A::SetTimer(Timer::StabilityHold, 2_000)]
+            [A::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: 2_000
+            }]
         );
     }
 
@@ -955,32 +1206,42 @@ mod tests {
         assert_eq!(
             owner.handle(2_300, E::Disconnect),
             [
-                A::CancelTimer(Timer::StabilityHold),
-                A::CancelTimer(Timer::HelloAnswer),
+                A::CancelTimer {
+                    timer: OwnerTimer::StabilityHold
+                },
+                A::CancelTimer {
+                    timer: OwnerTimer::HelloAnswer
+                },
                 A::CloseCandidate,
                 A::CloseLive,
-                A::Report(Status::Disconnected)
+                A::Report {
+                    status: OwnerStatus::Disconnected
+                }
             ]
         );
-        assert_eq!(owner.state(), State::Idle);
+        assert_eq!(owner.state(), OwnerState::Idle);
         // Late events from the closed channels and timers are ignored.
         for stray in [
             E::HelloAccepted,
             E::CandidateClosed,
             E::LiveClosed,
-            E::TimerFired(Timer::HelloAnswer),
+            E::TimerFired {
+                timer: OwnerTimer::HelloAnswer,
+            },
             E::CandidateDialed,
             good_probe(),
             E::Disconnect,
         ] {
             assert_eq!(owner.handle(3_000, stray), []);
-            assert_eq!(owner.state(), State::Idle);
+            assert_eq!(owner.state(), OwnerState::Idle);
         }
         // A failed connect ends disconnected; the consumer asks again.
         owner.handle(4_000, E::ConnectRequested);
         assert_eq!(
             owner.handle(9_000, E::ConnectFailed),
-            [A::Report(Status::Disconnected)]
+            [A::Report {
+                status: OwnerStatus::Disconnected
+            }]
         );
     }
 
@@ -991,10 +1252,15 @@ mod tests {
         owner.handle(2_250, E::LiveClosed);
         // The candidate is the only channel, and the host never answers.
         assert_eq!(
-            owner.handle(7_200, E::TimerFired(Timer::HelloAnswer)),
+            owner.handle(
+                7_200,
+                E::TimerFired {
+                    timer: OwnerTimer::HelloAnswer
+                }
+            ),
             [A::CloseCandidate, A::Connect { usb_first: false }]
         );
-        assert_eq!(owner.state(), State::Resuming);
+        assert_eq!(owner.state(), OwnerState::Resuming);
     }
 
     #[test]
@@ -1002,7 +1268,12 @@ mod tests {
         let mut owner = live_on_network();
         assert_eq!(
             owner.handle(1_000, E::LiveClosed),
-            [A::Report(Status::Resuming), A::Connect { usb_first: false }]
+            [
+                A::Report {
+                    status: OwnerStatus::Resuming
+                },
+                A::Connect { usb_first: false }
+            ]
         );
         // Seven failures: a pause that doubles, and no status change.
         let mut now = 1_000;
@@ -1010,21 +1281,31 @@ mod tests {
             now += 100;
             assert_eq!(
                 owner.handle(now, E::ConnectFailed),
-                [A::SetTimer(Timer::ResumeRetry, pause)]
+                [A::SetTimer {
+                    timer: OwnerTimer::ResumeRetry,
+                    after_ms: pause
+                }]
             );
-            assert_eq!(owner.state(), State::Resuming);
+            assert_eq!(owner.state(), OwnerState::Resuming);
             now += pause;
             assert_eq!(
-                owner.handle(now, E::TimerFired(Timer::ResumeRetry)),
+                owner.handle(
+                    now,
+                    E::TimerFired {
+                        timer: OwnerTimer::ResumeRetry
+                    }
+                ),
                 [A::Connect { usb_first: false }]
             );
         }
         // The eighth ends it.
         assert_eq!(
             owner.handle(now + 100, E::ConnectFailed),
-            [A::Report(Status::Disconnected)]
+            [A::Report {
+                status: OwnerStatus::Disconnected
+            }]
         );
-        assert_eq!(owner.state(), State::Idle);
+        assert_eq!(owner.state(), OwnerState::Idle);
 
         // A resume that succeeds starts the count again, and the pause is capped.
         let mut owner = TransportOwner::new(OwnerPolicy {
@@ -1035,7 +1316,7 @@ mod tests {
         owner.handle(
             0,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         owner.handle(10, E::LiveClosed);
@@ -1043,17 +1324,25 @@ mod tests {
         owner.handle(
             30,
             E::Connected {
-                route: Route::Network,
+                route: OwnerRoute::Network,
             },
         );
         owner.handle(40, E::LiveClosed);
         assert_eq!(
             owner.handle(50, E::ConnectFailed),
-            [A::SetTimer(Timer::ResumeRetry, 150)]
+            [A::SetTimer {
+                timer: OwnerTimer::ResumeRetry,
+                after_ms: 150
+            }]
         );
         let mut last = 0;
         for _ in 0..12 {
-            if let [A::SetTimer(Timer::ResumeRetry, pause)] = owner.handle(60, E::ConnectFailed)[..]
+            if let [
+                A::SetTimer {
+                    timer: OwnerTimer::ResumeRetry,
+                    after_ms: pause,
+                },
+            ] = owner.handle(60, E::ConnectFailed)[..]
             {
                 last = pause;
             }
@@ -1063,8 +1352,12 @@ mod tests {
         assert_eq!(
             owner.handle(70, E::Disconnect),
             [
-                A::CancelTimer(Timer::ResumeRetry),
-                A::Report(Status::Disconnected)
+                A::CancelTimer {
+                    timer: OwnerTimer::ResumeRetry
+                },
+                A::Report {
+                    status: OwnerStatus::Disconnected
+                }
             ]
         );
     }
@@ -1083,10 +1376,18 @@ mod tests {
         for round in 0..3 {
             assert_eq!(
                 owner.handle(now, E::UsbPipeReady),
-                [A::SetTimer(Timer::StabilityHold, 2_000)],
+                [A::SetTimer {
+                    timer: OwnerTimer::StabilityHold,
+                    after_ms: 2_000
+                }],
                 "round {round}"
             );
-            owner.handle(now + 2_000, E::TimerFired(Timer::StabilityHold));
+            owner.handle(
+                now + 2_000,
+                E::TimerFired {
+                    timer: OwnerTimer::StabilityHold,
+                },
+            );
             owner.handle(now + 2_010, E::CandidateDialed);
             assert_eq!(owner.handle(now + 2_200, slow), [A::CloseCandidate]);
             // The keeper's next pipe, two seconds later: ignored.
@@ -1098,15 +1399,45 @@ mod tests {
         assert_eq!(owner.handle(now + 280_000, E::UsbPipeReady), []);
         assert_eq!(
             owner.handle(now + 301_000, E::UsbPipeReady),
-            [A::SetTimer(Timer::StabilityHold, 2_000)]
+            [A::SetTimer {
+                timer: OwnerTimer::StabilityHold,
+                after_ms: 2_000
+            }]
         );
         // The session stayed on the network throughout.
         assert!(matches!(
             owner.state(),
-            State::Switching {
-                from: Route::Network,
+            OwnerState::Switching {
+                from: OwnerRoute::Network,
                 ..
             }
         ));
+    }
+    #[test]
+    fn the_shared_owner_is_the_same_machine_behind_a_lock() {
+        let shared = SharedTransportOwner::new(default_owner_policy());
+        assert_eq!(shared.state(), OwnerState::Idle);
+        let actions = shared.handle(0, OwnerEvent::ConnectRequested);
+        assert_eq!(
+            actions,
+            TransportOwner::new(OwnerPolicy::default()).handle(0, OwnerEvent::ConnectRequested)
+        );
+        assert_eq!(shared.state(), OwnerState::Connecting);
+        // From several threads at once: every call sees a whole state.
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let shared = shared.clone();
+                std::thread::spawn(move || {
+                    for now in 0..200 {
+                        shared.handle(now, OwnerEvent::UsbFlapped);
+                        let _ = shared.state();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(shared.state(), OwnerState::Connecting);
     }
 }
