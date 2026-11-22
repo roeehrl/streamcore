@@ -876,7 +876,10 @@ mod tests {
             injector.inject(key_down(0x04), &old),
             Err(InjectError::StaleLease)
         );
+        // The take-over does not wait for the release, so `hold` may return on the former
+        // holder's key-up alone: wait for both sends before reading their order.
         hold(&injector, &new, &calls, 0x05);
+        wait_for("the release and the new key", || keys(&calls).len() >= 3);
         assert_eq!(keys(&calls), [(A, false), (A, true), (B, false)]);
         assert_eq!(
             feedback.recv_timeout(WAIT),
