@@ -202,3 +202,81 @@ async fn ending_a_link_on_a_descriptor_releases_it_without_an_unplug() {
         .await
         .expect("the descriptor was released");
 }
+
+/// Pairing with no network: the host opens a pairing pipe on the accessory
+/// link while its window is open, the device pairs over it with the code,
+/// and the certificates they exchanged then carry a session on a second pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_pairs_over_an_accessory_pipe_and_then_connects() {
+    use streamcore_transport::identity::certificate_fingerprint;
+    use streamcore_transport::pairing_transport::{listen_pairing, pair_with_host_pipe};
+    let host = Arc::new(PeerIdentity::generate().unwrap());
+    let client = Arc::new(PeerIdentity::generate().unwrap());
+    let (host_end, device_end) = cable();
+    let host_link = UsbAccessoryLink::start(host_end, LinkRole::Host, "tablet-1".into());
+    let device_link = UsbAccessoryLink::start(device_end, LinkRole::Device, "host".into());
+
+    // The host's user opened a pairing window; its code is typed on the device.
+    let window = listen_pairing("127.0.0.1:0".into(), host.clone())
+        .await
+        .unwrap();
+    let code = window.display_code().unwrap();
+    let pipe = host_link.open_pipe(UsbService::Pairing).await.unwrap();
+    let admission = window.accept_pipe(pipe).unwrap();
+
+    let accepted = device_link.accept().await.unwrap();
+    assert_eq!(accepted.service, UsbService::Pairing);
+    let pairing = pair_with_host_pipe(
+        accepted.pipe,
+        client.clone(),
+        code,
+        Some(certificate_fingerprint(&host.certificate())),
+        OperationCancellation::new(),
+    );
+    let persisting = async {
+        let pending = window.next_verified().await.unwrap();
+        let certificate = pending.peer_certificate();
+        pending.confirm_persisted().await.unwrap();
+        certificate
+    };
+    let (host_certificate, client_certificate) = tokio::join!(pairing, persisting);
+    let host_certificate = host_certificate.unwrap();
+    assert_eq!(host_certificate, host.certificate());
+    assert_eq!(client_certificate, client.certificate());
+    assert_eq!(admission.outcome().await, PipeOutcome::Accepted);
+
+    // What pairing exchanged is all the session needs.
+    let listener = listen_secure(
+        "127.0.0.1:0".into(),
+        host,
+        vec![client_certificate],
+        options(),
+    )
+    .await
+    .unwrap();
+    let pipe = host_link.open_pipe(UsbService::Session).await.unwrap();
+    listener.accept_pipe(pipe).unwrap();
+    let accepting = listener.clone();
+    let server = tokio::spawn(async move { accepting.accept().await.unwrap() });
+    let accepted = device_link.accept().await.unwrap();
+    let channel = connect_secure_pipe(
+        client,
+        host_certificate,
+        accepted.pipe,
+        options(),
+        OperationCancellation::new(),
+    )
+    .await
+    .unwrap();
+    let server = server.await.unwrap();
+    channel
+        .send(b"paired over the cable".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(server.receive().await.unwrap(), b"paired over the cable");
+
+    // With the window closed, a pairing pipe is refused.
+    window.close_and_wait().await.unwrap();
+    let pipe = host_link.open_pipe(UsbService::Pairing).await.unwrap();
+    assert!(window.accept_pipe(pipe).is_err());
+}

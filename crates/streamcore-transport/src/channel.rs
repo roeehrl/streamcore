@@ -511,6 +511,12 @@ struct ListenerState {
 #[derive(uniffi::Object)]
 pub struct PipeAdmission(Mutex<Option<PipeHandle>>);
 
+impl PipeAdmission {
+    pub(crate) fn new(handle: PipeHandle) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(Some(handle))))
+    }
+}
+
 #[uniffi::export]
 impl PipeAdmission {
     /// Resolves when the pipe was accepted (its channel then arrives through
@@ -576,7 +582,7 @@ impl SecureListener {
     ) -> Result<Arc<PipeAdmission>, ChannelError> {
         let pipe = pipe.take().ok_or(ChannelError::InvalidConfiguration)?;
         let handle = self.accept_stream(pipe)?;
-        Ok(Arc::new(PipeAdmission(Mutex::new(Some(handle)))))
+        Ok(PipeAdmission::new(handle))
     }
 
     pub fn address(&self) -> String {
