@@ -166,18 +166,29 @@ impl WgcCapture {
         self.surfaces.len()
     }
 
+    /// The session's `MinUpdateInterval` (100 ns units) for a stream minimum of `min_ns` on
+    /// `display`: see [`crate::clock::capture_min_interval_ns`].
+    fn session_min_interval(&self, display: u32, min_ns: u64) -> i64 {
+        let refresh = self
+            .outputs
+            .get(display as usize)
+            .and_then(refresh_interval_ns);
+        let ns = crate::clock::capture_min_interval_ns(min_ns, refresh);
+        i64::try_from(ns / 100).unwrap_or(i64::MAX)
+    }
+
     fn start_capture(&self, id: CaptureId) -> Result<(), MediaError> {
         // `Create` needs a DispatcherQueue on this thread: the executor thread has one.
         if DispatcherQueue::GetForCurrentThread().is_err() {
             return Err(MediaError::Unsupported);
         }
-        let (item, size, spec) = {
+        let (item, size, spec, display) = {
             let state = self.lock();
             let cap = state.captures.get(&id).ok_or(MediaError::InvalidSettings)?;
             if cap.running.is_some() {
                 return Err(MediaError::InvalidSettings);
             }
-            (cap.item.clone(), cap.size, cap.spec.clone())
+            (cap.item.clone(), cap.size, cap.spec.clone(), cap.display)
         };
         let device = self
             .gpu
@@ -239,7 +250,7 @@ impl WgcCapture {
         }
         if spec.min_interval_ns > 0
             && let Err(e) = session.SetMinUpdateInterval(TimeSpan {
-                Duration: i64::try_from(spec.min_interval_ns / 100).unwrap_or(i64::MAX),
+                Duration: self.session_min_interval(display, spec.min_interval_ns),
             })
         {
             self.note(format!("MinUpdateInterval refused: {e}"));
@@ -490,7 +501,7 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn update(&self, id: CaptureId, update: CaptureUpdate, op: OpToken) {
-        let (events, session, region) = {
+        let (events, session, region, display) = {
             let state = self.lock();
             let Some(cap) = state.captures.get(&id) else {
                 return;
@@ -499,6 +510,7 @@ impl CaptureBackend for WgcCapture {
                 cap.events.clone(),
                 cap.running.as_ref().map(|r| r.session.clone()),
                 matches!(cap.spec.target, CaptureTarget::Region { .. }),
+                cap.display,
             )
         };
         let mut error = None;
@@ -510,7 +522,7 @@ impl CaptureBackend for WgcCapture {
             if let Some(ns) = update.min_interval_ns
                 && session
                     .SetMinUpdateInterval(TimeSpan {
-                        Duration: i64::try_from(ns / 100).unwrap_or(i64::MAX),
+                        Duration: self.session_min_interval(display, ns),
                     })
                     .is_err()
             {
