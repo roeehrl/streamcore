@@ -145,8 +145,10 @@ impl ByteDuplex for DescriptorDuplex {
     }
 
     /// Later calls fail. A read already blocked in the kernel returns when
-    /// the device next sends or the cable goes: a descriptor of this kind
-    /// cannot be woken from another thread.
+    /// the other end next sends or the cable goes: a descriptor of this kind
+    /// cannot be woken from another thread. An accessory link makes the other
+    /// end send (its parting hello is answered), so there the descriptor is
+    /// released soon after.
     fn shutdown(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
     }

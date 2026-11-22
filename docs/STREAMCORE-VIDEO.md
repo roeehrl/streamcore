@@ -1017,7 +1017,10 @@ service) -> ByteDuplex }` (`service` is `Session` or `Pairing`) and hand each pi
     hellos and discards everything else, whole frames or parts of one; each run of the
     peer is answered once with a hello naming it; and a hello naming this run from a new run of
     the peer ends that peer's pipes here while the link carries on. The host opens nothing before
-    the link is up.
+    the link is up. A link that ends without the cable going sends one last hello under a number
+    of its own: the peer's answer is what a platform read that cannot be woken (a descriptor's)
+    returns with, so the accessory is let go and a new link can start without a replug (three
+    links in a row in one process on a tablet).
   - **Transfers** (measured on a tablet): Android hands an app one transfer per read into a
     16 KiB buffer, so the host sends at most 16 KiB per transfer, followed by a zero-length packet
     when a shorter transfer is a whole number of packets; a read of zero bytes is not the end of
