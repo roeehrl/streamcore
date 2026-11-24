@@ -2,8 +2,17 @@
 
 The Windows backend for `streamcore-video`: Windows.Graphics.Capture on the chosen adapter,
 an `ID3D11VideoProcessor` for BGRA→NV12 scaling and conversion, and a Media Foundation
-hardware H.264 encoder. It compiles only on Windows (`cfg(windows)`). The `bench` feature adds
-the measurement binary driven by `scripts/run-video-windows-bench.sh`.
+hardware H.264 encoder. It compiles only on Windows (`cfg(windows)`), behind two features that
+are both off by default:
+
+| Feature | Builds |
+|---|---|
+| `backends` | The backends a host streams with: `win::capture`, `win::convert`, `win::encoder`, `win::queue`, `win::surfaces`, `win::probe` and the safe wrappers in `win::sys`. No binary, no command line. |
+| `bench` | `backends`, and the measurement pieces: `win::bench`, `win::report`, `win::diag` and the `streamcore-video-windows-bench` binary driven by `scripts/run-video-windows-bench.sh`. |
+
+A host depends on the crate with `features = ["backends"]`. Without either feature only the
+portable modules build (statistics, the trace recorder, H.264 helpers, the adapter policy, the
+bench's command-line parser and report model), which is what the tests on other platforms cover.
 
 ## Backend rules
 

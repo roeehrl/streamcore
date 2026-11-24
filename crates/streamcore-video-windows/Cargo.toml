@@ -5,13 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
-description = "P5: Windows video backends for streamcore-video (WGC capture, D3D11 video-processor convert, Media Foundation hardware H.264) and a per-stage bench. The Windows code builds only with the `bench` feature."
+description = "P5: Windows video backends for streamcore-video (WGC capture, D3D11 video-processor convert, Media Foundation hardware H.264) and a per-stage bench. The Windows code builds with the `backends` feature; `bench` adds the measurement binary."
 
 [features]
 default = []
-# The Windows backends and the bench. Off by default, so default workspace builds are unchanged;
-# off Windows the feature builds only the portable modules.
-bench = ["dep:windows", "dep:streamcore-video", "dep:streamcore-media"]
+# The Windows backends (capture, convert, encoder, the executor thread and the safe wrappers
+# under them), for a host that streams. Off by default, so default workspace builds are
+# unchanged; off Windows the feature builds only the portable modules.
+backends = ["dep:windows", "dep:streamcore-video", "dep:streamcore-media"]
+# The backends and the measurement pieces: the bench, the adapter report, the encoder
+# diagnostics and the bench binary.
+bench = ["backends"]
 
 [dependencies]
 serde.workspace = true

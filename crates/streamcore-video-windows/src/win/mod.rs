@@ -1,19 +1,27 @@
-//! The Windows backends and the bench commands. Only `sys` uses `unsafe`.
+//! The Windows backends (the `backends` feature) and, with the `bench` feature, the bench
+//! commands. Only `sys` uses `unsafe`.
 
+#[cfg(feature = "bench")]
 pub mod bench;
 pub mod capture;
 pub mod convert;
+#[cfg(feature = "bench")]
 pub mod diag;
 pub mod encoder;
 pub mod probe;
 pub mod queue;
+#[cfg(feature = "bench")]
 pub mod report;
 pub mod surfaces;
 pub mod sys;
 
+#[cfg(feature = "bench")]
 use crate::cli::{AdapterSel, Command, Options, Size};
+#[cfg(feature = "bench")]
 use crate::model::AdapterReport;
+#[cfg(feature = "bench")]
 use serde::Serialize;
+#[cfg(feature = "bench")]
 use sys::d3d::{OutputDesc, enumerate_adapters};
 
 pub type Error = String;
@@ -41,6 +49,7 @@ pub fn os_build() -> String {
 }
 
 /// The adapter (LUID) a run uses and the monitor's output: `--adapter`, or the policy's choice.
+#[cfg(feature = "bench")]
 pub fn select(options: &Options, report: &AdapterReport) -> Result<(u64, OutputDesc), Error> {
     let adapters = enumerate_adapters().map_err(err("enumerate adapters"))?;
     let output = adapters
@@ -68,6 +77,7 @@ pub fn select(options: &Options, report: &AdapterReport) -> Result<(u64, OutputD
 }
 
 /// The capture size of an output and the encode size for `size`.
+#[cfg(feature = "bench")]
 pub fn sizes(output: &OutputDesc, size: Size) -> ((u32, u32), (u32, u32)) {
     let capture = (
         (output.desktop[2] - output.desktop[0]).max(2) as u32,
@@ -80,6 +90,7 @@ pub fn sizes(output: &OutputDesc, size: Size) -> ((u32, u32), (u32, u32)) {
     (capture, encode)
 }
 
+#[cfg(feature = "bench")]
 fn write_json<T: Serialize>(path: Option<&str>, value: &T) -> Result<(), Error> {
     let json = serde_json::to_string_pretty(value).map_err(err("serialise"))?;
     match path {
@@ -89,6 +100,7 @@ fn write_json<T: Serialize>(path: Option<&str>, value: &T) -> Result<(), Error> 
 }
 
 /// Runs one command.
+#[cfg(feature = "bench")]
 pub fn run(options: &Options) -> Result<(), Error> {
     // The process MTA: helper threads (encoder create, bounded invalidate) join it.
     let _apartment = sys::com::Apartment::mta().map_err(err("CoInitializeEx"))?;
@@ -150,6 +162,7 @@ pub fn run(options: &Options) -> Result<(), Error> {
 }
 
 /// The timer period as requested and as the first hold applied it.
+#[cfg(feature = "bench")]
 pub(crate) fn timer_report(requested: bool) -> crate::model::TimerReport {
     let status = sys::com::TimerPeriod::status();
     crate::model::TimerReport {
