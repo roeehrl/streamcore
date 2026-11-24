@@ -14,6 +14,14 @@ A host depends on the crate with `features = ["backends"]`. Without either featu
 portable modules build (statistics, the trace recorder, H.264 helpers, the adapter policy, the
 bench's command-line parser and report model), which is what the tests on other platforms cover.
 
+**The encoder's inputs before its first output.** `MfEncoderFactory::new` takes this figure, and
+the stream's permit target follows from it (`win::encoder::plan_permits`). A host reads it with
+`win::probe::inputs_before_first_output(luid, width, height, fps, bitrate)`: one short encoder
+session with a stream's settings that ends at the first output. It starts Media Foundation for
+its own duration and blocks while the encoder starts, so call it on a plain worker thread (not
+the stream's executor, and not a thread in a single-threaded apartment) and before the stream's
+encoder exists. `win::probe::run` is the bench's full probe, which also times the encoder.
+
 ## Backend rules
 
 - **Threading.** Each stream's serial executor is a `DispatcherQueue` thread in a

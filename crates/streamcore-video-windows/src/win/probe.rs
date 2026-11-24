@@ -4,9 +4,9 @@
 //! `ProcessInput` -> `ProcessOutput` with one frame in flight. Runs on its own thread with blocking
 //! waits: it is not a stream executor.
 
-use super::sys::com::{Apartment, now_ns};
+use super::sys::com::{Apartment, MediaFoundation, now_ns};
 use super::sys::d3d::Gpu;
-use super::sys::mf::{Encoder, MfEvent, Params, hardware_h264};
+use super::sys::mf::{Encoder, MfEvent, Params, RATE_CONTROL_VBR, hardware_h264};
 use super::{Error, err, os_build};
 use crate::clock::ns_to_hundred_ns;
 use crate::h264::annexb::{NAL_SPS, find};
@@ -152,12 +152,6 @@ pub fn run(
     peak: Option<f64>,
     gap: Option<Gap>,
 ) -> Result<ProbeReport, Error> {
-    let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
-    let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
-    let candidates = hardware_h264(luid, gpu.vendor_id()).map_err(err("MFTEnum2"))?;
-    if candidates.is_empty() {
-        return Err("no hardware H.264 encoder MFT on this adapter".into());
-    }
     let params = Params {
         width,
         height,
@@ -166,6 +160,56 @@ pub fn run(
         rate_control,
         max_bitrate: peak.map(|k| (bitrate as f64 * k).min(f64::from(u32::MAX)) as u32),
     };
+    probe(luid, params, gap, true)
+}
+
+/// How many inputs the adapter's hardware H.264 encoder takes before its first output, fed one
+/// at a time at this size and rate: the figure [`MfEncoderFactory::new`] takes and a stream's
+/// permit target follows ([`plan_permits`]). `Ok(None)` when the encoder gave no output within
+/// eight inputs.
+///
+/// It is the first step of the bench's probe and nothing more: one encoder session with a
+/// stream's settings (unconstrained VBR), a few generated frames, no timing run. It starts
+/// Media Foundation for its own duration, so it needs nothing set up.
+///
+/// It blocks while the encoder is created and until its first output (at most eight inputs,
+/// 300 ms waited after each), on the calling thread and one helper. The calling thread joins
+/// the multithreaded apartment for the call, so a thread already in a single-threaded
+/// apartment gets an error: call it on a plain worker thread, never on a stream's executor,
+/// and before the stream's own encoder exists (some drivers limit encoder sessions per
+/// process).
+///
+/// [`MfEncoderFactory::new`]: super::encoder::MfEncoderFactory::new
+/// [`plan_permits`]: super::encoder::plan_permits
+pub fn inputs_before_first_output(
+    luid: u64,
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u64,
+) -> Result<Option<u64>, Error> {
+    let _mf = MediaFoundation::start().map_err(err("MFStartup"))?;
+    let params = Params {
+        width,
+        height,
+        fps,
+        bitrate: u32::try_from(bitrate).unwrap_or(u32::MAX),
+        rate_control: RATE_CONTROL_VBR,
+        max_bitrate: None,
+    };
+    Ok(probe(luid, params, None, false)?.min_inputs_before_output)
+}
+
+/// The probe. `timed`: after the first output, also time frames one in flight (and `gap`'s
+/// spaced frames); without it the session ends at the first output.
+fn probe(luid: u64, params: Params, gap: Option<Gap>, timed: bool) -> Result<ProbeReport, Error> {
+    let (width, height, fps) = (params.width, params.height, params.fps);
+    let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
+    let gpu = Gpu::create(Some(luid)).map_err(err("D3D11 device"))?;
+    let candidates = hardware_h264(luid, gpu.vendor_id()).map_err(err("MFTEnum2"))?;
+    if candidates.is_empty() {
+        return Err("no hardware H.264 encoder MFT on this adapter".into());
+    }
     // The first that configures: a directly created candidate may not take NV12 -> H.264.
     let mut failures = Vec::new();
     let encoder = candidates
@@ -209,7 +253,7 @@ pub fn run(
     }
     // One in flight: ProcessInput -> ProcessOutput.
     let mut encode = Vec::new();
-    if report.min_inputs_before_output == Some(1) {
+    if timed && report.min_inputs_before_output == Some(1) {
         for _ in 0..TIMED_FRAMES {
             let Some(h3) = feeder.feed(&rx, &mut report) else {
                 break;

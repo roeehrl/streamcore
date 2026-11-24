@@ -23,8 +23,9 @@
 //! - `win::encoder::MfEncoderFactory`: `EncoderFactory` and `StreamEncoder` over the Media
 //!   Foundation hardware H.264 MFT (`MFTEnum2` per adapter LUID, asynchronous events, low-latency
 //!   attributes), with Annex-B -> AVCC, avcC and the SPS VUI normaliser on the output thread;
-//! - `win::probe::run`: the encoder probe, which reads how many inputs the encoder takes before
-//!   its first output (the figure the encoder factory takes) and times it;
+//! - `win::probe::inputs_before_first_output`: the figure the encoder factory and the permit
+//!   target take, read from a short encoder session (`win::probe::run` is the bench's full
+//!   probe);
 //! - `win::sys`: the safe wrappers the backends are built on (the D3D11 device and adapter
 //!   enumeration, COM apartments, Media Foundation start-up, the timer period).
 //!
