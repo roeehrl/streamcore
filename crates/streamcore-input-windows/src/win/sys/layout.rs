@@ -4,6 +4,7 @@
 use crate::keys::{VK_CAPITAL, VK_SHIFT};
 use crate::layout::{KeyLayout, LayoutHandle, layout_handle};
 use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Globalization::LCIDToLocaleName;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW,
     RegOpenKeyExW,
@@ -141,10 +142,8 @@ fn focus_threads() -> (u32, u32) {
     (foreground_thread, foreground_thread)
 }
 
-/// The layout of the focused window's thread (the foreground window's when no window has the
-/// focus, the calling thread's as a last resort).
-pub fn focused() -> Win32Layout {
-    let (focus, foreground) = focus_threads();
+/// The layout of the first of these threads that has one, the calling thread's as a last resort.
+fn layout_of_threads(focus: u32, foreground: u32) -> Win32Layout {
     // SAFETY: GetKeyboardLayout takes a thread ID (0 for the calling thread) and returns that
     // thread's layout handle, or null for a thread that is gone.
     let layout_of = |thread| unsafe { GetKeyboardLayout(thread) };
@@ -158,6 +157,19 @@ pub fn focused() -> Win32Layout {
         layout = layout_of(0);
     }
     Win32Layout(layout)
+}
+
+/// The layout of the focused window's thread (the foreground window's when no window has the
+/// focus, the calling thread's as a last resort).
+pub fn focused() -> Win32Layout {
+    let (focus, foreground) = focus_threads();
+    layout_of_threads(focus, foreground)
+}
+
+/// As [`focused`], but `None` when no window is in the foreground.
+pub fn focused_window_layout() -> Option<Win32Layout> {
+    let (focus, foreground) = focus_threads();
+    (foreground != 0).then(|| layout_of_threads(focus, foreground))
 }
 
 /// Caps Lock as the focused window sees it. `GetKeyState` answers for the calling thread's input
@@ -185,7 +197,8 @@ pub fn focused_caps_lock() -> bool {
 pub struct Win32Layout(HKL);
 
 impl Win32Layout {
-    fn translated(&self, vk: u16, scan: u16, state: &[u8; 256]) -> Option<String> {
+    /// `ToUnicodeEx` with a key state: what it returned and what it wrote.
+    fn to_unicode(&self, vk: u16, scan: u16, state: &[u8; 256]) -> (i32, [u16; 8]) {
         let mut buffer = [0u16; 8];
         // SAFETY: `state` is the 256-byte key state the call reads and `buffer` the slice it
         // writes at most its length into. The flag keeps it from changing any keyboard state.
@@ -199,9 +212,50 @@ impl Win32Layout {
                 Some(self.0),
             )
         };
+        (written, buffer)
+    }
+
+    fn translated(&self, vk: u16, scan: u16, state: &[u8; 256]) -> Option<String> {
+        let (written, buffer) = self.to_unicode(vk, scan, state);
         // 0: the key types nothing. Negative: a dead key, which is not usable as a character.
         let length = usize::try_from(written).ok().filter(|n| *n > 0)?;
         String::from_utf16(buffer.get(..length)?).ok()
+    }
+
+    /// The handle's value, for telling one loaded layout from another.
+    pub fn handle(&self) -> usize {
+        self.0.0 as usize
+    }
+
+    /// The layout's identifier (its KLID, "0000040C"). A variant layout's is found by its
+    /// Layout Id in the registry; without an entry there, its language's default layout stands
+    /// in.
+    pub fn klid(&self) -> String {
+        match layout_handle(self.handle() as u32) {
+            LayoutHandle::Id(klid) => klid,
+            LayoutHandle::Variant {
+                layout_id,
+                fallback,
+            } => registered_layouts()
+                .into_iter()
+                .find(|klid| {
+                    layout_value(klid, "Layout Id")
+                        .is_some_and(|id| id.eq_ignore_ascii_case(&layout_id))
+                })
+                .map_or(fallback, |klid| klid.to_uppercase()),
+        }
+    }
+
+    /// The tag of the layout's input language ("fr-FR"): the language half of the handle, named
+    /// by `LCIDToLocaleName`. `None` for a language Windows has no name for.
+    pub fn language_tag(&self) -> Option<String> {
+        let language = self.handle() as u32 & 0xFFFF;
+        let mut buffer = [0u16; 85];
+        // SAFETY: a locale identifier (a language with the default sort order) and the slice
+        // the call writes a NUL-terminated name into; it returns 0 for an unknown one.
+        let written = unsafe { LCIDToLocaleName(language, Some(&mut buffer), 0) };
+        let name = until_nul(&buffer);
+        (written > 0 && !name.is_empty()).then_some(name)
     }
 }
 
@@ -235,22 +289,21 @@ impl KeyLayout for Win32Layout {
         self.translated(vk, scan, &state)
     }
 
+    fn dead_key(&self, vk: u16, scan: u16, shift: bool) -> Option<String> {
+        let mut state = [0u8; 256];
+        if shift {
+            state[usize::from(VK_SHIFT)] = 0x80;
+        }
+        let (written, buffer) = self.to_unicode(vk, scan, &state);
+        // Negative: a dead key, and the buffer holds its accent as a character of its own.
+        let accent = char::from_u32(u32::from(buffer[0])).filter(|c| *c != '\0')?;
+        (written < 0).then(|| accent.to_string())
+    }
+
     /// The layout's name as Windows shows it, or its identifier ("0000040C") when the registry
     /// has no name for it.
     fn name(&self) -> String {
-        let klid = match layout_handle(self.0.0 as usize as u32) {
-            LayoutHandle::Id(klid) => klid,
-            LayoutHandle::Variant {
-                layout_id,
-                fallback,
-            } => registered_layouts()
-                .into_iter()
-                .find(|klid| {
-                    layout_value(klid, "Layout Id")
-                        .is_some_and(|id| id.eq_ignore_ascii_case(&layout_id))
-                })
-                .map_or(fallback, |klid| klid.to_uppercase()),
-        };
+        let klid = self.klid();
         display_name(&klid).unwrap_or(klid)
     }
 }

@@ -4,6 +4,7 @@
 //! behind safe functions and types; every `unsafe` block states why the call is sound.
 #![allow(unsafe_code)]
 
+pub mod desktop;
 pub mod input;
 pub mod layout;
 pub mod pointer;

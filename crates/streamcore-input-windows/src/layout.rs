@@ -26,6 +26,12 @@ pub trait KeyLayout {
     /// `ToUnicodeEx`: what the key types with Shift up or down and Caps Lock off or on; `None`
     /// for a dead key or a key that types nothing.
     fn translate(&self, vk: u16, scan: u16, shift: bool, caps_lock: bool) -> Option<String>;
+    /// For a dead key (one that types nothing until the next key), the accent it starts, with
+    /// Shift up or down; `None` for every other key. Only a description of the layout asks; a
+    /// layout that cannot tell answers `None`.
+    fn dead_key(&self, _vk: u16, _scan: u16, _shift: bool) -> Option<String> {
+        None
+    }
     /// The layout's name, for telling the user a key is not on it.
     fn name(&self) -> String;
 }
