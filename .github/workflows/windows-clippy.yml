@@ -33,3 +33,9 @@ jobs:
           cargo clippy --locked --all-targets --all-features
           -p streamcore-video -p streamcore-video-windows -p streamcore-input-windows
           -- -D warnings
+      - name: Clippy (streamcore-video-windows, the backends without the bench)
+        shell: bash
+        run: >
+          cargo clippy --locked --all-targets --features backends
+          -p streamcore-video-windows
+          -- -D warnings
