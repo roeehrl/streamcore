@@ -188,6 +188,9 @@ pub fn inputs_before_first_output(
     fps: u32,
     bitrate: u64,
 ) -> Result<Option<u64>, Error> {
+    // As `win::run`: COM first, Media Foundation inside it, and so shut down before COM is
+    // left. The probe joins the same apartment again on this thread, which only counts.
+    let _apartment = Apartment::mta().map_err(err("CoInitializeEx"))?;
     let _mf = MediaFoundation::start().map_err(err("MFStartup"))?;
     let params = Params {
         width,
