@@ -17,7 +17,8 @@
 //!   that pumps a `DispatcherQueue`, so the WGC frame pool created on it fires `FrameArrived` on
 //!   the executor (3.5, 4.2);
 //! - `win::capture::WgcCapture`: `CaptureBackend` over Windows Graphics Capture on the encoder's
-//!   adapter;
+//!   adapter, for a display, a region of one, or one window (`CaptureTarget::Window`, named by
+//!   the native window id of [`window`]);
 //! - `win::convert::VpConverter`: `Converter`, BGRA -> NV12 at the target size with
 //!   `ID3D11VideoProcessor`, fenced with an `ID3D11Fence`;
 //! - `win::encoder::MfEncoderFactory`: `EncoderFactory` and `StreamEncoder` over the Media
@@ -33,8 +34,9 @@
 //! `encoders`, `bench`) and what it runs.
 //!
 //! The portable modules (statistics, the trace recorder, slot ids, the MFT bookkeeping, H.264
-//! helpers, the converter's crop maths, the power-throttling masks, the frame-counter barcode, the
-//! adapter policy and the report model) build and are tested on every platform.
+//! helpers, the converter's crop maths, window capture's id and size rules, the power-throttling
+//! masks, the frame-counter barcode, the adapter policy and the report model) build and are
+//! tested on every platform.
 
 pub mod barcode;
 pub mod cli;
@@ -47,6 +49,7 @@ pub mod policy;
 pub mod slots;
 pub mod stats;
 pub mod trace;
+pub mod window;
 
 #[cfg(all(windows, feature = "backends"))]
 pub mod win;

@@ -8,8 +8,13 @@ use std::path::PathBuf;
 
 use crate::desktop::WindowId;
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM, POINT, RECT,
+};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK,
     WTSActive, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
@@ -23,10 +28,15 @@ use windows::Win32::System::Threading::{
     GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow,
-    GetShellWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId, InternalGetWindowText,
-    IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+    EnumWindows, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetClientRect,
+    GetForegroundWindow, GetShellWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId,
+    InternalGetWindowText, IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow,
+    ShowWindowAsync,
 };
 use windows::core::{BOOL, PWSTR, w};
 
@@ -155,6 +165,69 @@ pub fn is_cloaked(window: WindowId) -> bool {
         )
     };
     read.is_ok() && cloaked != 0
+}
+
+/// The window's rectangle as DWM draws it (`DWMWA_EXTENDED_FRAME_BOUNDS`), as
+/// `[left, top, right, bottom]` in physical desktop pixels whatever the caller's DPI awareness.
+/// `None` for a window that is gone or that DWM does not compose.
+pub fn frame_bounds(window: WindowId) -> Option<[i32; 4]> {
+    let mut rect = RECT::default();
+    // SAFETY: DWMWA_EXTENDED_FRAME_BOUNDS writes one RECT, and `rect` is a live RECT of the
+    // size given.
+    unsafe {
+        DwmGetWindowAttribute(
+            handle(window),
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut rect).cast(),
+            size_of::<RECT>() as u32,
+        )
+    }
+    .ok()?;
+    Some([rect.left, rect.top, rect.right, rect.bottom])
+}
+
+/// The window's client area as `[left, top, right, bottom]` in physical desktop pixels: read
+/// under a per-monitor-aware thread context, which is put back before returning. `None` for a
+/// window that is gone.
+///
+/// The context asked for is per-monitor v2, which Windows has from 10 1703; an older one
+/// refuses it (the call returns null and changes nothing) and is asked for per-monitor v1
+/// instead. If that is refused too the thread's context stays as it is, and the rectangle is in
+/// whatever units the calling thread already uses.
+pub fn client_bounds(window: WindowId) -> Option<[i32; 4]> {
+    let mut before = DPI_AWARENESS_CONTEXT::default();
+    for context in [
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    ] {
+        // SAFETY: changes only the calling thread's DPI awareness context and returns the one
+        // it had (null when the context asked for is refused, and then nothing changed); a
+        // context that was replaced is restored below on every path.
+        before = unsafe { SetThreadDpiAwarenessContext(context) };
+        if !before.is_invalid() {
+            break;
+        }
+    }
+    let mut rect = RECT::default();
+    let mut origin = POINT::default();
+    // SAFETY: `rect` is a live RECT the call writes; it fails for a handle that names no
+    // window.
+    let read = unsafe { GetClientRect(handle(window), &mut rect) }.is_ok()
+        // SAFETY: `origin` is a live POINT the call reads and writes; it returns false for a
+        // handle that names no window.
+        && unsafe { ClientToScreen(handle(window), &mut origin) }.as_bool();
+    if !before.is_invalid() {
+        // SAFETY: restores the context this thread had before this function changed it.
+        unsafe { SetThreadDpiAwarenessContext(before) };
+    }
+    read.then(|| {
+        [
+            origin.x,
+            origin.y,
+            origin.x.saturating_add(rect.right),
+            origin.y.saturating_add(rect.bottom),
+        ]
+    })
 }
 
 /// The window's extended style (`GWL_EXSTYLE`); 0 for a window that is gone.

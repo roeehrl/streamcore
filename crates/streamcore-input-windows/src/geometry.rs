@@ -34,6 +34,27 @@ impl TargetRect {
         }
     }
 
+    /// The rectangle between two corners, as Windows reports one (`left`, `top`, and `right`,
+    /// `bottom` one past its last pixel). Edges the wrong way round give no width or height.
+    pub fn from_edges(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        let span = |from: i32, to: i32| {
+            i32::try_from((i64::from(to) - i64::from(from)).max(0)).unwrap_or(i32::MAX)
+        };
+        Self::new(left, top, span(left, right), span(top, bottom))
+    }
+
+    /// The part of this rectangle that lies inside `other`; no width or height where they do
+    /// not meet.
+    pub fn clipped_to(&self, other: &TargetRect) -> Self {
+        let far = |origin: i32, size: i32| i64::from(origin) + i64::from(size.max(0));
+        let left = self.x.max(other.x);
+        let top = self.y.max(other.y);
+        let right = far(self.x, self.width).min(far(other.x, other.width));
+        let bottom = far(self.y, self.height).min(far(other.y, other.height));
+        let span = |from: i32, to: i64| i32::try_from((to - i64::from(from)).max(0)).unwrap_or(0);
+        Self::new(left, top, span(left, right), span(top, bottom))
+    }
+
     /// Whether the rectangle has any pixels.
     pub fn is_valid(&self) -> bool {
         self.width > 0 && self.height > 0
@@ -169,6 +190,47 @@ pub fn key_repeat_timing(delay_setting: u32, speed_setting: u32) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rectangles_from_edges() {
+        assert_eq!(
+            TargetRect::from_edges(-1920, 100, 0, 1180),
+            TargetRect::new(-1920, 100, 1920, 1080)
+        );
+        // Edges the wrong way round, and a minimized window's far-away corner, have no pixels.
+        assert!(!TargetRect::from_edges(10, 10, 0, 0).is_valid());
+        assert_eq!(
+            TargetRect::from_edges(-32000, -32000, -31840, -31972),
+            TargetRect::new(-32000, -32000, 160, 28)
+        );
+        assert_eq!(
+            TargetRect::from_edges(i32::MIN, 0, i32::MAX, 1).width,
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn clipping_keeps_what_is_inside() {
+        let frame = TargetRect::new(100, 50, 800, 600);
+        // A client area inside the frame is unchanged.
+        let client = TargetRect::new(101, 81, 798, 568);
+        assert_eq!(client.clipped_to(&frame), client);
+        // One that reaches past it (a window that draws its own frame) is cut to it.
+        assert_eq!(TargetRect::new(92, 50, 816, 608).clipped_to(&frame), frame);
+        assert_eq!(
+            TargetRect::new(700, 500, 400, 400).clipped_to(&frame),
+            TargetRect::new(700, 500, 200, 150)
+        );
+        // Apart: nothing left.
+        assert!(
+            !TargetRect::new(2000, 2000, 10, 10)
+                .clipped_to(&frame)
+                .is_valid()
+        );
+        assert!(!TargetRect::new(0, 0, -5, 10).clipped_to(&frame).is_valid());
+        let huge = TargetRect::new(i32::MAX - 1, 0, i32::MAX, 10);
+        assert_eq!(huge.clipped_to(&huge), huge);
+    }
 
     #[test]
     fn normalized_points_map_into_the_target() {

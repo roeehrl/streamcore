@@ -16,6 +16,10 @@ options:
   --mode synthetic|desktop   bench source: a synthetic window over the whole monitor that draws a
                              frame-counter barcode and flips colour (default), or the desktop as is
   --pace composition|MS      synthetic: a new counter on every DWM composition (default) or every MS ms
+  --window TITLE             bench: capture one window instead of a monitor, as it is: the front-most
+                             shown window whose title contains TITLE (case ignored). --mode and
+                             --monitor are then not used; WGC delivers a frame when the window changes.
+                             A minimized window needs --size
   --monitor N                output index from `report` (default 0)
   --adapter auto|N|LUID      encoder/capture adapter: the policy's choice (default), an index, or a LUID
   --fps N                    target frame rate (default 60)
@@ -86,6 +90,8 @@ pub struct Options {
     pub mode: Mode,
     pub pace: Pace,
     pub monitor: u32,
+    /// `--window`: capture the window whose title contains this.
+    pub window: Option<String>,
     pub adapter: AdapterSel,
     pub fps: u32,
     pub seconds: f64,
@@ -123,6 +129,7 @@ impl Options {
             mode: Mode::Synthetic,
             pace: Pace::Composition,
             monitor: 0,
+            window: None,
             adapter: AdapterSel::Auto,
             fps: 60,
             seconds: 30.0,
@@ -197,6 +204,13 @@ pub fn parse(args: Vec<String>) -> Result<Options, String> {
                 }
             }
             "--monitor" => o.monitor = num(&flag, it.next())?,
+            "--window" => {
+                let title = it.next().ok_or("--window needs a title")?;
+                if title.trim().is_empty() {
+                    return Err("--window needs a title".into());
+                }
+                o.window = Some(title);
+            }
             "--adapter" => {
                 let v = it.next().ok_or("--adapter needs a value")?;
                 o.adapter = if v == "auto" {
@@ -387,10 +401,32 @@ mod tests {
             "bench --pace 0",
             "bench --mode nope",
             "bench --seconds",
+            "bench --window",
             "bench --bogus",
         ] {
             assert!(parse(args(bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn window() {
+        assert_eq!(parse(args("bench")).unwrap().window, None);
+        assert_eq!(
+            parse(args("bench --window Notepad --seconds 5"))
+                .unwrap()
+                .window
+                .as_deref(),
+            Some("Notepad")
+        );
+        // One argument, spaces and all, is the title.
+        let o = parse(vec![
+            "bench".into(),
+            "--window".into(),
+            "Untitled - Notepad".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.window.as_deref(), Some("Untitled - Notepad"));
+        assert!(parse(vec!["bench".into(), "--window".into(), " ".into()]).is_err());
     }
 
     #[test]

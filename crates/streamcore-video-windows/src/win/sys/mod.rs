@@ -7,6 +7,7 @@
 
 pub mod com;
 pub mod d3d;
+pub mod hwnd;
 pub mod mf;
 pub mod mfdiag;
 pub mod reg;
