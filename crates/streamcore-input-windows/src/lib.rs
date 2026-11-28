@@ -36,10 +36,16 @@
 //! [`Capabilities`] (whether a pen and a touch device exist) is read once, when the injector
 //! starts.
 //!
+//! **Desktop state.** [`desktop`] reads what a host reports beside the stream and acts on: the
+//! focused window's keyboard layout, the foreground app, the windows a switcher would list,
+//! bringing one to the foreground, whether the desktop can take input now, and the Windows
+//! version. Those functions inject nothing and need no lease.
+//!
 //! The rules (key tables, layout mapping, pacing, the pen and touch sessions, the lease,
 //! coordinate mapping and what is held) are portable and tested on every platform, behind the
 //! [`Backend`] trait. The Win32 calls are in `win`, built on Windows only.
 
+pub mod desktop;
 pub mod geometry;
 pub mod keys;
 pub mod layout;
@@ -57,6 +63,7 @@ mod queue;
 #[cfg(windows)]
 mod win;
 
+pub use desktop::{AppWindow, ForegroundApp, LayoutFamily, LayoutId, SessionState, WindowId};
 pub use engine::{Backend, SendOp};
 pub use event::{
     ClickEvent, Feedback, FeedbackSink, InjectError, InputEvent, PanDragEvent, PenEvent,

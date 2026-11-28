@@ -2,8 +2,25 @@
 
 The Windows backend for `streamcore-video`: Windows.Graphics.Capture on the chosen adapter,
 an `ID3D11VideoProcessor` for BGRA→NV12 scaling and conversion, and a Media Foundation
-hardware H.264 encoder. It compiles only on Windows (`cfg(windows)`). The `bench` feature adds
-the measurement binary driven by `scripts/run-video-windows-bench.sh`.
+hardware H.264 encoder. It compiles only on Windows (`cfg(windows)`), behind two features that
+are both off by default:
+
+| Feature | Builds |
+|---|---|
+| `backends` | The backends a host streams with: `win::capture`, `win::convert`, `win::encoder`, `win::queue`, `win::surfaces`, `win::probe` and the safe wrappers in `win::sys`. No binary, no command line. |
+| `bench` | `backends`, and the measurement pieces: `win::bench`, `win::report`, `win::diag` and the `streamcore-video-windows-bench` binary driven by `scripts/run-video-windows-bench.sh`. |
+
+A host depends on the crate with `features = ["backends"]`. Without either feature only the
+portable modules build (statistics, the trace recorder, H.264 helpers, the adapter policy, the
+bench's command-line parser and report model), which is what the tests on other platforms cover.
+
+**The encoder's inputs before its first output.** `MfEncoderFactory::new` takes this figure, and
+the stream's permit target follows from it (`win::encoder::plan_permits`). A host reads it with
+`win::probe::inputs_before_first_output(luid, width, height, fps, bitrate)`: one short encoder
+session with a stream's settings that ends at the first output. It starts Media Foundation for
+its own duration and blocks while the encoder starts, so call it on a plain worker thread (not
+the stream's executor, and not a thread in a single-threaded apartment) and before the stream's
+encoder exists. `win::probe::run` is the bench's full probe, which also times the encoder.
 
 ## Backend rules
 

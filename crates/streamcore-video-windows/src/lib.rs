@@ -3,7 +3,15 @@
 //! and a bench that drives it through a real [`streamcore_video::StreamController`] and reports
 //! per-stage timings (9.2) on the QPC clock.
 //!
-//! With the `bench` feature on Windows, `win` provides:
+//! Two features, both off by default, both for Windows (elsewhere they build only the portable
+//! modules):
+//!
+//! - `backends`: the backends below, for a host that streams. No bench binary, no command
+//!   line, no adapter report.
+//! - `bench`: `backends` and the measurement pieces (`win::bench`, `win::report`, `win::diag`
+//!   and the `streamcore-video-windows-bench` binary).
+//!
+//! With `backends` on Windows, `win` provides:
 //!
 //! - `win::queue::ExecutorThread`: the stream's `SerialQueue`, one thread (STA, MMCSS "Capture")
 //!   that pumps a `DispatcherQueue`, so the WGC frame pool created on it fires `FrameArrived` on
@@ -15,7 +23,14 @@
 //! - `win::encoder::MfEncoderFactory`: `EncoderFactory` and `StreamEncoder` over the Media
 //!   Foundation hardware H.264 MFT (`MFTEnum2` per adapter LUID, asynchronous events, low-latency
 //!   attributes), with Annex-B -> AVCC, avcC and the SPS VUI normaliser on the output thread;
-//! - the bench binary `streamcore-video-windows-bench` (`report`, `probe`, `bench`).
+//! - `win::probe::inputs_before_first_output`: the figure the encoder factory and the permit
+//!   target take, read from a short encoder session (`win::probe::run` is the bench's full
+//!   probe);
+//! - `win::sys`: the safe wrappers the backends are built on (the D3D11 device and adapter
+//!   enumeration, COM apartments, Media Foundation start-up, the timer period).
+//!
+//! With `bench`, also the bench binary `streamcore-video-windows-bench` (`report`, `probe`,
+//! `encoders`, `bench`) and what it runs.
 //!
 //! The portable modules (statistics, the trace recorder, slot ids, the MFT bookkeeping, H.264
 //! helpers, the converter's crop maths, the power-throttling masks, the frame-counter barcode, the
@@ -33,5 +48,5 @@ pub mod slots;
 pub mod stats;
 pub mod trace;
 
-#[cfg(all(windows, feature = "bench"))]
+#[cfg(all(windows, feature = "backends"))]
 pub mod win;

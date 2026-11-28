@@ -2,7 +2,7 @@
 //! pen and touch, and the focused window's keyboard layout. Safe code; the calls themselves are
 //! in `sys`.
 
-mod sys;
+pub(crate) mod sys;
 
 use crate::engine::{Backend, SendOp};
 use crate::geometry::VirtualScreen;
