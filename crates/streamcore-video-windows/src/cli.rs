@@ -18,7 +18,8 @@ options:
   --pace composition|MS      synthetic: a new counter on every DWM composition (default) or every MS ms
   --window TITLE             bench: capture one window instead of a monitor, as it is: the front-most
                              shown window whose title contains TITLE (case ignored). --mode and
-                             --monitor are then not used; WGC delivers a frame when the window changes
+                             --monitor are then not used; WGC delivers a frame when the window changes.
+                             A minimized window needs --size
   --monitor N                output index from `report` (default 0)
   --adapter auto|N|LUID      encoder/capture adapter: the policy's choice (default), an index, or a LUID
   --fps N                    target frame rate (default 60)

@@ -8,7 +8,8 @@
 //! the desktop as it is (WGC delivers a frame only when something changes). `--window TITLE`
 //! captures one window as it is, through `CaptureTarget::Window`: its notes say which window,
 //! its frame bounds beside the capture item's size, every layout the capture reported when the
-//! window changed size, and a closed window ends the run with `source gone: Closed`.
+//! window changed size, how many frames were delivered while a size settled or dropped while
+//! the window was minimized, and a closed window ends the run with `source gone: Closed`.
 
 use super::capture::{SDR_DESKTOP, WgcCapture};
 use super::convert::{Strip, VpConverter};
@@ -101,13 +102,18 @@ fn window_place(window: &Window) -> String {
 /// A capture size and an encode size, each width by height.
 type Sizes = ((u32, u32), (u32, u32));
 
-/// The capture size of a window (its frame bounds) and the encode size for `size`.
+/// The capture size of a window (its frame bounds) and the encode size for `size`. A minimized
+/// window has no size to read: the run then needs `--size`, starts with no picture, and shows
+/// what the capture does when the window is restored.
 fn window_sizes(window: &Window, size: Size) -> Result<Sizes, Error> {
     if hwnd::is_minimized(window.handle) {
-        return Err(format!(
-            "window {:?} is minimized: restore it first",
-            window.title
-        ));
+        return match size {
+            Size::Fixed(w, h) => Ok(((w, h), (w, h))),
+            Size::Native => Err(format!(
+                "window {:?} is minimized: restore it, or give --size WxH to start on it as it is",
+                window.title
+            )),
+        };
     }
     let capture = hwnd::frame_bounds(window.handle)
         .map(rect_size)
@@ -382,6 +388,21 @@ pub fn run(
     notes.extend(capture.notes());
     if let Some(w) = window {
         notes.push(format!("window at the end: {}", window_place(w)));
+        let c = capture.size_counts();
+        notes.push(format!(
+            "window sizes: pool resized {} times, {} frames delivered while a size settled, {} \
+             dropped while minimized, {} dropped before the first size, next frame after the \
+             last resize: {}",
+            c.pool_resizes,
+            c.frames_while_settling,
+            c.frames_minimized,
+            c.frames_unsized,
+            match c.frame_after_resize_ns {
+                Some(ns) => format!("{:.1} ms", ns as f64 / 1e6),
+                None if c.pool_resizes == 0 => "no resize".into(),
+                None => "none arrived".into(),
+            }
+        ));
     }
     if converter.copied_inputs() > 0 {
         notes.push(format!(
