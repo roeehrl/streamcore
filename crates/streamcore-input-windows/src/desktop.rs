@@ -452,33 +452,39 @@ pub fn running_apps() -> Vec<AppWindow> {
 
 /// Asks Windows to bring a window to the foreground. Returns whether Windows agreed.
 ///
-/// **What it does.** If the window still exists and is visible: `ShowWindowAsync(SW_RESTORE)`
-/// when it is minimized (posted, so a window that has stopped responding cannot stall the call),
-/// then `SetForegroundWindow`. Nothing else. It attaches no thread's input to another's, presses
-/// no key, moves no pointer and changes no system setting, so it needs no
-/// [`InputLease`](crate::InputLease) and cannot leave anything held.
+/// **What it does.** If the window still exists and is visible: `SetForegroundWindow`; and
+/// only if Windows agreed and the window is minimized, `ShowWindowAsync(SW_RESTORE)` (posted, so
+/// a window that has stopped responding cannot stall the call). Nothing else. It attaches no
+/// thread's input to another's, presses no key, moves no pointer and changes no system setting,
+/// so it needs no [`InputLease`](crate::InputLease) and cannot leave anything held.
+///
+/// The order is deliberate. A refusal leaves every window as it was: a minimized window is not
+/// restored behind whatever is in front. Windows does not restore a minimized window when it
+/// makes it the foreground window, which is why the restore follows.
 ///
 /// **Its limit.** Windows lets a process set the foreground window only in some cases: it is
 /// the foreground process itself, the foreground process started it, it received the last input
 /// event, no window is in the foreground, or the foreground process allowed it
 /// (`AllowSetForegroundWindow`). A host running in the background is usually none of these. Then
-/// Windows flashes the window's taskbar button instead and this returns false, having changed
-/// nothing else. Windows also makes the same exception after an Alt key press, which is why
-/// hosts send [`MASKED_ALT_TAP`](crate::keys::MASKED_ALT_TAP) first; that is injected input and
-/// belongs to whoever holds the lease, so this function does not do it.
+/// Windows flashes the window's taskbar button instead and this returns false; the flash is the
+/// only thing that happened. Windows also makes the same exception after an Alt key press,
+/// which is why hosts send [`MASKED_ALT_TAP`](crate::keys::MASKED_ALT_TAP) first; that is
+/// injected input and belongs to whoever holds the lease, so this function does not do it.
 ///
 /// A true return means Windows accepted the request; the change of foreground follows at once
-/// but is the target's to complete. Read [`foreground_app`] to confirm it. False also for a
-/// window that has closed, is hidden, or belongs to another desktop.
+/// but is the target's to complete, and a minimized window's restore is posted, not awaited.
+/// Read [`foreground_app`] to confirm it. False also for a window that has closed, is hidden,
+/// or belongs to another desktop.
 #[cfg(windows)]
 pub fn activate(window: WindowId) -> bool {
     if !sys::desktop::is_window(window) || !sys::desktop::is_visible(window) {
         return false;
     }
-    if sys::desktop::is_minimized(window) {
+    let agreed = sys::desktop::set_foreground(window);
+    if agreed && sys::desktop::is_minimized(window) {
         sys::desktop::restore(window);
     }
-    sys::desktop::set_foreground(window)
+    agreed
 }
 
 /// Whether the interactive desktop can take input now. A poll, by documented calls only:

@@ -215,7 +215,7 @@ pub fn top_level_windows() -> Vec<WindowId> {
 }
 
 /// Posts a restore to a minimized window (`ShowWindowAsync`, so the caller never waits for the
-/// window's thread).
+/// window's thread). `SW_RESTORE` also activates the window.
 pub fn restore(window: WindowId) {
     // SAFETY: posts a show command to a window handle; nothing happens for one that names none.
     let _ = unsafe { ShowWindowAsync(handle(window), SW_RESTORE) };
