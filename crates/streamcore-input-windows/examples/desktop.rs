@@ -114,6 +114,19 @@ mod show {
                 app.title,
                 app.window
             ));
+            // Where it is, and the number a capture backend would name it by.
+            match desktop::window_bounds(app.window) {
+                Some(bounds) => out.line(&format!(
+                    "     native id {:#x}, frame {:?}, client {:?}",
+                    app.window.native_id(),
+                    bounds.frame,
+                    bounds.client
+                )),
+                None => out.line(&format!(
+                    "     native id {:#x}, no bounds",
+                    app.window.native_id()
+                )),
+            }
         }
     }
 

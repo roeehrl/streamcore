@@ -1,6 +1,7 @@
 //! The state of the Windows desktop a stream host reports and acts on: the focused window's
 //! keyboard layout, the foreground app, the windows a switcher would list, bringing one of them
-//! to the foreground, whether the desktop can take input now, and the Windows version.
+//! to the foreground, where a window is on the desktop, whether the desktop can take input now,
+//! and the Windows version.
 //!
 //! Every function here is safe to call from any thread and injects nothing: none of them needs
 //! the [`InputLease`](crate::InputLease). They are polls. Nothing here registers for a
@@ -13,8 +14,8 @@
 //!
 //! **A process with no interactive desktop** (a service, or a shell reached over SSH) has no
 //! foreground window and sees no application windows: [`focused_layout`], [`focused_layout_id`]
-//! and [`foreground_app`] return `None`, [`running_apps`] is empty, [`activate`] returns false
-//! and [`session_state`] is [`SessionState::Detached`].
+//! and [`foreground_app`] return `None`, [`running_apps`] is empty, [`activate`] returns false,
+//! [`window_bounds`] finds no window and [`session_state`] is [`SessionState::Detached`].
 //!
 //! **Not here.** App icons (a host that wants them reads them from the executable at
 //! [`AppWindow::exe_path`]); change notifications; whether the display is off or asleep (see
@@ -26,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use streamcore_input::LayoutInfoMessage;
 
+use crate::geometry::TargetRect;
 use crate::keys;
 use crate::layout::KeyLayout;
 
@@ -41,6 +43,31 @@ use crate::win::sys;
 /// list rather than keep ids for long.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowId(pub(crate) isize);
+
+impl WindowId {
+    /// The window as the number a capture backend names a window by (the `window_id` of a
+    /// window capture target, in `streamcore-video`'s `CaptureTarget::Window`), so a host can
+    /// capture a window it found with [`running_apps`] or [`foreground_app`].
+    ///
+    /// It is the window's handle value, sign-extended to 64 bits, and is exactly as short-lived
+    /// as the `WindowId`: it names the window on this computer, in this run of the desktop
+    /// session, until the window closes. Never store it or send it to another computer as a
+    /// name for the window.
+    pub fn native_id(self) -> u64 {
+        self.0 as i64 as u64
+    }
+
+    /// The window a native id names: the inverse of [`native_id`](Self::native_id), for an id
+    /// that came from one (or from a capture backend's list of windows). `None` for 0, which
+    /// names no window, and for a value that is no window handle on this platform.
+    ///
+    /// Whether that window still exists is not checked here; every function that takes a
+    /// `WindowId` finds nothing for one that is gone.
+    pub fn from_native_id(id: u64) -> Option<Self> {
+        let handle = isize::try_from(id as i64).ok()?;
+        (handle != 0).then_some(Self(handle))
+    }
+}
 
 impl fmt::Debug for WindowId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -170,6 +197,47 @@ pub fn is_switcher_window(facts: &WindowFacts) -> bool {
         return true;
     }
     !facts.owned && facts.ex_style & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) == 0
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where a window is
+
+/// Where a window is on the desktop, in the desktop pixels a [`TargetRect`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBounds {
+    /// The window as it is drawn: its frame (title bar and borders) and everything in it,
+    /// without the invisible resize borders and the shadow around it. This is the rectangle a
+    /// capture of the window shows, so it is the [`TargetRect`] for pointer input on a stream of
+    /// that window: a point normalized to the picture lands on the same place in the window.
+    pub frame: TargetRect,
+    /// The client area (what the app draws below its title bar), cut to `frame`; the frame
+    /// itself when Windows will not say. For a host that confines pointer input to the app's
+    /// own content.
+    pub client: TargetRect,
+    /// The window is minimized. It is then drawn nowhere: `frame` and `client` are wherever
+    /// Windows parks a minimized window (far off every screen) and must not be used as a
+    /// target. [`activate`] restores the window.
+    pub minimized: bool,
+}
+
+impl WindowBounds {
+    /// Bounds from the two rectangles as Windows reports them, each as
+    /// `[left, top, right, bottom]`; `client` is `None` when it could not be read.
+    pub fn from_edges(frame: [i32; 4], client: Option<[i32; 4]>, minimized: bool) -> Self {
+        let rect = |e: [i32; 4]| TargetRect::from_edges(e[0], e[1], e[2], e[3]);
+        let frame = rect(frame);
+        Self {
+            frame,
+            client: client.map_or(frame, |c| rect(c).clipped_to(&frame)),
+            minimized,
+        }
+    }
+
+    /// The rectangle to give the injector for a stream of this window: `frame`, when the window
+    /// is shown and has any pixels.
+    pub fn target(&self) -> Option<TargetRect> {
+        (!self.minimized && self.frame.is_valid()).then_some(self.frame)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,6 +571,35 @@ pub fn activate(window: WindowId) -> bool {
         sys::desktop::restore(window);
     }
     agreed
+}
+
+/// Where a window is now: the rectangle it is drawn in and its client area, in desktop pixels.
+///
+/// A poll, and cheap (a handful of calls, none of which sends the window a message, so a window
+/// that has stopped responding cannot stall it). Windows tells a process about another
+/// process's window moving only through a hook, which is the host's to own, so a host that maps
+/// pointer input onto a stream of a window calls this as often as it needs the rectangle to
+/// follow the window (for example before each batch of pointer events, or on a timer while the
+/// stream runs) and passes [`WindowBounds::target`] to the injector.
+///
+/// The frame is what DWM reports as the window's extended frame bounds
+/// (`DWMWA_EXTENDED_FRAME_BOUNDS`), which is in physical pixels whatever the calling process's
+/// DPI awareness. The client area is read under a per-monitor-aware thread context for this
+/// call alone, so it is in the same pixels; the thread's own context is put back before the call
+/// returns.
+///
+/// `None` for a window that has closed, and for one the compositor does not draw.
+#[cfg(windows)]
+pub fn window_bounds(window: WindowId) -> Option<WindowBounds> {
+    if !sys::desktop::is_window(window) {
+        return None;
+    }
+    let frame = sys::desktop::frame_bounds(window)?;
+    Some(WindowBounds::from_edges(
+        frame,
+        sys::desktop::client_bounds(window),
+        sys::desktop::is_minimized(window),
+    ))
 }
 
 /// Whether the interactive desktop can take input now. A poll, by documented calls only:
@@ -914,6 +1011,54 @@ mod tests {
     }
 
     #[test]
+    fn native_ids_round_trip() {
+        for handle in [1isize, 0x1f0a2, 0x7fff_fff1, -2, isize::MAX, isize::MIN] {
+            let window = WindowId(handle);
+            assert_eq!(WindowId::from_native_id(window.native_id()), Some(window));
+        }
+        assert_eq!(WindowId(0x1f0a2).native_id(), 0x1f0a2);
+        // A handle with its top bit set is sign-extended, as Windows does between 32 and 64 bits.
+        assert_eq!(WindowId(-2).native_id(), u64::MAX - 1);
+        assert_eq!(WindowId::from_native_id(0), None);
+        let wide = 0x0000_0001_0000_0000u64;
+        if isize::BITS == 32 {
+            assert_eq!(WindowId::from_native_id(wide), None);
+        } else {
+            assert_eq!(
+                WindowId::from_native_id(wide),
+                Some(WindowId(0x1_0000_0000))
+            );
+        }
+    }
+
+    #[test]
+    fn window_bounds_from_edges() {
+        // An ordinary window: the client area lies inside the frame.
+        let bounds =
+            WindowBounds::from_edges([100, 50, 900, 650], Some([101, 81, 899, 649]), false);
+        assert_eq!(bounds.frame, TargetRect::new(100, 50, 800, 600));
+        assert_eq!(bounds.client, TargetRect::new(101, 81, 798, 568));
+        assert_eq!(bounds.target(), Some(bounds.frame));
+        // A window that draws its own frame reports a client area past what is drawn.
+        let own = WindowBounds::from_edges([100, 50, 900, 650], Some([92, 50, 908, 658]), false);
+        assert_eq!(own.client, own.frame);
+        // No client area read: the frame stands in.
+        let bare = WindowBounds::from_edges([-1920, 0, 0, 1080], None, false);
+        assert_eq!(bare.client, bare.frame);
+        assert_eq!(bare.target(), Some(TargetRect::new(-1920, 0, 1920, 1080)));
+    }
+
+    #[test]
+    fn a_minimized_or_empty_window_is_no_target() {
+        let parked = [-32000, -32000, -31840, -31972];
+        let minimized = WindowBounds::from_edges(parked, Some(parked), true);
+        assert!(minimized.minimized);
+        assert_eq!(minimized.target(), None);
+        let empty = WindowBounds::from_edges([10, 10, 10, 10], None, false);
+        assert_eq!(empty.target(), None);
+    }
+
+    #[test]
     fn versions() {
         assert_eq!(format_version(10, 0, 26200), "10.0.26200");
     }
@@ -980,6 +1125,21 @@ mod tests {
                 assert!(!app.title.is_empty());
                 assert_ne!(app.pid, 0);
             }
+        }
+
+        #[test]
+        fn window_bounds_of_listed_windows() {
+            for app in running_apps() {
+                let bounds = window_bounds(app.window);
+                println!("  {:?} {bounds:?}", app.title);
+                if let Some(bounds) = bounds.filter(|b| !b.minimized) {
+                    assert!(bounds.frame.is_valid(), "{:?}", app.title);
+                    assert_eq!(bounds.client.clipped_to(&bounds.frame), bounds.client);
+                }
+            }
+            assert_eq!(window_bounds(WindowId(0)), None);
+            // Window handles are even; an odd value names none.
+            assert_eq!(window_bounds(WindowId(0x7fff_fff1)), None);
         }
 
         #[test]
