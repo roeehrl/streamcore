@@ -136,14 +136,26 @@ pub struct WindowFacts {
     pub titled: bool,
     /// The window has an owner (`GW_OWNER`): a dialog or a palette of another window.
     pub owned: bool,
+    /// The window is the shell's desktop: the window `GetShellWindow` names, or one of the
+    /// shell's desktop classes (see [`is_shell_desktop_class`]).
+    pub shell_desktop: bool,
     /// The extended window style (`GWL_EXSTYLE`).
     pub ex_style: u32,
+}
+
+/// Whether a window class is one the shell draws the desktop with: `Progman` (titled "Program
+/// Manager") and `WorkerW`, the windows behind the icons and the wallpaper. They are visible,
+/// titled, unowned top-level windows with no style that says they are not applications, so
+/// only their class tells them apart.
+pub fn is_shell_desktop_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("Progman") || class.eq_ignore_ascii_case("WorkerW")
 }
 
 /// Whether a switcher lists the window. The rule is the one Windows documents for taskbar
 /// buttons, which Alt+Tab follows too, and of what is shown only what the user can see:
 ///
 /// - the window is visible, not cloaked, and has a title;
+/// - it is not the shell's desktop, whatever its styles say;
 /// - `WS_EX_APPWINDOW` lists it whatever else is set;
 /// - otherwise it is listed when it has no owner and is neither a tool window
 ///   (`WS_EX_TOOLWINDOW`) nor one the user cannot activate (`WS_EX_NOACTIVATE`).
@@ -151,7 +163,7 @@ pub struct WindowFacts {
 /// An owned window (a modal dialog) is therefore not listed on its own: its owner is, and
 /// activating the owner brings the dialog with it.
 pub fn is_switcher_window(facts: &WindowFacts) -> bool {
-    if !facts.visible || facts.cloaked || !facts.titled {
+    if !facts.visible || facts.cloaked || !facts.titled || facts.shell_desktop {
         return false;
     }
     if facts.ex_style & WS_EX_APPWINDOW != 0 {
@@ -395,7 +407,8 @@ pub fn foreground_app() -> Option<ForegroundApp> {
 /// visible top-level windows that are not cloaked, have a title and pass the taskbar rule (see
 /// [`is_switcher_window`]).
 ///
-/// What that leaves out: windows on other virtual desktops and suspended packaged apps (both are
+/// What that leaves out: the shell's own desktop window ("Program Manager"), windows on other
+/// virtual desktops and suspended packaged apps (both are
 /// cloaked), tool windows, owned dialogs (their owner is listed), windows with no title, and
 /// every window of another session or desktop. The caller's own windows are listed like any
 /// other; filter by [`AppWindow::pid`] to leave them out.
@@ -408,6 +421,7 @@ pub fn foreground_app() -> Option<ForegroundApp> {
 /// Icons are not read here.
 #[cfg(windows)]
 pub fn running_apps() -> Vec<AppWindow> {
+    let shell = sys::desktop::shell_window();
     sys::desktop::top_level_windows()
         .into_iter()
         .filter_map(|window| {
@@ -417,6 +431,8 @@ pub fn running_apps() -> Vec<AppWindow> {
                 cloaked: sys::desktop::is_cloaked(window),
                 titled: !title.is_empty(),
                 owned: sys::desktop::has_owner(window),
+                shell_desktop: shell == Some(window)
+                    || is_shell_desktop_class(&sys::desktop::class_name(window)),
                 ex_style: sys::desktop::ex_style(window),
             };
             if !is_switcher_window(&facts) {
@@ -673,8 +689,29 @@ mod tests {
             cloaked: false,
             titled: true,
             owned: false,
+            shell_desktop: false,
             ex_style,
         }
+    }
+
+    #[test]
+    fn switcher_leaves_out_the_shell_desktop() {
+        assert!(is_shell_desktop_class("Progman"));
+        assert!(is_shell_desktop_class("WorkerW"));
+        assert!(is_shell_desktop_class("progman"));
+        assert!(!is_shell_desktop_class("Notepad"));
+        assert!(!is_shell_desktop_class("Shell_TrayWnd"));
+        assert!(!is_shell_desktop_class(""));
+        // "Program Manager": visible, titled, unowned, no style that would leave it out.
+        let desktop = WindowFacts {
+            shell_desktop: true,
+            ..window(0)
+        };
+        assert!(!is_switcher_window(&desktop));
+        assert!(!is_switcher_window(&WindowFacts {
+            ex_style: WS_EX_APPWINDOW,
+            ..desktop
+        }));
     }
 
     #[test]

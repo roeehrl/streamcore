@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use crate::desktop::WindowId;
 use windows::Wdk::System::SystemServices::RtlGetVersion;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, HWND, LPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK,
@@ -24,9 +24,9 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GetForegroundWindow, GetWindow,
-    GetWindowLongW, GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindow,
-    IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+    EnumWindows, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow,
+    GetShellWindow, GetWindow, GetWindowLongW, GetWindowThreadProcessId, InternalGetWindowText,
+    IsIconic, IsWindow, IsWindowVisible, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
 };
 use windows::core::{BOOL, PWSTR, w};
 
@@ -57,29 +57,59 @@ pub fn window_process(window: WindowId) -> Option<u32> {
     (thread != 0 && pid != 0).then_some(pid)
 }
 
-/// The full path of a process's executable. Asks for the least access that allows it, which a
-/// process may have even to one running elevated.
-pub fn process_image(pid: u32) -> Option<PathBuf> {
-    // SAFETY: opens a process by ID with query-only access; the handle is closed below.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-    // Long enough for any path Windows allows (32767 units and a NUL).
-    let mut buffer = vec![0u16; 32768];
+/// `QueryFullProcessImageNameW` into a buffer of `units`: the path, or the error.
+fn image_name(process: HANDLE, units: usize) -> windows::core::Result<Vec<u16>> {
+    let mut buffer = vec![0u16; units];
     let mut length = buffer.len() as u32;
-    // SAFETY: `process` is open; `buffer` is writable for the `length` units given, and the
-    // call sets `length` to the units it wrote, without the NUL.
-    let read = unsafe {
+    // SAFETY: `process` is a process handle the caller holds open; `buffer` is writable for the
+    // `length` units given, and the call sets `length` to the units it wrote, without the NUL.
+    unsafe {
         QueryFullProcessImageNameW(
             process,
             PROCESS_NAME_WIN32,
             PWSTR(buffer.as_mut_ptr()),
             &mut length,
         )
-    };
+    }?;
+    buffer.truncate(length as usize);
+    Ok(buffer)
+}
+
+/// The full path of a process's executable. Asks for the least access that allows it, which a
+/// process may have even to one running elevated.
+pub fn process_image(pid: u32) -> Option<PathBuf> {
+    // SAFETY: opens a process by ID with query-only access; the handle is closed below.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    // Twice MAX_PATH holds nearly every path; only a longer one pays for the largest Windows
+    // allows (32767 units and a NUL).
+    let path = image_name(process, 520).or_else(|error| {
+        if error.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() {
+            image_name(process, 32768)
+        } else {
+            Err(error)
+        }
+    });
     // SAFETY: `process` was opened above and is closed exactly once.
     let _ = unsafe { CloseHandle(process) };
-    read.ok()?;
-    let path = buffer.get(..length as usize)?;
-    (!path.is_empty()).then(|| PathBuf::from(OsString::from_wide(path)))
+    let path = path.ok()?;
+    (!path.is_empty()).then(|| PathBuf::from(OsString::from_wide(&path)))
+}
+
+/// A window's class name; empty for a window that is gone.
+pub fn class_name(window: WindowId) -> String {
+    // A class name is at most 256 characters.
+    let mut buffer = [0u16; 260];
+    // SAFETY: `buffer` is the slice the call writes at most its length into, NUL-terminated; a
+    // handle that names no window yields 0.
+    let length = unsafe { GetClassNameW(handle(window), &mut buffer) };
+    let length = usize::try_from(length).unwrap_or(0).min(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
+}
+
+/// The shell's desktop window (`GetShellWindow`), if a shell is running.
+pub fn shell_window() -> Option<WindowId> {
+    // SAFETY: the call takes no arguments and returns a window handle or null.
+    id(unsafe { GetShellWindow() })
 }
 
 /// A window's title, without sending the window a message: `InternalGetWindowText` copies the
