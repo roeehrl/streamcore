@@ -57,25 +57,37 @@ encoder exists. `win::probe::run` is the bench's full probe, which also times th
   (`window::handle_from_native_id`), which names the window on this computer until it closes and
   means nothing in another run. A host gets one from the input crate's
   `WindowId::native_id()`; the two crates share the number, not a dependency. `open` answers
-  `InvalidSettings` for an id that is no handle and `SourceGone` for a window that has closed or
-  that WGC will not capture. `enumerate()` still lists displays only.
+  `InvalidSettings` for an id that is no handle or a window WGC will not capture, and
+  `SourceGone` for a window that has closed. `enumerate()` lists displays only: which windows to
+  offer is a rule about the desktop, and a host takes that list from the input crate's
+  `desktop::running_apps`.
   - *The picture* is the window as the compositor draws it, frame and client area (the
     rectangle `DWMWA_EXTENDED_FRAME_BOUNDS` reports), without whatever is in front of it. Menus,
     tooltips and dialogs are top-level windows of their own and are not in it.
-  - *Size.* A size change is handled as a display's mode change is (see Resizes): the frame
-    that reveals it is delivered at its content size, the pool is recreated, and
+  - *Size.* A window dragged by its edge has a new size on almost every frame, and every
+    reported layout makes the consumer re-plan, so a window's new size is adopted only once it
+    has held for 200 ms (`window::WINDOW_RESIZE_SETTLE_NS`): then the pool is recreated and
     `layout_changed` reports the window's size, the origin of its frame in desktop pixels, and
-    the index and scale of the display most of it is on. The stream gets a new layout epoch
-    and the consumer re-plans. A move alone raises no frame and no event: a host that maps
-    input polls the window's bounds (the input crate's `desktop::window_bounds`).
-  - *Closing* the window raises the item's `Closed`: `source_gone(SourceGone::Closed)`.
-  - *Minimized.* WGC raises no frame while the window is minimized and none of its events
-    says so, so the backend reports nothing: the stream keeps its last picture, as it does on
-    an idle screen, and frames resume when the window is restored. A frame of another size
-    that arrives while the window is minimized is dropped rather than taken for a resize. A
-    window that is minimized when the capture opens starts the same way: no picture until it
-    is restored. A host that wants to tell the user reads `minimized` from the window's
-    bounds.
+    the index and scale of the display most of it is on (a new layout epoch). One drag is one
+    report. Meanwhile frames keep coming from the old buffers at their content size, clipped to
+    the buffer: a window that shrank shows whole, one that grew shows the part that fits. A
+    one-shot `DispatcherQueueTimer` on the executor thread adopts the size when no further
+    frame arrives, so a resize made in one step (maximize, snap) waits 200 ms and no longer.
+    A display's mode change is still adopted with the frame that reveals it. The rules are
+    `window::SizeTracker`, tested on every platform. A move alone raises no frame and no event:
+    a host that maps input polls the window's bounds (the input crate's
+    `desktop::window_bounds`).
+  - *Closing* the window raises the item's `Closed`: `source_gone(SourceGone::Closed)`, once.
+    A window that closed between `open` and `start` subscribing to `Closed` raised it to no one,
+    so `start` asks again right after subscribing and reports it the same way, after the
+    start's result (a start that fails on the dead item answers `SourceGone`).
+  - *Minimized.* No WGC event says a window was minimized. Frames that arrive while it is
+    (`IsIconic`, asked per frame) are dropped, whatever they hold, so the stream keeps its last
+    picture, as it does on an idle screen, and frames resume when the window is restored. A
+    host that wants to tell the user reads `minimized` from the window's bounds.
+  - *Starting minimized.* The item may then have no size. The pool gets a 1 x 1 placeholder
+    from which nothing is delivered: the first frame that carries a size only sizes the pool
+    (at once, no settle time, with its `layout_changed`), and delivery starts with the next.
   - *Border and cursor.* As for a display: `IsBorderRequired = false` and
     `IsCursorCaptureEnabled` per `CaptureSpec::cursor`, each set only where this Windows has the
     property (the border switch came with Windows 11); otherwise a note says the border stays
@@ -84,7 +96,9 @@ encoder exists. `win::probe::run` is the bench's full probe, which also times th
     whole.
   - *Bench.* `bench --window TITLE` runs the stream on the front-most shown window whose title
     contains TITLE. Its notes give the window's frame bounds beside the capture item's size,
-    every layout reported during the run, and the window's place at the end.
+    every layout reported during the run, the window's place at the end, and how many frames
+    were delivered while a size settled or dropped while the window was minimized. With
+    `--size WxH` it also starts on a minimized window.
 - **Capture frames outlive Rust's hold.** A WGC frame read by a recorded blit stays open
   until the converter's fence passes that blit, even when the executor releases the surface
   as soon as `convert` returns (`Surfaces::retire` / `reap`). Only values the GPU has completed
@@ -94,7 +108,8 @@ encoder exists. `win::probe::run` is the bench's full probe, which also times th
 - **Resizes.** The frame that reveals a new source size arrives in a buffer of the old size;
   it is reported at its content size (clipped to the buffer) and the converter reads only that
   part. The capture adopts the new size once `Recreate` succeeds, so a failed `Recreate` is
-  retried with the next frame. `stop` forgets the capture; a failed `start` unregisters and
+  retried with the next frame. A display's new size is adopted with the frame that reveals it; a
+  window's once it has settled (see "A window as the source"). `stop` forgets the capture; a failed `start` unregisters and
   closes what it created.
 - **Timer resolution (host rule).** Intel's Quick Sync H.264 MFT waits on the system timer.
   While a capture runs, the backend holds a reference-counted `TimerPeriod`: the first hold

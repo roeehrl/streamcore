@@ -639,9 +639,9 @@ Desktop Duplication or GDI (on their own thread) when WGC shows nothing, and dua
   thread-pool threads). MF and NVENC outputs post.
 - Codec per adapter by measurement; on Intel Gen9-class iGPUs H.264 (VDENC) over EU-assisted HEVC.
 - **Window targets.** `CaptureTarget::Window` is a WGC capture item for one window; `window_id` is
-  the window's handle value, valid on that computer until the window closes. A size change is a
-  layout change (a new epoch), the window closing is `SourceGone::Closed`, and a minimized window
-  delivers nothing, like an idle screen. No window fit (`window_fit: false`) and no region of a
+  the window's handle value, valid on that computer until the window closes. A new size is a
+  layout change (a new epoch) once it has held for 200 ms, so a drag is one change; the window
+  closing is `SourceGone::Closed`; and a minimized window delivers nothing, like an idle screen. No window fit (`window_fit: false`) and no region of a
   window. Details are in `crates/streamcore-video-windows/README.md`.
 
 ### 4.3 Linux (P7) and CPU fallback
