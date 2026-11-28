@@ -58,7 +58,8 @@ impl WindowId {
     }
 
     /// The window a native id names: the inverse of [`native_id`](Self::native_id), for an id
-    /// that came from one (or from a capture backend's list of windows). `None` for 0, which
+    /// that came from one (for example the `window_id` of a capture a host is running, to read
+    /// that window's [`window_bounds`]). `None` for 0, which
     /// names no window, and for a value that is no window handle on this platform.
     ///
     /// Whether that window still exists is not checked here; every function that takes a
@@ -586,7 +587,10 @@ pub fn activate(window: WindowId) -> bool {
 /// (`DWMWA_EXTENDED_FRAME_BOUNDS`), which is in physical pixels whatever the calling process's
 /// DPI awareness. The client area is read under a per-monitor-aware thread context for this
 /// call alone, so it is in the same pixels; the thread's own context is put back before the call
-/// returns.
+/// returns. That context is per-monitor v2 (Windows 10 1703 and later), or per-monitor v1 where
+/// Windows refuses v2 (1607). Where it refuses both, nothing is changed and the client area is
+/// in the calling thread's own units: physical pixels if the host process is per-monitor aware,
+/// otherwise scaled ones on a scaled display. The frame is right in every case.
 ///
 /// `None` for a window that has closed, and for one the compositor does not draw.
 #[cfg(windows)]
@@ -1138,8 +1142,16 @@ mod tests {
                 }
             }
             assert_eq!(window_bounds(WindowId(0)), None);
-            // Window handles are even; an odd value names none.
-            assert_eq!(window_bounds(WindowId(0x7fff_fff1)), None);
+            assert_eq!(window_bounds(no_window()), None);
+        }
+
+        /// A value that names no window now, as Windows itself says (`IsWindow`), rather than
+        /// by a guess at which values handles take.
+        fn no_window() -> WindowId {
+            (0..4096)
+                .map(|n| WindowId(0x7fff_0000 + n))
+                .find(|window| !sys::desktop::is_window(*window))
+                .expect("some value in 4096 names no window")
         }
 
         #[test]

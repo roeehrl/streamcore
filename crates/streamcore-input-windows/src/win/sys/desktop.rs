@@ -29,6 +29,7 @@ use windows::Win32::System::Threading::{
     QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -188,11 +189,25 @@ pub fn frame_bounds(window: WindowId) -> Option<[i32; 4]> {
 /// The window's client area as `[left, top, right, bottom]` in physical desktop pixels: read
 /// under a per-monitor-aware thread context, which is put back before returning. `None` for a
 /// window that is gone.
+///
+/// The context asked for is per-monitor v2, which Windows has from 10 1703; an older one
+/// refuses it (the call returns null and changes nothing) and is asked for per-monitor v1
+/// instead. If that is refused too the thread's context stays as it is, and the rectangle is in
+/// whatever units the calling thread already uses.
 pub fn client_bounds(window: WindowId) -> Option<[i32; 4]> {
-    // SAFETY: changes only the calling thread's DPI awareness context and returns the one it
-    // had, which is restored below on every path.
-    let before =
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let mut before = DPI_AWARENESS_CONTEXT::default();
+    for context in [
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE,
+    ] {
+        // SAFETY: changes only the calling thread's DPI awareness context and returns the one
+        // it had (null when the context asked for is refused, and then nothing changed); a
+        // context that was replaced is restored below on every path.
+        before = unsafe { SetThreadDpiAwarenessContext(context) };
+        if !before.is_invalid() {
+            break;
+        }
+    }
     let mut rect = RECT::default();
     let mut origin = POINT::default();
     // SAFETY: `rect` is a live RECT the call writes; it fails for a handle that names no
