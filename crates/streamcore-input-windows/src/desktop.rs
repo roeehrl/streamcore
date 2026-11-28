@@ -188,7 +188,8 @@ pub fn is_switcher_window(facts: &WindowFacts) -> bool {
 pub enum SessionState {
     /// The desktop this process runs on has the input: injected input reaches its windows.
     Ready,
-    /// The workstation is locked.
+    /// The workstation is locked. Decided from the session's lock flag before any desktop is
+    /// compared, so it is the answer whichever desktop has the input while locked.
     Locked,
     /// Another desktop has the input and the session is not reported as locked: a consent (UAC)
     /// prompt on the secure desktop, the sign-in screen, Ctrl+Alt+Del or a screen saver that
@@ -289,6 +290,10 @@ pub fn layout_family(labels: &HashMap<String, Vec<String>>) -> Option<LayoutFami
 /// The keys a layout description labels, as HID usages: the letters, the digits, the punctuation
 /// keys of the main block, and the two keys only ISO keyboards have (0x32 beside Return, 0x64
 /// beside the left Shift).
+///
+/// 0x31 (the US backslash key) and 0x32 (the ISO key beside Return) are one key to Windows: both
+/// send scan code 0x2B, and a keyboard has one or the other. Both are listed and always carry
+/// the same label, so a client can draw whichever its keyboard shape has.
 pub fn labelled_keys() -> impl Iterator<Item = u16> {
     (0x04..=0x27).chain(0x2D..=0x38).chain([0x64])
 }
@@ -347,16 +352,29 @@ pub fn format_version(major: u32, minor: u32, build: u32) -> String {
 // ---------------------------------------------------------------------------------------------
 // The functions (Windows only)
 
-/// The keyboard layout of the thread that owns the focused window, described for a client: its
-/// identifier (the KLID, "0000040C"), its name as Windows shows it, its language tag ("fr-FR"),
-/// its family and its key labels (see [`layout_info`]).
+/// The keyboard layout the foreground window's keys are resolved on, described for a client:
+/// its identifier (the KLID, "0000040C"), its name as Windows shows it, its language tag
+/// ("fr-FR"), its family and its key labels (see [`layout_info`]).
 ///
-/// It is the layout the [`Injector`](crate::Injector) resolves shortcuts and text on. Windows
-/// keeps a layout per thread: when the focused window's thread will not say (some console
-/// windows), the calling thread's layout stands in, as it does for the injector.
+/// It is the layout the [`Injector`](crate::Injector) resolves shortcuts and text on, found the
+/// same way. Windows keeps a layout per thread, and the thread asked is: the one that owns the
+/// focused window, as the foreground window's thread reports it; else the foreground window's
+/// own thread; else, when neither will say (some console windows), the calling thread.
+///
+/// **Packaged (UWP) apps are a known gap.** Their foreground window belongs to a shared frame
+/// host, whose thread usually reports no focused window, while the keys go to the app's own
+/// window on another thread in another process. So for these apps this is the frame host
+/// thread's layout. That is the app's layout when Windows keeps one layout for all windows (the
+/// default), and may not be when "let me use a different input method for each app window" is
+/// on. The injector has the same gap, so the two still agree with each other.
 ///
 /// `None` when no window is in the foreground. It reads the registry and asks the layout about
 /// every labelled key, so poll [`focused_layout_id`] and call this when that changes.
+///
+/// The labels are read with `ToUnicodeEx` and its flag that leaves the keyboard state alone,
+/// which Windows 10 1607 and later honour. An older Windows ignores the flag, and asking about
+/// a dead key there would leave it pending for the next key typed; the synthetic pointer
+/// devices this crate is built on need a later Windows than that anyway.
 #[cfg(windows)]
 pub fn focused_layout() -> Option<LayoutInfoMessage> {
     let layout = sys::layout::focused_window_layout()?;
@@ -497,8 +515,12 @@ pub fn activate(window: WindowId) -> bool {
 ///   own (`GetThreadDesktop`). A user's process may not open the secure desktop, and that
 ///   refusal is how it is told.
 ///
+/// The order matters: a detached session is told first, then the lock, and only an unlocked,
+/// connected session is judged by its desktops. So `Locked` never depends on the desktop names,
+/// and `SecureDesktop` always means "not reported as locked".
+///
 /// See [`SessionState`] for what each answer means and what cannot be told, and
-/// [`classify_session`] for the order the readings are taken in.
+/// [`classify_session`] for the rule itself.
 #[cfg(windows)]
 pub fn session_state() -> SessionState {
     let session = sys::desktop::session_info();
@@ -687,6 +709,8 @@ mod tests {
         // Not Return, Escape, Backspace, Tab, Space or Caps Lock.
         assert!((0x28..=0x2C).all(|hid| !keys.contains(&hid)) && !keys.contains(&0x39));
         assert!(keys.iter().all(|hid| keys::hid_to_scan(*hid) != 0));
+        // The US backslash key and the ISO key beside Return are one key to Windows.
+        assert_eq!(keys::hid_to_scan(0x31), keys::hid_to_scan(0x32));
     }
 
     fn window(ex_style: u32) -> WindowFacts {

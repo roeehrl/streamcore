@@ -112,7 +112,10 @@ fn display_name(klid: &str) -> Option<String> {
     layout_value(klid, "Layout Text")
 }
 
-/// `ToUnicodeEx` flag (Windows 10 1607 and later): leave the keyboard state (dead keys) alone.
+/// `ToUnicodeEx` flag: leave the keyboard state (dead keys) alone. Windows 10 1607 and later
+/// honour it. An older Windows ignores it, so a translation of a dead key there would leave the
+/// dead key pending for the next key typed; the synthetic pointer devices the crate needs do
+/// not exist there either.
 const TO_UNICODE_NO_STATE_CHANGE: u32 = 0x4;
 
 /// The thread that owns the focused window and the foreground window's thread (the same when no
