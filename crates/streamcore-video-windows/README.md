@@ -82,6 +82,9 @@ encoder exists. `win::probe::run` is the bench's full probe, which also times th
     or the cursor is drawn. The cursor is drawn only while it is over the window.
   - *No region of a window.* `CaptureTarget::Region` names a display; a window is captured
     whole.
+  - *Bench.* `bench --window TITLE` runs the stream on the front-most shown window whose title
+    contains TITLE. Its notes give the window's frame bounds beside the capture item's size,
+    every layout reported during the run, and the window's place at the end.
 - **Capture frames outlive Rust's hold.** A WGC frame read by a recorded blit stays open
   until the converter's fence passes that blit, even when the executor releases the surface
   as soon as `convert` returns (`Surfaces::retire` / `reap`). Only values the GPU has completed

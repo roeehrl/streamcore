@@ -5,7 +5,10 @@
 //! barcode (and, with `--pace MS`, flips its colour) at known QPC times; the converter reads the
 //! barcode back from every converted frame, so each submitted frame is matched to the moment its
 //! content was drawn, and capture -> encoded is timed without a client. Desktop mode captures
-//! the desktop as it is (WGC delivers a frame only when something changes).
+//! the desktop as it is (WGC delivers a frame only when something changes). `--window TITLE`
+//! captures one window as it is, through `CaptureTarget::Window`: its notes say which window,
+//! its frame bounds beside the capture item's size, every layout the capture reported when the
+//! window changed size, and a closed window ends the run with `source gone: Closed`.
 
 use super::capture::{SDR_DESKTOP, WgcCapture};
 use super::convert::{Strip, VpConverter};
@@ -13,13 +16,15 @@ use super::encoder::{MfEncoderFactory, plan_permits};
 use super::queue::ExecutorThread;
 use super::surfaces::Surfaces;
 use super::sys::com::now_ns;
-use super::sys::d3d::{Gpu, OutputDesc};
+use super::sys::d3d::{Gpu, OutputDesc, enumerate_adapters};
+use super::sys::hwnd;
 use super::sys::window::{Pace as WindowPace, Strip as WindowStrip, Synthetic};
 use super::{Error, err, os_build, probe, sizes};
 use crate::barcode;
-use crate::cli::{Mode, Options, Pace};
+use crate::cli::{Mode, Options, Pace, Size};
 use crate::model::{BenchReport, SyntheticResult};
 use crate::trace::{FrameTrace, Recorder, summarize_stages};
+use crate::window::{find_title, native_id_from_handle, rect_size};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -48,11 +53,99 @@ const STRIP: WindowStrip = WindowStrip {
     height: 48,
 };
 
-pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchReport, Error> {
-    let (capture_size, encode) = sizes(output, options.size);
+/// The window `--window` chose.
+pub struct Window {
+    handle: isize,
+    pub title: String,
+}
+
+/// The front-most shown window whose title contains `needle`, ignoring case.
+pub fn find_window(needle: &str) -> Result<Window, Error> {
+    let windows = hwnd::titled_windows();
+    let index =
+        find_title(windows.iter().map(|(_, title)| title.as_str()), needle).ok_or_else(|| {
+            let titles: Vec<&str> = windows.iter().map(|(_, title)| title.as_str()).collect();
+            format!("no shown window has {needle:?} in its title; the titles are: {titles:?}")
+        })?;
+    let (handle, title) = windows[index].clone();
+    Ok(Window { handle, title })
+}
+
+/// The index (as `--monitor` counts) of the display most of the window is on.
+pub fn window_monitor(window: &Window) -> Option<u32> {
+    let monitor = hwnd::monitor(window.handle);
+    enumerate_adapters()
+        .ok()?
+        .iter()
+        .flat_map(|a| a.outputs.iter())
+        .position(|o| o.hmonitor == monitor)
+        .map(|i| i as u32)
+}
+
+/// Where the window is, for a note.
+fn window_place(window: &Window) -> String {
+    match hwnd::frame_bounds(window.handle) {
+        Some(b) => {
+            let (w, h) = rect_size(b);
+            format!(
+                "frame bounds {w}x{h} at ({}, {}), minimized {}",
+                b[0],
+                b[1],
+                hwnd::is_minimized(window.handle)
+            )
+        }
+        None => format!("no frame bounds (exists {})", hwnd::exists(window.handle)),
+    }
+}
+
+/// A capture size and an encode size, each width by height.
+type Sizes = ((u32, u32), (u32, u32));
+
+/// The capture size of a window (its frame bounds) and the encode size for `size`.
+fn window_sizes(window: &Window, size: Size) -> Result<Sizes, Error> {
+    if hwnd::is_minimized(window.handle) {
+        return Err(format!(
+            "window {:?} is minimized: restore it first",
+            window.title
+        ));
+    }
+    let capture = hwnd::frame_bounds(window.handle)
+        .map(rect_size)
+        .filter(|(w, h)| *w >= 2 && *h >= 2)
+        .ok_or_else(|| format!("window {:?} has no frame bounds", window.title))?;
+    let encode = match size {
+        Size::Native => (capture.0 & !1, capture.1 & !1),
+        Size::Fixed(w, h) => (w, h),
+    };
+    Ok((capture, encode))
+}
+
+pub fn run(
+    options: &Options,
+    luid: u64,
+    output: &OutputDesc,
+    window: Option<&Window>,
+) -> Result<BenchReport, Error> {
+    let (capture_size, encode) = match window {
+        Some(w) => window_sizes(w, options.size)?,
+        None => sizes(output, options.size),
+    };
     let bitrate = options.bitrate_for(encode.0, encode.1);
     let mut notes = Vec::new();
     let mut errors = Vec::new();
+    if let Some(w) = window {
+        // The capture item's size beside the frame bounds: the picture is the frame.
+        let item = match hwnd::capture_item(w.handle).and_then(|item| item.Size()) {
+            Ok(size) => format!("{}x{}", size.Width, size.Height),
+            Err(e) => format!("unavailable ({e})"),
+        };
+        notes.push(format!(
+            "window {:?} (native id {:#x}): {}, capture item {item}",
+            w.title,
+            native_id_from_handle(w.handle),
+            window_place(w)
+        ));
+    }
 
     // The permit target comes from the encoder's min_inputs_before_output (3.3).
     let probe = probe::run(
@@ -99,8 +192,9 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     );
     factory.set_rate_control(options.rate_control, options.peak());
 
-    // Synthetic source over the whole monitor, its barcode read back after convert.
-    let synthetic = options.mode == Mode::Synthetic;
+    // Synthetic source over the whole monitor, its barcode read back after convert. A window
+    // is captured as it is.
+    let synthetic = options.mode == Mode::Synthetic && window.is_none();
     let source = if synthetic {
         let cell = ((capture_size.0 as i32 - 32) / barcode::CELLS as i32).clamp(4, 40);
         let strip = WindowStrip {
@@ -156,8 +250,13 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     let parts = StreamParts {
         stream_id: 1,
         spec: CaptureSpec {
-            target: CaptureTarget::Display {
-                display_id: options.monitor,
+            target: match window {
+                Some(w) => CaptureTarget::Window {
+                    window_id: native_id_from_handle(w.handle),
+                },
+                None => CaptureTarget::Display {
+                    display_id: options.monitor,
+                },
             },
             mode: StreamMode::View,
             pixel_width: capture_size.0,
@@ -281,6 +380,9 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
         errors.push(format!("{leaked} surfaces still leased after close"));
     }
     notes.extend(capture.notes());
+    if let Some(w) = window {
+        notes.push(format!("window at the end: {}", window_place(w)));
+    }
     if converter.copied_inputs() > 0 {
         notes.push(format!(
             "capture frames copied before convert: {}",
@@ -363,9 +465,15 @@ pub fn run(options: &Options, luid: u64, output: &OutputDesc) -> Result<BenchRep
     .collect();
     Ok(BenchReport {
         os_build: os_build(),
-        mode: if synthetic { "synthetic" } else { "desktop" }.into(),
+        mode: match (window, synthetic) {
+            (Some(_), _) => "window",
+            (None, true) => "synthetic",
+            (None, false) => "desktop",
+        }
+        .into(),
         adapter: gpu.name.clone(),
         monitor: options.monitor,
+        window: window.map(|w| w.title.clone()),
         capture_size: [capture_size.0, capture_size.1],
         encode_size: [encode.0, encode.1],
         fps_target: options.fps,
@@ -457,6 +565,9 @@ fn synthetic_analysis(
 
 pub fn print(r: &BenchReport) {
     println!("OS build {}  adapter {}", r.os_build, r.adapter);
+    if let Some(title) = &r.window {
+        println!("window {title:?} on monitor {}", r.monitor);
+    }
     println!(
         "{} mode: capture {}x{} -> encode {}x{} @ {} fps target, refresh {:?} Hz, {:.1} s measured after {} s warm-up",
         r.mode,

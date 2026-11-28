@@ -146,13 +146,17 @@ pub struct TimerReport {
     pub throttling_unreadable: bool,
 }
 
-/// One bench run (`bench --mode synthetic|desktop`).
+/// One bench run (`bench --mode synthetic|desktop`, or `bench --window TITLE`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct BenchReport {
     pub os_build: String,
     pub mode: String,
     pub adapter: String,
     pub monitor: u32,
+    /// `--window`: the captured window's title (`mode` is then "window", `monitor` the display
+    /// most of it was on and `capture_size` its size when the run began).
+    #[serde(default)]
+    pub window: Option<String>,
     pub capture_size: [u32; 2],
     pub encode_size: [u32; 2],
     pub fps_target: u32,

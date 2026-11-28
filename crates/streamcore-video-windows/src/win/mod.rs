@@ -153,8 +153,18 @@ pub fn run(options: &Options) -> Result<(), Error> {
             write_json(options.json.as_deref(), &d)
         }
         Command::Bench => {
+            let window = match &options.window {
+                Some(title) => Some(bench::find_window(title)?),
+                None => None,
+            };
+            // A window is measured on the display most of it is on.
+            let mut options = options.clone();
+            if let Some(monitor) = window.as_ref().and_then(bench::window_monitor) {
+                options.monitor = monitor;
+            }
+            let options = &options;
             let (luid, output) = select(options, &adapters)?;
-            let b = bench::run(options, luid, &output)?;
+            let b = bench::run(options, luid, &output, window.as_ref())?;
             bench::print(&b);
             write_json(options.json.as_deref(), &b)
         }
