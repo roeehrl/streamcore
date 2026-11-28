@@ -50,6 +50,38 @@ encoder exists. `win::probe::run` is the bench's full probe, which also times th
 - **Regions.** WGC captures the whole display (`region_in_surface: false`); the video
   processor crops `ConvertJob::source`, so a region needs the convert path and follows live
   moves without touching the capture.
+- **A window as the source.** `CaptureTarget::Window { window_id }` captures one window with a
+  capture item made for it (`IGraphicsCaptureItemInterop::CreateForWindow`); `caps()` lists
+  `Window`, with `window_fit: false` because the backend never moves, resizes or raises the
+  window. `window_id` is a native window id: the window's handle value sign-extended to 64 bits
+  (`window::handle_from_native_id`), which names the window on this computer until it closes and
+  means nothing in another run. A host gets one from the input crate's
+  `WindowId::native_id()`; the two crates share the number, not a dependency. `open` answers
+  `InvalidSettings` for an id that is no handle and `SourceGone` for a window that has closed or
+  that WGC will not capture. `enumerate()` still lists displays only.
+  - *The picture* is the window as the compositor draws it, frame and client area (the
+    rectangle `DWMWA_EXTENDED_FRAME_BOUNDS` reports), without whatever is in front of it. Menus,
+    tooltips and dialogs are top-level windows of their own and are not in it.
+  - *Size.* A size change is handled as a display's mode change is (see Resizes): the frame
+    that reveals it is delivered at its content size, the pool is recreated, and
+    `layout_changed` reports the window's size, the origin of its frame in desktop pixels, and
+    the index and scale of the display most of it is on. The stream gets a new layout epoch
+    and the consumer re-plans. A move alone raises no frame and no event: a host that maps
+    input polls the window's bounds (the input crate's `desktop::window_bounds`).
+  - *Closing* the window raises the item's `Closed`: `source_gone(SourceGone::Closed)`.
+  - *Minimized.* WGC raises no frame while the window is minimized and none of its events
+    says so, so the backend reports nothing: the stream keeps its last picture, as it does on
+    an idle screen, and frames resume when the window is restored. A frame of another size
+    that arrives while the window is minimized is dropped rather than taken for a resize. A
+    window that is minimized when the capture opens starts the same way: no picture until it
+    is restored. A host that wants to tell the user reads `minimized` from the window's
+    bounds.
+  - *Border and cursor.* As for a display: `IsBorderRequired = false` and
+    `IsCursorCaptureEnabled` per `CaptureSpec::cursor`, each set only where this Windows has the
+    property (the border switch came with Windows 11); otherwise a note says the border stays
+    or the cursor is drawn. The cursor is drawn only while it is over the window.
+  - *No region of a window.* `CaptureTarget::Region` names a display; a window is captured
+    whole.
 - **Capture frames outlive Rust's hold.** A WGC frame read by a recorded blit stays open
   until the converter's fence passes that blit, even when the executor releases the surface
   as soon as `convert` returns (`Surfaces::retire` / `reap`). Only values the GPU has completed

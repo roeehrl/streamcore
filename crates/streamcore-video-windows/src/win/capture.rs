@@ -1,5 +1,5 @@
-//! `CaptureBackend` over Windows Graphics Capture (design doc 4.2): a monitor captured into BGRA
-//! textures on the stream's D3D11 device (the encoder's adapter).
+//! `CaptureBackend` over Windows Graphics Capture (design doc 4.2): a monitor, or one window,
+//! captured into BGRA textures on the stream's D3D11 device (the encoder's adapter).
 //!
 //! `open` and `start` run on the executor; `start` creates the frame pool with `Create`, which
 //! binds `FrameArrived` to the calling thread's `DispatcherQueue`, so every frame arrives on the
@@ -8,6 +8,25 @@
 //! older ones it finds queued (counted as pool backlog), and leases the frame to Rust until
 //! `release`: WGC cannot reuse its buffer meanwhile, so the pool is sized for the latest slot plus
 //! the permits in flight plus one buffer for WGC to write.
+//!
+//! **A window target** (`CaptureTarget::Window`) names its window by native id
+//! ([`crate::window::handle_from_native_id`]) and runs the same path with a capture item made
+//! for the window:
+//!
+//! - The picture is the window as DWM draws it (its frame and client area, the rectangle
+//!   `DWMWA_EXTENDED_FRAME_BOUNDS` reports), upright, without the windows in front of it. Other
+//!   top-level windows of the same app (menus, tooltips, dialogs) are not part of it.
+//! - A size change arrives as a frame whose content size differs from the pool's: that frame is
+//!   delivered at its content size, the pool is recreated at the new size and
+//!   `CaptureEvents::layout_changed` reports the window's layout, exactly as a display's mode
+//!   change does. A move alone produces no frame and no event: a host that maps input reads the
+//!   window's bounds itself.
+//! - The window closing raises the item's `Closed`, reported as `SourceGone::Closed`.
+//! - A minimized window delivers nothing: WGC raises no frame while there is nothing to compose,
+//!   so the stream keeps its last picture, as on an idle screen, and frames resume when the
+//!   window is restored. Should a frame of another size arrive while the window is minimized, it
+//!   is dropped (`crate::window::frame_action`).
+//! - A region of a window is not offered: `CaptureTarget::Region` names a display.
 
 use super::surfaces::{Entry, Surfaces};
 use super::sys::com::{TimerPeriod, now_ns};
@@ -16,8 +35,10 @@ use super::sys::d3d::{
     Gpu, OutputDesc, capture_item_for_monitor, enumerate_adapters, texture_from_surface,
     texture_size,
 };
+use super::sys::hwnd;
 use crate::clock::hundred_ns_to_ns;
 use crate::trace::Recorder;
+use crate::window::{FrameAction, frame_action, handle_from_native_id, image_size, pool_size};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use streamcore_video::{
@@ -27,6 +48,7 @@ use streamcore_video::{
     SerialQueue, SourceCatalog, SourceGone, SurfaceId, SurfaceInfo, SurfaceKind, TransferFunction,
     YCbCrMatrix,
 };
+use windows::Foundation::Metadata::ApiInformation;
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -34,7 +56,7 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::System::DispatcherQueue;
-use windows::core::IInspectable;
+use windows::core::{HSTRING, IInspectable, h};
 
 /// What WGC delivers for an SDR desktop: sRGB-encoded BGRA.
 pub const SDR_DESKTOP: ColorTags = ColorTags {
@@ -53,9 +75,18 @@ struct Running {
     _timer: Option<TimerPeriod>,
 }
 
+/// What a capture shows.
+#[derive(Clone, Copy)]
+enum Source {
+    /// A display, by its index in `WgcCapture::outputs`.
+    Display(u32),
+    /// A window, by its handle value.
+    Window(isize),
+}
+
 struct Capture {
     spec: CaptureSpec,
-    display: u32,
+    source: Source,
     events: Arc<dyn CaptureEvents>,
     item: GraphicsCaptureItem,
     size: SizeInt32,
@@ -114,6 +145,13 @@ pub fn refresh_interval_ns(output: &OutputDesc) -> Option<u64> {
     crate::clock::interval_from_rational(num, den)
 }
 
+/// Whether this Windows has `GraphicsCaptureSession`'s property `name` (the capture border
+/// switch came with Windows 11, the cursor switch with Windows 10 2004).
+fn session_has(name: &HSTRING) -> bool {
+    ApiInformation::IsPropertyPresent(h!("Windows.Graphics.Capture.GraphicsCaptureSession"), name)
+        .unwrap_or(false)
+}
+
 impl WgcCapture {
     pub fn new(
         gpu: Arc<Gpu>,
@@ -166,13 +204,54 @@ impl WgcCapture {
         self.surfaces.len()
     }
 
+    /// The output a source is shown on, with its index: the display itself, or the display
+    /// most of the window is on. `None` for a display that is not listed, and for a window on a
+    /// display that was attached after this backend was created.
+    fn output_of(&self, source: Source) -> Option<(u32, &OutputDesc)> {
+        match source {
+            Source::Display(display) => self.outputs.get(display as usize).map(|o| (display, o)),
+            Source::Window(handle) => {
+                let monitor = hwnd::monitor(handle);
+                self.outputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.hmonitor == monitor)
+                    .map(|(i, o)| (i as u32, o))
+            }
+        }
+    }
+
+    /// The layout reported when a source changes size. A display's is its own. A window's is
+    /// the window's: `size` pixels at the origin of its frame in desktop pixels, upright, with
+    /// the scale and `display_id` of the display most of it is on (display 0 and scale 1 when
+    /// that display is not listed).
+    fn layout_for(&self, source: Source, size: SizeInt32) -> Option<DisplayLayout> {
+        let output = self.output_of(source);
+        match source {
+            Source::Display(_) => output.map(|(display, o)| layout_of(display, o, Some(size))),
+            Source::Window(handle) => {
+                let origin = hwnd::frame_bounds(handle).map_or((0, 0), |b| (b[0], b[1]));
+                Some(DisplayLayout {
+                    display_id: output.map_or(0, |(display, _)| display),
+                    pixel_width: size.Width.max(0) as u32,
+                    pixel_height: size.Height.max(0) as u32,
+                    scale: output
+                        .and_then(|(_, o)| o.dpi)
+                        .map_or(1.0, |dpi| f64::from(dpi) / 96.0),
+                    origin_x: origin.0,
+                    origin_y: origin.1,
+                    rotation: DisplayRotation::Identity,
+                })
+            }
+        }
+    }
+
     /// The session's `MinUpdateInterval` (100 ns units) for a stream minimum of `min_ns` on
-    /// `display`: see [`crate::clock::capture_min_interval_ns`].
-    fn session_min_interval(&self, display: u32, min_ns: u64) -> i64 {
+    /// `source`'s display: see [`crate::clock::capture_min_interval_ns`].
+    fn session_min_interval(&self, source: Source, min_ns: u64) -> i64 {
         let refresh = self
-            .outputs
-            .get(display as usize)
-            .and_then(refresh_interval_ns);
+            .output_of(source)
+            .and_then(|(_, o)| refresh_interval_ns(o));
         let ns = crate::clock::capture_min_interval_ns(min_ns, refresh);
         i64::try_from(ns / 100).unwrap_or(i64::MAX)
     }
@@ -182,13 +261,13 @@ impl WgcCapture {
         if DispatcherQueue::GetForCurrentThread().is_err() {
             return Err(MediaError::Unsupported);
         }
-        let (item, size, spec, display) = {
+        let (item, size, spec, source) = {
             let state = self.lock();
             let cap = state.captures.get(&id).ok_or(MediaError::InvalidSettings)?;
             if cap.running.is_some() {
                 return Err(MediaError::InvalidSettings);
             }
-            (cap.item.clone(), cap.size, cap.spec.clone(), cap.display)
+            (cap.item.clone(), cap.size, cap.spec.clone(), cap.source)
         };
         let device = self
             .gpu
@@ -242,15 +321,23 @@ impl WgcCapture {
                 return Err(MediaError::Internal);
             }
         };
-        if let Err(e) = session.SetIsBorderRequired(false) {
+        // The yellow capture border and the cursor are switched only where this Windows has
+        // the switch; without it the border stays and the cursor is drawn, and a note says so.
+        if !session_has(h!("IsBorderRequired")) {
+            self.note("IsBorderRequired is not on this Windows: the capture border stays".into());
+        } else if let Err(e) = session.SetIsBorderRequired(false) {
             self.note(format!("IsBorderRequired=false refused: {e}"));
         }
-        if let Err(e) = session.SetIsCursorCaptureEnabled(spec.cursor == CursorMode::Composited) {
+        if !session_has(h!("IsCursorCaptureEnabled")) {
+            self.note("IsCursorCaptureEnabled is not on this Windows: the cursor is drawn".into());
+        } else if let Err(e) =
+            session.SetIsCursorCaptureEnabled(spec.cursor == CursorMode::Composited)
+        {
             self.note(format!("IsCursorCaptureEnabled refused: {e}"));
         }
         if spec.min_interval_ns > 0
             && let Err(e) = session.SetMinUpdateInterval(TimeSpan {
-                Duration: self.session_min_interval(display, spec.min_interval_ns),
+                Duration: self.session_min_interval(source, spec.min_interval_ns),
             })
         {
             self.note(format!("MinUpdateInterval refused: {e}"));
@@ -294,34 +381,39 @@ impl WgcCapture {
             .SystemRelativeTime()
             .ok()
             .map(|t| hundred_ns_to_ns(t.Duration));
-        let content = frame.ContentSize().ok();
-        let Ok(texture) = frame.Surface().and_then(|s| texture_from_surface(&s)) else {
-            let _ = frame.Close();
-            return;
-        };
-        let texture_px = texture_size(&texture);
-        // The image's size: the frame that reveals a resize still comes in a buffer of the
-        // pool's old size, with the image in its top-left part (clipped when it grew).
-        let (width, height) =
-            content
-                .filter(|c| c.Width > 0 && c.Height > 0)
-                .map_or(texture_px, |c| {
-                    (
-                        (c.Width as u32).min(texture_px.0),
-                        (c.Height as u32).min(texture_px.1),
-                    )
-                });
-        let (events, resized) = {
+        let content = frame.ContentSize().ok().map(|c| (c.Width, c.Height));
+        let (events, source, pool_px, buffers) = {
             let state = self.lock();
             let Some(cap) = state.captures.get(&id) else {
                 let _ = frame.Close();
                 return;
             };
-            let resized = content
-                .filter(|c| c.Width != cap.size.Width || c.Height != cap.size.Height)
-                .map(|c| (c, cap.display, i32::from(cap.spec.queue_depth)));
-            (cap.events.clone(), resized)
+            (
+                cap.events.clone(),
+                cap.source,
+                (cap.size.Width, cap.size.Height),
+                i32::from(cap.spec.queue_depth),
+            )
         };
+        // Whether the window is minimized matters only for a frame of a new size, so it is
+        // asked only then (no lock held).
+        let mut action = frame_action(content, pool_px, false);
+        if action != FrameAction::Deliver
+            && let Source::Window(handle) = source
+        {
+            action = frame_action(content, pool_px, hwnd::is_minimized(handle));
+        }
+        if action == FrameAction::Skip {
+            let _ = frame.Close();
+            return;
+        }
+        let Ok(texture) = frame.Surface().and_then(|s| texture_from_surface(&s)) else {
+            let _ = frame.Close();
+            return;
+        };
+        // The image's size: the frame that reveals a resize still comes in a buffer of the
+        // pool's old size, with the image in its top-left part (clipped when it grew).
+        let (width, height) = image_size(content, texture_size(&texture));
         let surface = self.surfaces.insert(Entry::Capture {
             texture,
             frame,
@@ -352,7 +444,11 @@ impl WgcCapture {
         }
         // No lock held: this may drain the executor inline (convert and submit run now).
         events.frame(id, None, info, FrameStatus::Complete);
-        if let Some((size, display, buffers)) = resized {
+        if let FrameAction::DeliverAndResize { width, height } = action {
+            let size = SizeInt32 {
+                Width: width,
+                Height: height,
+            };
             // The source changed size: new buffers at the new size, and tell the stream. The
             // capture's size moves only once the pool has them, so a failed `Recreate` is
             // retried with the next frame.
@@ -374,8 +470,8 @@ impl WgcCapture {
             if let Some(cap) = self.lock().captures.get_mut(&id) {
                 cap.size = size;
             }
-            if let Some(o) = self.outputs.get(display as usize) {
-                events.layout_changed(id, layout_of(display, o, Some(size)));
+            if let Some(layout) = self.layout_for(source, size) {
+                events.layout_changed(id, layout);
             }
         }
     }
@@ -417,8 +513,13 @@ impl CaptureBackend for WgcCapture {
     fn caps(&self) -> CaptureCaps {
         CaptureCaps {
             // A region captures its whole display; the converter crops `ConvertJob::source`,
-            // which follows live moves.
-            target_kinds: vec![CaptureTargetKind::Display, CaptureTargetKind::Region],
+            // which follows live moves. A window is captured whole.
+            target_kinds: vec![
+                CaptureTargetKind::Display,
+                CaptureTargetKind::Window,
+                CaptureTargetKind::Region,
+            ],
+            // The backend never moves, resizes or raises the window it captures.
             window_fit: false,
             live_region_move: true,
             cursor_modes: vec![CursorMode::Hidden, CursorMode::Composited],
@@ -463,18 +564,35 @@ impl CaptureBackend for WgcCapture {
         if spec.adapter_luid.is_some_and(|l| l != self.gpu.luid) {
             return Err(MediaError::Unsupported);
         }
-        let display_id = match spec.target {
+        let (source, item) = match spec.target {
             CaptureTarget::Display { display_id } | CaptureTarget::Region { display_id, .. } => {
-                display_id
+                let output = self
+                    .outputs
+                    .get(display_id as usize)
+                    .ok_or(MediaError::SourceGone)?;
+                let item = capture_item_for_monitor(output.hmonitor)
+                    .map_err(|_| MediaError::SourceGone)?;
+                (Source::Display(display_id), item)
+            }
+            CaptureTarget::Window { window_id } => {
+                // An id that is no handle here is a wrong setting; one whose window has
+                // closed, or that WGC will not capture, is a source that is gone.
+                let handle = handle_from_native_id(window_id).ok_or(MediaError::InvalidSettings)?;
+                if !hwnd::exists(handle) {
+                    return Err(MediaError::SourceGone);
+                }
+                let item = hwnd::capture_item(handle).map_err(|_| MediaError::SourceGone)?;
+                (Source::Window(handle), item)
             }
             _ => return Err(MediaError::Unsupported),
         };
-        let output = self
-            .outputs
-            .get(display_id as usize)
-            .ok_or(MediaError::SourceGone)?;
-        let item = capture_item_for_monitor(output.hmonitor).map_err(|_| MediaError::SourceGone)?;
         let size = item.Size().map_err(|_| MediaError::SourceGone)?;
+        // A window may report no size yet (it is minimized): the pool still needs one.
+        let (width, height) = pool_size((size.Width, size.Height));
+        let size = SizeInt32 {
+            Width: width,
+            Height: height,
+        };
         let mut state = self.lock();
         state.next += 1;
         let id = state.next;
@@ -482,7 +600,7 @@ impl CaptureBackend for WgcCapture {
             id,
             Capture {
                 spec,
-                display: display_id,
+                source,
                 events,
                 item,
                 size,
@@ -501,7 +619,7 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn update(&self, id: CaptureId, update: CaptureUpdate, op: OpToken) {
-        let (events, session, region, display) = {
+        let (events, session, region, source) = {
             let state = self.lock();
             let Some(cap) = state.captures.get(&id) else {
                 return;
@@ -510,19 +628,19 @@ impl CaptureBackend for WgcCapture {
                 cap.events.clone(),
                 cap.running.as_ref().map(|r| r.session.clone()),
                 matches!(cap.spec.target, CaptureTarget::Region { .. }),
-                cap.display,
+                cap.source,
             )
         };
         let mut error = None;
         // A region move needs nothing here: the capture holds the whole display and the
-        // executor crops the new rect from the next convert on.
+        // executor crops the new rect from the next convert on. A window has no region.
         if update.region.is_some() && !region {
             error = Some(MediaError::Unsupported);
         } else if let Some(session) = session {
             if let Some(ns) = update.min_interval_ns
                 && session
                     .SetMinUpdateInterval(TimeSpan {
-                        Duration: self.session_min_interval(display, ns),
+                        Duration: self.session_min_interval(source, ns),
                     })
                     .is_err()
             {
